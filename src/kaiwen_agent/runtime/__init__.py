@@ -12,6 +12,7 @@ from kaiwen_agent.runtime.durability import (
     RuntimeRunRecord,
     RuntimeRunStatus,
     RuntimeRunStore,
+    WorkspaceBinding,
 )
 from kaiwen_agent.runtime.factory import (
     AgentFactory,
@@ -53,6 +54,7 @@ __all__ = [
     "RuntimeRecoveryManager",
     "RuntimeRunConflictError",
     "RuntimeRunRecord",
+    "WorkspaceBinding",
     "RuntimeRunStatus",
     "RuntimeRunStore",
     "RuntimeVersionPins",

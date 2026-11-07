@@ -1121,6 +1121,11 @@ class SQLitePersistence:
                     run.version_pins,
                 ):
                     raise ValueError("Runtime run identity and version pins are immutable")
+                if (
+                    current.workspace_binding is not None
+                    and current.workspace_binding != run.workspace_binding
+                ):
+                    raise ValueError("The runtime run's workspace binding is immutable")
                 _validate_runtime_run_transition(current.status, run.status)
             connection.execute(
                 """INSERT INTO runtime_runs

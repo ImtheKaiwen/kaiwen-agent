@@ -86,6 +86,7 @@ from kaiwen_agent.kits.coding.verification import (
     coding_verifiers,
     install_coding_verifiers,
 )
+from kaiwen_agent.kits.coding.workspace import AuthorizedCodingWorkspace
 
 __all__ = [
     "PROMPT_VERSION",
@@ -108,6 +109,7 @@ __all__ = [
     "CodingProviderPreset",
     "CodingRoleConfig",
     "CodingRunManifest",
+    "AuthorizedCodingWorkspace",
     "CodingRunControl",
     "TrustedEvidencePipeline",
     "WorkspaceFingerprintProvider",

@@ -7,6 +7,7 @@ from kaiwen_agent.runtime.durability import (
     RuntimeRunRecord,
     RuntimeRunStatus,
     RuntimeRunStore,
+    WorkspaceBinding,
 )
 from kaiwen_agent.runtime.models import AutonomyLevel, RuntimeIdentity
 from kaiwen_agent.runtime.profile import RuntimeVersionPins
@@ -30,10 +31,12 @@ class DurableRunManager:
         identity: RuntimeIdentity,
         autonomy: AutonomyLevel,
         version_pins: RuntimeVersionPins,
+        workspace_binding: WorkspaceBinding | None = None,
     ) -> RuntimeRunRecord:
         if identity.tenant_id is None or identity.user_id is None:
             raise ValueError("Durable workflow runs require trusted tenant_id and user_id")
         run = RuntimeRunRecord(
+            workspace_binding=workspace_binding,
             tenant_id=identity.tenant_id,
             user_id=identity.user_id,
             session_id=identity.session_id,
@@ -43,6 +46,26 @@ class DurableRunManager:
         )
         await self.store.save_runtime_run(run)
         return run
+
+    async def bind_workspace(
+        self, *, run_id: str, identity: RuntimeIdentity, binding: WorkspaceBinding
+    ) -> RuntimeRunRecord:
+        """Bind a not-yet-started run to its authorized workspace. Idempotent, write-once."""
+
+        current = await self.get(run_id=run_id, identity=identity)
+        if current is None:
+            raise KeyError("Runtime run was not found for this owner")
+        if current.workspace_binding == binding:
+            return current
+        if current.workspace_binding is not None:
+            raise ValueError("The run is already bound to a different workspace")
+        if current.status is not RuntimeRunStatus.CREATED:
+            raise ValueError("A run can only be bound to a workspace before it starts")
+        updated = current.model_copy(update={"workspace_binding": binding, "updated_at": utc_now()})
+        await self._save(
+            updated, expected_status=RuntimeRunStatus.CREATED, expected_owner_fence=None
+        )
+        return updated
 
     async def get(self, *, run_id: str, identity: RuntimeIdentity) -> RuntimeRunRecord | None:
         tenant_id, user_id = _required_owner(identity)

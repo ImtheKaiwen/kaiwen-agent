@@ -31,6 +31,22 @@ class RuntimeRunStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class WorkspaceBinding(BaseModel):
+    """The one workspace a durable run is authorized to read and verify.
+
+    It is written by the host when the run is created, stored in the durable run record,
+    and never changes afterwards. Tenant and owner are already part of the record. The
+    policy checksum ties the binding to the exact read/write policy of the workspace, so a
+    different policy under the same id does not match.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    workspace_id: str = Field(min_length=1, max_length=200)
+    root: str = Field(min_length=1, max_length=200)
+    policy_checksum: str = Field(min_length=1, max_length=200)
+
+
 class RuntimeRunRecord(BaseModel):
     """Owner-scoped durable workflow state, separate from the legacy AgentRun."""
 
@@ -45,6 +61,8 @@ class RuntimeRunRecord(BaseModel):
     autonomy: AutonomyLevel
     version_pins: RuntimeVersionPins
     status: RuntimeRunStatus = RuntimeRunStatus.CREATED
+    # Optional so records written before workspace binding existed load unchanged.
+    workspace_binding: WorkspaceBinding | None = None
     safe_boundary: str | None = Field(default=None, max_length=500)
     blocked_reason: str | None = Field(default=None, max_length=1_000)
     # Lease key held by the executing controller; recovery only judges runs that have one.
