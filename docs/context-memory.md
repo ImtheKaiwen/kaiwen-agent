@@ -28,7 +28,17 @@ schemas reduce the available input window before the provider is called. Overflo
 fails before a model request rather than silently dropping required authority.
 
 Recent conversation retrieval verifies tenant, conversation, and user identity.
-Conversation IDs supplied by a client are not sufficient on their own.
+Conversation IDs supplied by a client are not sufficient on their own. It selects the
+newest messages of the owner (not the first stored ones) and renders them in
+chronological order. Stores that implement the optional `ConversationWindowStore`
+capability (`list_latest_messages`, `message_exists`; the in-memory and SQLite stores do)
+answer this with a bounded query. A store implementing only `ConversationStore` still
+works through a forward-paging fallback that reads the whole conversation.
+`list_messages` keeps its oldest-first, `after_id` incremental contract.
+
+Under budget pressure, equal-priority items that carry `ContextItem.order` are kept
+newest first and then listed oldest first, so the latest turns survive and the final
+context stays chronological. Required items and priorities are unchanged.
 
 ## Session summaries
 
@@ -44,7 +54,12 @@ Automatic rolling compaction is a separate injected service. It calls a host-own
 structured `SummaryGenerator` only after a soft threshold, keeps recent raw messages,
 validates exact source-message provenance, preserves previous goals, decisions,
 constraints and artifact references, rejects detected credentials, and leaves raw
-conversation history untouched. Missing source cursors fail closed. Canonical prompts,
+conversation history untouched. Missing source cursors fail closed. Compaction reads
+forward from the stored cursor with `after_id`, so it keeps advancing in conversations
+longer than 1,000 messages and never skips messages between the cursor and the tail. Each
+pass summarizes at most `message_limit` messages; a longer backlog takes several passes.
+A store without `message_exists` cannot distinguish a missing cursor from an empty tail
+and reports no new messages. Canonical prompts,
 policy, task state, acceptance criteria, and permissions never come from this lossy
 summary.
 

@@ -22,6 +22,7 @@ class ContextBudgetAllocator:
                 not item.required,
                 -item.priority,
                 -item.relevance,
+                -(item.order if item.order is not None else 0),
             ),
         )
         used_by_kind: defaultdict[ContextKind, int] = defaultdict(int)
@@ -48,6 +49,16 @@ class ContextBudgetAllocator:
             used_by_kind[item.kind] += token_count
             total += token_count
 
+        # Selection prefers the newest ordered items; presentation restores chronology.
+        # Without `order` values this sort key is identical to the selection key.
+        accepted.sort(
+            key=lambda item: (
+                not item.required,
+                -item.priority,
+                -item.relevance,
+                item.order if item.order is not None else 0,
+            )
+        )
         return BuiltContext(
             items=accepted,
             estimated_tokens=total,

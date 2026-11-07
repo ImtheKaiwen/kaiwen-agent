@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Fix recent-conversation context freezing after 1,000 stored messages, context budgets
+  dropping the newest turns, and conversation compaction stalling after the first 1,000
+  messages. Add the optional `ConversationWindowStore` capability
+  (`list_latest_messages`, `message_exists`), implemented by the in-memory and SQLite
+  stores, and an optional `ContextItem.order`. Existing `ConversationStore` behavior,
+  including `after_id` reads, is unchanged.
 - Add `run.cancelled` (Python, JSON Schema, TypeScript, UI state) and the `cancelled`
   `AgentRun` status. Cancelling an agent run, scheduler, workflow, or job now ends in a
   terminal cancelled state, stops workers, and releases resources; an interrupted

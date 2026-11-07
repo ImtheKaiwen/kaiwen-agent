@@ -46,6 +46,10 @@ class ContextItem(BaseModel):
     priority: int = Field(default=0, ge=-1000, le=1000)
     relevance: float = Field(default=1, ge=0, le=1)
     required: bool = False
+    # Optional chronological position among items of equal priority and relevance.
+    # Under budget pressure higher values are kept first; the final context lists
+    # the surviving items in ascending order. Items without it behave as before.
+    order: int | None = Field(default=None, ge=0)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

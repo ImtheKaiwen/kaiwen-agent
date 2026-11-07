@@ -365,6 +365,51 @@ class SQLitePersistence:
 
         return await self._run(operation)
 
+    async def list_latest_messages(
+        self,
+        *,
+        tenant_id: str,
+        conversation_id: str,
+        user_id: str | None = None,
+        limit: int = 100,
+    ) -> list[ConversationMessage]:
+        if not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        await self.initialize()
+
+        def operation(connection: sqlite3.Connection) -> list[ConversationMessage]:
+            clauses = "tenant_id = ? AND conversation_id = ?"
+            parameters: list[object] = [tenant_id, conversation_id]
+            if user_id is not None:
+                clauses += " AND user_id = ?"
+                parameters.append(user_id)
+            rows = connection.execute(
+                f"""SELECT message_json FROM conversation_messages
+                WHERE {clauses} ORDER BY sequence DESC LIMIT ?""",  # noqa: S608 - fixed clauses
+                (*parameters, limit),
+            ).fetchall()
+            return [
+                ConversationMessage.model_validate_json(row["message_json"])
+                for row in reversed(rows)
+            ]
+
+        return await self._run(operation)
+
+    async def message_exists(
+        self, *, tenant_id: str, conversation_id: str, message_id: str
+    ) -> bool:
+        await self.initialize()
+
+        def operation(connection: sqlite3.Connection) -> bool:
+            row = connection.execute(
+                """SELECT 1 FROM conversation_messages
+                WHERE id = ? AND tenant_id = ? AND conversation_id = ?""",
+                (message_id, tenant_id, conversation_id),
+            ).fetchone()
+            return row is not None
+
+        return await self._run(operation)
+
     async def list_tasks(self, *, status: TaskStatus | None = None) -> list[AgentTask]:
         await self.initialize()
 

@@ -8,7 +8,11 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from kaiwen_agent.context_engine.token_counter import EstimatedTokenCounter, TokenCounter
 from kaiwen_agent.memory import MemoryManager, SecretDetector, SessionSummary
-from kaiwen_agent.realtime.conversation import ConversationMessage, ConversationStore
+from kaiwen_agent.realtime.conversation import (
+    ConversationMessage,
+    ConversationStore,
+    ConversationWindowStore,
+)
 
 
 class CompactionPolicy(BaseModel):
@@ -117,34 +121,26 @@ class ContextCompactionManager:
                 observed_tokens=self.token_counter.count(current_input),
                 reason="owner_scope_unavailable",
             )
-        messages = await self.conversations.list_messages(
-            tenant_id=tenant_id,
-            conversation_id=conversation_id,
-            limit=self.policy.message_limit,
-        )
-        scoped = [message for message in messages if message.user_id == user_id]
         previous = await self.memory.get_session_summary(
             tenant_id=tenant_id,
             user_id=user_id,
             conversation_id=conversation_id,
         )
-        pending = scoped
-        if previous is not None and previous.source_message_id is not None:
-            cursor = next(
-                (
-                    index
-                    for index, message in enumerate(scoped)
-                    if message.id == previous.source_message_id
-                ),
-                None,
+        cursor_id = previous.source_message_id if previous is not None else None
+        if cursor_id is not None and not await self._cursor_exists(
+            tenant_id=tenant_id, conversation_id=conversation_id, message_id=cursor_id
+        ):
+            return CompactionResult(
+                status=CompactionStatus.REJECTED,
+                observed_tokens=self._observed_tokens([], previous, current_input),
+                reason="source_cursor_missing",
             )
-            if cursor is None:
-                return CompactionResult(
-                    status=CompactionStatus.REJECTED,
-                    observed_tokens=self._observed_tokens(scoped, previous, current_input),
-                    reason="source_cursor_missing",
-                )
-            pending = scoped[cursor + 1 :]
+        pending = await self._pending_messages(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            after_id=cursor_id,
+        )
         observed = self._observed_tokens(pending, previous, current_input)
         if observed < self.policy.threshold_tokens:
             return CompactionResult(
@@ -211,6 +207,43 @@ class ContextCompactionManager:
             observed_tokens=observed,
             summary=summary,
         )
+
+    async def _cursor_exists(
+        self, *, tenant_id: str, conversation_id: str, message_id: str
+    ) -> bool:
+        # Stores without the optional window capability cannot distinguish a missing
+        # cursor from an empty tail; they are treated as "no new messages" instead.
+        if not isinstance(self.conversations, ConversationWindowStore):
+            return True
+        return await self.conversations.message_exists(
+            tenant_id=tenant_id, conversation_id=conversation_id, message_id=message_id
+        )
+
+    async def _pending_messages(
+        self, *, tenant_id: str, user_id: str, conversation_id: str, after_id: str | None
+    ) -> list[ConversationMessage]:
+        """Owner messages after the cursor, oldest first, bounded to one batch.
+
+        Reads forward from the summarized cursor with the incremental `after_id`
+        contract, so no message between the cursor and the tail is skipped. At most
+        `message_limit` candidates plus `recent_messages` retained messages are gathered;
+        anything further waits for the next compaction.
+        """
+
+        target = self.policy.message_limit + self.policy.recent_messages
+        pending: list[ConversationMessage] = []
+        while len(pending) < target:
+            page = await self.conversations.list_messages(
+                tenant_id=tenant_id,
+                conversation_id=conversation_id,
+                after_id=after_id,
+                limit=1000,
+            )
+            if not page:
+                break
+            pending.extend(item for item in page if item.user_id == user_id)
+            after_id = page[-1].id
+        return pending[:target]
 
     def _observed_tokens(
         self,
