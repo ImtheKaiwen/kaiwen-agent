@@ -3,6 +3,8 @@
 from kaiwen_agent.toolkits.commands import (
     CommandCatalog,
     CommandConfigurationError,
+    CommandExecution,
+    CommandExecutionObserver,
     CommandParameter,
     CommandPreset,
     CommandRunInput,
@@ -13,6 +15,11 @@ from kaiwen_agent.toolkits.commands import (
     SandboxUnavailableError,
     UnsupportedSandboxRunner,
     command_tool,
+)
+from kaiwen_agent.toolkits.docker_sandbox import (
+    DockerImageIdentity,
+    DockerSandboxConfig,
+    DockerSandboxRunner,
 )
 from kaiwen_agent.toolkits.filesystem import (
     WorkspaceBatchItem,
@@ -49,11 +56,28 @@ from kaiwen_agent.toolkits.project import (
 )
 from kaiwen_agent.toolkits.registry import ToolBundleDefinition, ToolBundleRegistry
 from kaiwen_agent.toolkits.search import WorkspaceSearchInput, workspace_search_tool
+from kaiwen_agent.toolkits.snapshot import (
+    ExecutionSnapshot,
+    SnapshotBuilder,
+    SnapshotError,
+    SnapshotFile,
+    SnapshotLimits,
+)
 from kaiwen_agent.toolkits.testing import testing_tools
 
 __all__ = [
     "CommandCatalog",
     "CommandConfigurationError",
+    "CommandExecution",
+    "CommandExecutionObserver",
+    "DockerImageIdentity",
+    "DockerSandboxConfig",
+    "DockerSandboxRunner",
+    "ExecutionSnapshot",
+    "SnapshotBuilder",
+    "SnapshotError",
+    "SnapshotFile",
+    "SnapshotLimits",
     "CommandParameter",
     "CommandPreset",
     "CommandRunInput",

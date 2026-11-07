@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
-from kaiwen_agent.artifacts import ArtifactManager
+from kaiwen_agent.artifacts import ArtifactManager, ArtifactMetadata
+from kaiwen_agent.kits.coding.verification.evidence import EVIDENCE_ORIGIN, EvidenceSigner
 from kaiwen_agent.quality import (
     VerificationContext,
     VerificationResult,
@@ -20,6 +21,9 @@ class JsonArtifactVerifier:
     verifier_id: str
     artifacts: ArtifactManager
     require_zero_exit_code: bool = False
+    # When set, only artifacts authenticated by the trusted execution path count, and
+    # the verdict is derived from recorded execution facts, never from a status field.
+    signer: EvidenceSigner | None = None
 
     async def verify(
         self,
@@ -43,6 +47,8 @@ class JsonArtifactVerifier:
                 findings=("current_evidence_not_found",),
             )
         matches.sort(key=lambda item: (item.created_at, item.id), reverse=True)
+        if self.signer is not None:
+            return await self._verify_trusted(requirement, context, matches)
         metadata = matches[0]
         artifact = await self.artifacts.read(context.artifact_context(), metadata.id)
         try:
@@ -89,6 +95,55 @@ class JsonArtifactVerifier:
             evidence_refs=(metadata.id,),
         )
 
+    async def _verify_trusted(
+        self,
+        requirement: ResolvedRequirement,
+        context: VerificationContext,
+        matches: list[ArtifactMetadata],
+    ) -> VerificationResult:
+        assert self.signer is not None
+        for metadata in matches:
+            artifact = await self.artifacts.read(context.artifact_context(), metadata.id)
+            if metadata.labels.get("evidence_origin") != EVIDENCE_ORIGIN or not self.signer.verify(
+                tenant_id=metadata.tenant_id,
+                owner_user_id=metadata.owner_user_id,
+                run_id=metadata.run_id,
+                content=artifact.content,
+                labels=metadata.labels,
+            ):
+                continue
+            try:
+                payload = json.loads(artifact.content)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if (
+                not isinstance(payload, dict)
+                or payload.get("origin") != EVIDENCE_ORIGIN
+                or payload.get("run_id") != context.run_id
+                or payload.get("requirement_id") != requirement.definition.id
+                or payload.get("snapshot_fingerprint") != context.protected_input_fingerprint
+            ):
+                continue
+            if (
+                payload.get("exit_code") == 0
+                and payload.get("timed_out") is False
+                and payload.get("cancelled") is False
+            ):
+                return self._result(
+                    requirement, VerificationStatus.PASS, evidence_refs=(metadata.id,)
+                )
+            outcome = payload.get("outcome")
+            reason = outcome if outcome in {"failed", "timed_out", "cancelled"} else "failed"
+            return self._result(
+                requirement,
+                VerificationStatus.FAIL,
+                evidence_refs=(metadata.id,),
+                findings=(f"command_{reason}",),
+            )
+        return self._result(
+            requirement, VerificationStatus.INCONCLUSIVE, findings=("evidence_not_trusted",)
+        )
+
     def _result(
         self,
         requirement: ResolvedRequirement,
@@ -106,7 +161,9 @@ class JsonArtifactVerifier:
         )
 
 
-def coding_verifiers(artifacts: ArtifactManager) -> tuple[JsonArtifactVerifier, ...]:
+def coding_verifiers(
+    artifacts: ArtifactManager, *, signer: EvidenceSigner | None = None
+) -> tuple[JsonArtifactVerifier, ...]:
     command_verifiers = {"coding.acceptance", "coding.tests"}
     identifiers = (
         "coding.acceptance",
@@ -126,6 +183,7 @@ def coding_verifiers(artifacts: ArtifactManager) -> tuple[JsonArtifactVerifier, 
             verifier_id=identifier,
             artifacts=artifacts,
             require_zero_exit_code=identifier in command_verifiers,
+            signer=signer if identifier in command_verifiers else None,
         )
         for identifier in identifiers
     )
@@ -134,8 +192,10 @@ def coding_verifiers(artifacts: ArtifactManager) -> tuple[JsonArtifactVerifier, 
 def install_coding_verifiers(
     registry: VerifierRegistry,
     artifacts: ArtifactManager,
+    *,
+    signer: EvidenceSigner | None = None,
 ) -> tuple[JsonArtifactVerifier, ...]:
-    verifiers = coding_verifiers(artifacts)
+    verifiers = coding_verifiers(artifacts, signer=signer)
     for verifier in verifiers:
         existing = registry.get(verifier.verifier_id)
         if existing is None:
