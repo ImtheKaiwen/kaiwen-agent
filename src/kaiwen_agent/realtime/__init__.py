@@ -17,7 +17,9 @@ from kaiwen_agent.realtime.conversation import (
     ConversationModality,
     ConversationRole,
     ConversationStore,
+    ConversationWindowStore,
     InMemoryConversationStore,
+    latest_messages,
 )
 from kaiwen_agent.realtime.events import (
     RealtimeEventDelivery,
@@ -81,9 +83,11 @@ __all__ = [
     "ConversationModality",
     "ConversationRole",
     "ConversationStore",
+    "ConversationWindowStore",
     "FakeRealtimeConnection",
     "FakeRealtimeProvider",
     "InMemoryConversationStore",
+    "latest_messages",
     "InMemoryRealtimeEventSink",
     "InMemoryRealtimeSessionStore",
     "InMemoryTaskSubmissionPort",

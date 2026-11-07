@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -54,6 +55,64 @@ class ConversationStore(Protocol):
     ) -> list[ConversationMessage]: ...
 
 
+@runtime_checkable
+class ConversationWindowStore(Protocol):
+    """Optional capability: bounded newest-window reads and cursor existence checks.
+
+    `list_messages` keeps its oldest-first, `after_id` incremental contract. Stores that
+    also implement this protocol let context code read the newest messages and verify a
+    cursor without scanning the conversation from its start.
+    """
+
+    async def list_latest_messages(
+        self,
+        *,
+        tenant_id: str,
+        conversation_id: str,
+        user_id: str | None = None,
+        limit: int = 100,
+    ) -> list[ConversationMessage]:
+        """Return the newest `limit` matching messages in chronological order."""
+        ...
+
+    async def message_exists(
+        self, *, tenant_id: str, conversation_id: str, message_id: str
+    ) -> bool: ...
+
+
+async def latest_messages(
+    store: ConversationStore,
+    *,
+    tenant_id: str,
+    conversation_id: str,
+    user_id: str | None = None,
+    limit: int,
+) -> list[ConversationMessage]:
+    """Newest `limit` messages for one owner scope, oldest first.
+
+    Uses the store's window capability when present. Otherwise it pages forward with the
+    standard `after_id` contract, keeping only a bounded tail; that is correct for any
+    store but reads the whole conversation.
+    """
+
+    if not 1 <= limit <= 1000:
+        raise ValueError("limit must be between 1 and 1000")
+    if isinstance(store, ConversationWindowStore):
+        return await store.list_latest_messages(
+            tenant_id=tenant_id, conversation_id=conversation_id, user_id=user_id, limit=limit
+        )
+    tail: deque[ConversationMessage] = deque(maxlen=limit)
+    after_id: str | None = None
+    while True:
+        page = await store.list_messages(
+            tenant_id=tenant_id, conversation_id=conversation_id, after_id=after_id, limit=1000
+        )
+        if not page:
+            return list(tail)
+        tail.extend(item for item in page if user_id is None or item.user_id == user_id)
+        after_id = page[-1].id
+
+
 class InMemoryConversationStore:
     def __init__(self) -> None:
         self._messages: list[ConversationMessage] = []
@@ -88,3 +147,38 @@ class InMemoryConversationStore:
                 )
                 messages = messages[index + 1 :]
             return [item.model_copy(deep=True) for item in messages[:limit]]
+
+    async def list_latest_messages(
+        self,
+        *,
+        tenant_id: str,
+        conversation_id: str,
+        user_id: str | None = None,
+        limit: int = 100,
+    ) -> list[ConversationMessage]:
+        if not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        async with self._lock:
+            selected: list[ConversationMessage] = []
+            for item in reversed(self._messages):
+                if (
+                    item.tenant_id == tenant_id
+                    and item.conversation_id == conversation_id
+                    and (user_id is None or item.user_id == user_id)
+                ):
+                    selected.append(item.model_copy(deep=True))
+                    if len(selected) == limit:
+                        break
+            selected.reverse()
+            return selected
+
+    async def message_exists(
+        self, *, tenant_id: str, conversation_id: str, message_id: str
+    ) -> bool:
+        async with self._lock:
+            return any(
+                item.id == message_id
+                and item.tenant_id == tenant_id
+                and item.conversation_id == conversation_id
+                for item in self._messages
+            )

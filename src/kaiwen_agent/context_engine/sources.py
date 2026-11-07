@@ -11,7 +11,7 @@ from kaiwen_agent.context_engine.models import (
 from kaiwen_agent.memory.long_term import LongTermMemoryManager
 from kaiwen_agent.memory.manager import MemoryManager
 from kaiwen_agent.memory.models import MemoryOperationContext
-from kaiwen_agent.realtime.conversation import ConversationStore
+from kaiwen_agent.realtime.conversation import ConversationStore, latest_messages
 
 
 class ContextSource(Protocol):
@@ -68,23 +68,23 @@ class RecentConversationSource:
     async def collect(self, request: ContextBuildRequest) -> list[ContextItem]:
         if request.tenant_id is None or request.user_id is None or request.conversation_id is None:
             return []
-        messages = await self.store.list_messages(
+        scoped = await latest_messages(
+            self.store,
             tenant_id=request.tenant_id,
             conversation_id=request.conversation_id,
-            limit=1000,
+            user_id=request.user_id,
+            limit=self.message_limit,
         )
-        scoped = [message for message in messages if message.user_id == request.user_id][
-            -self.message_limit :
-        ]
         return [
             ContextItem(
                 source=self.name,
                 kind=ContextKind.RECENT_CONVERSATION,
                 content=f"{message.role.value}: {message.text}",
                 priority=700,
+                order=position,
                 metadata={"message_id": message.id},
             )
-            for message in scoped
+            for position, message in enumerate(scoped)
         ]
 
 
