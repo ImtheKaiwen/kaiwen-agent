@@ -410,7 +410,7 @@ Each defect was reproduced with a failing test before its fix.
 - [x] Merged as pull request 7 (squash commit `87d913a`) after all 10 CI jobs passed on
       the exact head, including the real Docker tests and example on Linux.
 
-### M6.3.1: Run identity, fresh snapshots and evidence correctness (in review)
+### M6.3.1: Run identity, fresh snapshots and evidence correctness (completed)
 
 - [x] `WorkflowController(fingerprint_provider=...)` evaluates every completion gate against a
       fresh trusted fingerprint, brackets a passing evaluation to detect a concurrent change,
@@ -429,6 +429,30 @@ Each defect was reproduced with a failing test before its fix.
   (Linux engine, WSL2), a single development machine, in addition to Linux CI.
 - Not done: running a model agent as a worker, supervisor and delegation tools, reviewer
   approvals and milestone acceptance (M6.3.2 to M6.3.4); atomic verification of the workspace.
+- [x] Merged as pull request 8 (squash commit `79c31ef`) after all 10 CI jobs passed on the
+      exact head, including the real Docker tests and examples on Linux.
+
+### M6.3.2: AgentRuntime worker integration and team context foundation (in review)
+
+- [x] ADR 0014: Private Agent Context + Shared Durable Project State + Bounded Task Handoffs +
+      Lead Coordination View, with project, team, agent and lead scopes and the line between
+      authoritative records and model-authored text.
+- [x] `AgentRuntimeWorker`: a configured `AgentRuntime` as a `Worker` through the existing
+      scheduler; host-owned permissions, tools and role; trusted identity from the durable run;
+      bounded handoff-shaped result with `verified: false`; cooperative checkpoints and progress.
+- [x] `WorkspaceBinding` in the durable run record (optional, write-once, immutable in the store),
+      enforced by `WorkflowController(workspace_binding=...)` and by coding workers.
+- [x] `AuthorizedCodingWorkspace`: coding workers that can produce evidence are refused unless the
+      fingerprint provider, catalog, runner, recorder, signed verifiers and controller agree.
+- [x] `TaskContextPackage`, `TaskContextAssembler`, `TaskHandoff`, `private_conversation_id`:
+      bounded context through the existing `ContextBuilder`; private per-task conversations;
+      handoffs from completed dependency tasks; references verified in the run's owner scope.
+- Verified: deterministic AgentRuntime-worker tests (scripted model, not an external LLM), and a
+  real-container workflow where an AgentRuntime worker runs tests in Docker and the gate rejects a
+  false model claim, plus a demonstrator example.
+- Not done: Lead coordination view and delegation tools (M6.3.3), reviewer approval and team
+  acceptance (M6.3.4), isolated parallel writers, worktree merging, real external LLM verification,
+  atomic workspace verification.
 - [~] Not complete until the pull request CI passes on the exact head and the owner merges it.
 
 ### M7 design items (not started)

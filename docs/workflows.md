@@ -54,6 +54,23 @@ run record (it must exist for that owner and be running), the run id is never re
 permissions come from the calling host. It is only a context primitive; it does not run
 agents or tools.
 
+## Run-to-workspace binding and coding workers
+
+A durable run can be bound to one workspace with `WorkspaceBinding` (workspace id, root, policy
+checksum), passed to `DurableRunManager.create(workspace_binding=...)` or set once before
+start with `bind_workspace`. It is stored in the durable run record, so it survives restarts,
+the store refuses to change it, and old records without one load unchanged.
+`WorkflowController(workspace_binding=...)` blocks a run whose durable binding differs
+(`workspace_binding_mismatch`) before any task runs; without it nothing changes for other
+workflows. A coding worker built with `AgentRuntimeWorker(workspace=AuthorizedCodingWorkspace(...))`
+re-checks the binding of the run it executes for.
+
+`AuthorizedCodingWorkspace` lists every inconsistency between the workspace policy, fingerprint
+provider, command catalog, sandbox runner, evidence pipeline and controller. A worker that can
+produce execution evidence (`evidence_tool_names`) is refused at construction unless the
+controller uses that workspace's fingerprint provider and binding and its gate uses the
+pipeline's signed verifiers. Fixed-fingerprint workflows are not affected.
+
 ## Recovery scope
 
 The runtime run and scheduled task records are durable when the host supplies durable
