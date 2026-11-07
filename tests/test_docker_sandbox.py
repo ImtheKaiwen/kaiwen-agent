@@ -160,7 +160,11 @@ def make_runner(
     scratch = tmp_path / "scratch"
     scratch.mkdir()
     runner = DockerSandboxRunner(
-        DockerSandboxConfig(image=IMAGE, docker_path=DOCKER, **config),  # type: ignore[arg-type]
+        DockerSandboxConfig(
+            image=IMAGE,
+            docker_path=DOCKER,
+            **{"user": "65534:65534", **config},  # type: ignore[arg-type]
+        ),
         filesystem=filesystem,
         root="main",
         launcher=docker,
@@ -541,3 +545,108 @@ def test_modification_is_reported_after_a_timeout_too(tmp_path: Path) -> None:
     runner, root, _ = make_runner(tmp_path, docker)
     result = asyncio.run(runner.run(command(root, timeout=0.2)))
     assert result.timed_out and result.snapshot_unchanged is False
+
+
+def test_invalid_utf8_output_stays_within_the_encoded_byte_budget(tmp_path: Path) -> None:
+    docker = FakeDocker(run=FakeProcess(stdout=b"\xff" * 1_000, stderr=b"\xfe" * 1_000))
+    runner, root, _ = make_runner(tmp_path, docker)
+    result = asyncio.run(runner.run(command(root, max_output=1_000)))
+    assert len(result.stdout.encode()) <= 500
+    assert len(result.stderr.encode()) <= 500
+    assert len(result.stdout.encode()) + len(result.stderr.encode()) <= 1_000
+    assert result.output_truncated is True
+
+
+def test_multibyte_output_cut_inside_a_character_stays_within_budget(tmp_path: Path) -> None:
+    docker = FakeDocker(run=FakeProcess(stdout="\u20ac".encode() * 300))  # 900 bytes
+    runner, root, _ = make_runner(tmp_path, docker)
+    result = asyncio.run(runner.run(command(root, max_output=1_000)))
+    assert len(result.stdout.encode()) <= 500
+    assert result.output_truncated is True
+    assert set(result.stdout) <= {"\u20ac", "\ufffd"}
+
+
+def test_output_exactly_at_the_budget_is_not_reported_truncated(tmp_path: Path) -> None:
+    docker = FakeDocker(run=FakeProcess(stdout=b"a" * 500, stderr="\u00e9".encode() * 250))
+    runner, root, _ = make_runner(tmp_path, docker)
+    result = asyncio.run(runner.run(command(root, max_output=1_000)))
+    assert result.stdout == "a" * 500 and result.stderr == "\u00e9" * 250
+    assert result.output_truncated is False
+
+
+def test_invalid_utf8_does_not_lose_the_result_or_evidence_in_the_catalog(
+    tmp_path: Path,
+) -> None:
+    from kaiwen_agent.context import AgentContext
+    from kaiwen_agent.toolkits import CommandCatalog, CommandPreset, CommandRunInput
+
+    docker = FakeDocker(run=FakeProcess(stdout=b"\xff" * 2_000, code=1))
+    runner, root, _ = make_runner(tmp_path, docker)
+    catalog = CommandCatalog(
+        filesystem=runner.filesystem,
+        root="main",
+        runner=runner,
+        presets=(
+            CommandPreset(
+                id="unit",
+                category="test",
+                executable="python",
+                arguments=("-m", "unittest"),
+                max_output_bytes=1_000,
+                timeout_seconds=5,
+            ),
+        ),
+    )
+    context = AgentContext(
+        session_id="s", metadata={"workspace_id": "workspace-1"}, permissions=frozenset()
+    )
+    result = asyncio.run(catalog.execute(context, CommandRunInput(command_id="unit")))
+    assert result.exit_code == 1 and result.output_truncated is True
+    assert len(result.stdout.encode()) <= 500
+
+
+def test_cleanup_failure_is_reported_not_treated_as_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import kaiwen_agent.toolkits.docker_sandbox as module
+
+    runner, root, _ = make_runner(tmp_path, FakeDocker())
+    assert asyncio.run(runner.run(command(root))).cleanup_failed is False
+    monkeypatch.setattr(module, "_remove_tree", lambda _path: False)
+    with caplog.at_level("ERROR", logger="kaiwen_agent.toolkits.docker_sandbox"):
+        result = asyncio.run(runner.run(command(root)))
+    assert result.cleanup_failed is True
+    assert any("cleanup" in record.getMessage().lower() for record in caplog.records)
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or getattr(os, "geteuid", lambda: 0)() == 0, reason="needs non-root POSIX"
+)
+def test_remove_tree_deletes_restrictive_directories_owned_by_the_host_user(
+    tmp_path: Path,
+) -> None:
+    import kaiwen_agent.toolkits.docker_sandbox as module
+
+    target = tmp_path / "run"
+    (target / "out" / "deep").mkdir(parents=True)
+    (target / "out" / "deep" / "file.txt").write_text("x")
+    (target / "out" / "deep").chmod(0o500)
+    (target / "out").chmod(0o500)
+    assert module._remove_tree(target) is True
+    assert not target.exists()
+    assert module._remove_tree(target) is True  # already gone
+
+
+@pytest.mark.skipif(os.name != "posix", reason="host user ids")
+def test_default_container_user_is_the_non_root_host_user() -> None:
+    config = DockerSandboxConfig(image=IMAGE)
+    uid = os.getuid()  # type: ignore[attr-defined]
+    expected = f"{uid}:{os.getgid()}" if uid != 0 else "65534:65534"  # type: ignore[attr-defined]
+    assert config.effective_user == expected
+    assert not config.effective_user.startswith("0:")
+    assert DockerSandboxConfig(image=IMAGE, user="1234:4321").effective_user == "1234:4321"
+
+
+def test_default_container_user_is_never_root_on_any_platform() -> None:
+    uid, gid = DockerSandboxConfig(image=IMAGE).effective_user.split(":")
+    assert int(uid) != 0 and int(gid) != 0

@@ -116,6 +116,8 @@ class SandboxResult(BaseModel):
     # or removed while the command ran (new files are allowed); see `modified_paths`.
     snapshot_unchanged: bool | None = None
     modified_paths: tuple[str, ...] = ()
+    # True when the per-run copy of the workspace could not be fully removed afterwards.
+    cleanup_failed: bool = False
 
 
 class SandboxRunner(Protocol):

@@ -72,7 +72,11 @@ class DockerSandboxConfig(BaseModel):
     image: str = Field(min_length=1, max_length=400)
     require_digest: bool = True
     docker_path: str | None = None
-    user: str = Field(default="65534:65534", pattern=r"^[0-9]{1,9}:[0-9]{1,9}$")
+    # None selects the non-root host user on POSIX (so files the container creates stay
+    # removable by the host) and 65534:65534 elsewhere. An explicit uid:gid that differs
+    # from the host user can leave directories the host cannot delete; the runner then
+    # reports `cleanup_failed`.
+    user: str | None = Field(default=None, pattern=r"^[0-9]{1,9}:[0-9]{1,9}$")
     memory_mb: int = Field(default=512, ge=16, le=65_536)
     cpus: float = Field(default=1.0, gt=0, le=64)
     pids_limit: int = Field(default=128, ge=8, le=32_768)
@@ -93,7 +97,9 @@ class DockerSandboxConfig(BaseModel):
 
     @field_validator("user")
     @classmethod
-    def reject_root(cls, value: str) -> str:
+    def reject_root(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         uid, gid = (int(part) for part in value.split(":"))
         if uid == 0 or gid == 0:
             raise ValueError("The sandbox must not run as root")
@@ -109,6 +115,18 @@ class DockerSandboxConfig(BaseModel):
             if len(item) > 1_000 or redactor.redact(f"{name}={item}") != f"{name}={item}":
                 raise ValueError("Sandbox environment must not contain secrets")
         return dict(value)
+
+    @property
+    def effective_user(self) -> str:
+        """The numeric uid:gid the container runs as. Never root."""
+
+        if self.user is not None:
+            return self.user
+        getuid = getattr(os, "getuid", None)
+        getgid = getattr(os, "getgid", None)
+        if getuid is not None and getgid is not None and getuid() != 0 and getgid() != 0:
+            return f"{getuid()}:{getgid()}"
+        return "65534:65534"
 
     def model_post_init(self, _context: object) -> None:
         if self.require_digest and _DIGEST_REF.fullmatch(self.image) is None:
@@ -262,7 +280,7 @@ class DockerSandboxRunner:
             "--network",
             "bridge" if command.network_enabled else "none",
             "--user",
-            self.config.user,
+            self.config.effective_user,
             "--read-only",
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges",
@@ -322,6 +340,7 @@ class DockerSandboxRunner:
         ).resolve()
         name = f"kaiwen-sandbox-{uuid.uuid4().hex}"
         started = time.monotonic()
+        result: SandboxResult | None = None
         try:
             # mkdtemp creates the directory owner-only (0700). The copy inside is
             # world-writable so the container user can write, which is safe only while no
@@ -355,13 +374,21 @@ class DockerSandboxRunner:
                 modified = await asyncio.to_thread(snapshot.changed_paths, workspace_copy)
             except Exception:  # noqa: BLE001 - an unverifiable copy counts as modified
                 logger.warning("Snapshot comparison failed", exc_info=True)
-                return result.model_copy(update={"snapshot_unchanged": False})
-            return result.model_copy(
-                update={"snapshot_unchanged": not modified, "modified_paths": modified}
-            )
+                result = result.model_copy(update={"snapshot_unchanged": False})
+            else:
+                result = result.model_copy(
+                    update={"snapshot_unchanged": not modified, "modified_paths": modified}
+                )
         finally:
             await asyncio.shield(self._remove_container(name))
-            shutil.rmtree(run_directory, ignore_errors=True)
+            leaked = not _remove_tree(run_directory)
+            if leaked:
+                logger.error(
+                    "Sandbox cleanup failed: a run directory could not be removed (%s)",
+                    run_directory.name,
+                )
+        assert result is not None
+        return result.model_copy(update={"cleanup_failed": leaked})
 
     async def _run_container(
         self,
@@ -518,7 +545,56 @@ class _BoundedReader:
                 return
 
     def text(self) -> str:
-        return bytes(self._buffer).decode("utf-8", errors="replace")
+        """Decoded text whose UTF-8 encoding never exceeds the byte budget.
+
+        Replacement characters are three bytes, so decoding invalid input can grow past
+        the retained raw bytes; the encoded result is cut back at a character boundary.
+        """
+
+        decoded = bytes(self._buffer).decode("utf-8", errors="replace")
+        encoded = decoded.encode("utf-8")
+        if len(encoded) > self._limit:
+            decoded = encoded[: self._limit].decode("utf-8", errors="ignore")
+            self.truncated = True
+        return decoded
+
+
+def _remove_tree(path: Path) -> bool:
+    """Remove `path`, including directories the container made unwritable. True on success.
+
+    Directories created by a container running as the host user can have restrictive
+    modes; the host owns them, so it restores access and retries. Entries owned by another
+    uid in a directory the host cannot write cannot be removed here, and False is returned.
+    """
+
+    try:
+        shutil.rmtree(path)
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError:
+        pass
+    if os.name == "posix":
+        _restore_access(path)
+    try:
+        shutil.rmtree(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return not path.exists()
+    return True
+
+
+def _restore_access(path: Path) -> None:
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o700, follow_symlinks=False)
+    try:
+        entries = list(os.scandir(path))
+    except OSError:
+        return
+    for entry in entries:
+        if entry.is_dir(follow_symlinks=False):
+            _restore_access(Path(entry.path))
 
 
 def _container_workdir(command: SandboxCommand, root: Path, snapshot: ExecutionSnapshot) -> str:

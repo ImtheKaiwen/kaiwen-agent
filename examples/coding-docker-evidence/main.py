@@ -2,7 +2,9 @@
 
 Requires a running Linux Docker engine and a locally available, digest-pinned image
 (`docker pull <image>`). Without an engine the example reports why and exits cleanly;
-it never runs the tests on the host. Set KAIWEN_DOCKER_IMAGE to use another pinned image.
+it never runs the tests on the host. Set KAIWEN_REQUIRE_DOCKER=1 to make an unavailable
+engine a failure, and KAIWEN_DOCKER_IMAGE to use another pinned image. A real run that
+does not produce a passing gate and then a non-passing gate exits with an error.
 """
 
 from __future__ import annotations
@@ -46,6 +48,8 @@ async def main() -> None:
         root = Path(directory) / "project"
         (root / "pkg").mkdir(parents=True)
         (root / "tests").mkdir()
+        # `unittest discover -s tests -t .` needs `tests` to be an importable package.
+        (root / "tests" / "__init__.py").write_text("")
         (root / "pkg" / "__init__.py").write_text("")
         (root / "pkg" / "calc.py").write_text("def add(a, b):\n    return a + b\n")
         (root / "tests" / "test_calc.py").write_text(
@@ -115,6 +119,8 @@ async def main() -> None:
             await runner.verify()
         except SandboxUnavailableError as error:
             print(f"Docker sandbox unavailable ({error}); nothing was executed.")
+            if os.environ.get("KAIWEN_REQUIRE_DOCKER") == "1":
+                raise SystemExit("KAIWEN_REQUIRE_DOCKER is set, so this is a failure") from error
             return
 
         snapshot = runner.capture()
@@ -129,13 +135,28 @@ async def main() -> None:
             context, CommandRunInput(command_id="unit.tests"), category="test"
         )
         print("exit code:", executed.exit_code, "| snapshot:", snapshot.fingerprint[:12])
-        print("gate for the executed snapshot:", await verdict(snapshot.fingerprint))
+        executed_verdict = await verdict(snapshot.fingerprint)
+        print("gate for the executed snapshot:", executed_verdict)
 
         # Any source change gives a new fingerprint, so earlier evidence no longer counts.
         (root / "pkg" / "calc.py").write_text("def add(a, b):\n    return a - b\n")
         with runner.capture() as changed:
-            print("gate after a source change:", await verdict(changed.fingerprint))
+            changed_verdict = await verdict(changed.fingerprint)
+        print("gate after a source change:", changed_verdict)
         snapshot.close()
+
+        # A real run that does not behave as documented must fail loudly.
+        problems = []
+        if executed.exit_code != 0:
+            problems.append(f"tests exited with {executed.exit_code}: {executed.stderr[-500:]}")
+        if executed_verdict != "pass":
+            problems.append(f"expected a passing gate, got {executed_verdict}")
+        if changed_verdict == "pass":
+            problems.append("a changed source must not pass on old evidence")
+        if executed.cleanup_failed:
+            problems.append("the sandbox could not remove its temporary run directory")
+        if problems:
+            raise SystemExit("Docker evidence example failed: " + "; ".join(problems))
 
 
 if __name__ == "__main__":

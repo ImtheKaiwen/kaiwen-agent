@@ -69,6 +69,14 @@ jobs:
         env:
           KAIWEN_REQUIRE_DOCKER: ${{ runner.os == 'Linux' && '1' || '' }}
         run: python -m pytest -rs
+      - name: Run the Docker evidence example against a real engine
+        if: runner.os == 'Linux'
+        env:
+          KAIWEN_REQUIRE_DOCKER: "1"
+          KAIWEN_DOCKER_IMAGE: python@sha256:e064671ca452259bab50e8e2c7bd896e39e9a343bb06ca25234adf6fe18d0fc7
+        run: |
+          docker pull --quiet "$KAIWEN_DOCKER_IMAGE"
+          python examples/coding-docker-evidence/main.py
       - name: Run executable examples
         shell: bash
         env:

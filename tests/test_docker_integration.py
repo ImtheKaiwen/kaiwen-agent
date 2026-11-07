@@ -13,6 +13,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -300,7 +301,9 @@ def test_real_container_isolation_properties(tmp_path: Path) -> None:
             os.environ.pop("KAIWEN_PROBE_SECRET", None)
         assert result.exit_code == 0, result.stderr
         info = json.loads(result.stdout.strip().splitlines()[-1])
-        assert (info["uid"], info["gid"]) == (65534, 65534)
+        expected_uid, expected_gid = (int(part) for part in runner.config.effective_user.split(":"))
+        assert (info["uid"], info["gid"]) == (expected_uid, expected_gid)
+        assert info["uid"] != 0
         assert int(info["cap_eff"], 16) == 0
         assert info["no_new_privs"] == "1"
         assert info["network"] is False
@@ -399,4 +402,93 @@ def test_real_container_modifying_snapshot_sources_never_passes(tmp_path: Path) 
 
     asyncio.run(scenario())
     assert (root / "pkg" / "calc.py").read_text() == TEST_SOURCE  # the host copy is untouched
+    assert leftover_containers() == []
+
+
+LINUX_NON_ROOT = sys.platform.startswith("linux") and os.getuid() not in (0, 65534)  # type: ignore[attr-defined]
+
+
+@pytest.mark.skipif(not LINUX_NON_ROOT, reason="needs a non-root Linux host user")
+def test_real_container_created_restrictive_directories_are_removed(tmp_path: Path) -> None:
+    """The run directory must not leak when the command creates owner-only directories."""
+
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    mkdirs = (
+        "import os\n"
+        "os.makedirs('out/deep')\n"
+        "open('out/deep/file.txt', 'w').write('x')\n"
+        "os.chmod('out/deep', 0o500)\n"
+        "os.chmod('out', 0o500)\n"
+    )
+    root, runner, _artifacts, catalog_for, _gate = build_stack(
+        tmp_path, (script("mkdirs", "mkdirs.py"),), files={"mkdirs.py": mkdirs}
+    )
+    runner._temporary_directory = scratch
+    results = []
+
+    async def scenario() -> None:
+        catalog = catalog_for(runner)
+        results.append(
+            await catalog.execute(context(), CommandRunInput(command_id="mkdirs"), category="test")
+        )
+
+    asyncio.run(scenario())
+    assert results[0].exit_code == 0, results[0].stderr
+    assert results[0].cleanup_failed is False
+    assert list(scratch.iterdir()) == [], "the temporary run directory was leaked"
+    assert leftover_containers() == []
+
+
+@pytest.mark.skipif(not LINUX_NON_ROOT, reason="needs a non-root Linux host user")
+def test_real_container_with_a_foreign_uid_reports_a_failed_cleanup(tmp_path: Path) -> None:
+    """Reproduces the ownership problem: a container uid that differs from the host user
+    leaves directories the host cannot remove. The runner must say so, not claim success."""
+
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    mkdirs = "import os\nos.makedirs('out')\nopen('out/file.txt', 'w').write('x')\n"
+    root, runner, _artifacts, catalog_for, _gate = build_stack(
+        tmp_path,
+        (script("mkdirs", "mkdirs.py"),),
+        files={"mkdirs.py": mkdirs},
+        user="65534:65534",
+    )
+    runner._temporary_directory = scratch
+    results = []
+
+    async def scenario() -> None:
+        results.append(
+            await catalog_for(runner).execute(
+                context(), CommandRunInput(command_id="mkdirs"), category="test"
+            )
+        )
+
+    try:
+        asyncio.run(scenario())
+        assert results[0].exit_code == 0, results[0].stderr
+        assert results[0].cleanup_failed is True
+        assert list(scratch.iterdir()), "the host should not have been able to remove it"
+    finally:
+        # Test-only cleanup of the files the foreign uid owns, as root inside a container.
+        for leftover in scratch.iterdir():
+            subprocess.run(
+                [
+                    "docker",
+                    "run",
+                    "--rm",
+                    "--pull=never",
+                    "--user",
+                    "0:0",
+                    "--entrypoint",
+                    "rm",
+                    "--mount",
+                    f"type=bind,source={scratch},target=/scratch",
+                    IMAGE,
+                    "-rf",
+                    f"/scratch/{leftover.name}",
+                ],
+                capture_output=True,
+                timeout=120,
+            )
     assert leftover_containers() == []
