@@ -10,6 +10,8 @@
   timed-out, stale, or unsigned evidence never passes. `testing_tools` can run test, lint
   and typecheck presets without approval only for an isolating runner. `CommandCatalog`
   gains optional observers and `SandboxResult` gains optional snapshot and image fields.
+  Evidence is recorded only for runners the host names (`trusted_runners`), runs that
+  change their own snapshot files never pass, and the per-run directory is owner-only.
   See ADR 0012 and `docs/coding-kits/PERMISSIONS_AND_SANDBOX.md`.
 - Fix recent-conversation context freezing after 1,000 stored messages, context budgets
   dropping the newest turns, and conversation compaction stalling after the first 1,000

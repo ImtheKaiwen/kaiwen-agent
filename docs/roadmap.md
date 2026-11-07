@@ -397,6 +397,10 @@ Each defect was reproduced with a failing test before its fix.
       generated from the runner's result, and failed, timed-out, stale, unsigned, or
       other-owner evidence never passes. Optional unattended approval for test, lint and
       typecheck presets with an isolating runner.
+- Review corrections: unittest discovery fixture and probe scripts in the real Docker
+      tests (presets still reject metacharacters), host-named `trusted_runners` for
+      evidence provenance, owner-only per-run directory, and post-run detection of
+      modified snapshot files. A flaky fixed-sleep M5 test was changed to a bounded poll.
 - Verified: scripted-engine tests for argv, limits, timeout, cancellation, cleanup and
   fail-closed paths; real-container tests run on Linux CI only (required there).
 - Not exercised or supported: Windows Docker Desktop/WSL2, macOS, rootless Docker,

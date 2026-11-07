@@ -71,19 +71,56 @@ workspace for each run.
 
 ### Evidence
 
-Register `CommandEvidenceRecorder` as an observer of `CommandCatalog` with
-`EvidenceBinding`s that map a preset to a requirement and evidence type. After a real
-run it records an owner- and run-scoped artifact containing the preset, validated
-parameters, snapshot fingerprint, image identity, exit code, outcome, duration,
-checksums, and bounded redacted output, signed with a host-held `EvidenceSigner`. Pass
-the same signer to `install_coding_verifiers(..., signer=...)`: the command verifiers
-(`coding.tests`, `coding.acceptance`) then accept only signed evidence and derive the
-verdict from the recorded exit code and flags. Failure, timeout, cancellation, missing
-evidence, a different run or owner, or a different snapshot fingerprint never pass.
-Results from runners that do not report a snapshot (such as `FakeSandboxRunner`) record
-no evidence. The run id comes from the trusted `runtime_run_id` in the agent context
-metadata. Without a signer the verifiers keep their earlier behavior and trust
-host-written JSON artifacts.
+Register `CommandEvidenceRecorder` as an observer of `CommandCatalog`, naming the
+runners the host trusts (`trusted_runners`, required) and `EvidenceBinding`s that map a
+preset to a requirement and evidence type. After a real run it records an owner- and
+run-scoped artifact containing the preset, validated parameters, snapshot fingerprint,
+image identity, exit code, outcome, duration, snapshot integrity, checksums, and bounded
+redacted output, signed with a host-held `EvidenceSigner`. Pass the same signer to
+`install_coding_verifiers(..., signer=...)`: the command verifiers (`coding.tests`,
+`coding.acceptance`) then accept only signed evidence and derive the verdict from the
+recorded exit code and flags. Failure, timeout, cancellation, missing evidence, a
+different run or owner, a different snapshot fingerprint, or a run that changed its own
+snapshot files never pass. The run id comes from the trusted `runtime_run_id` in the
+agent context metadata. Without a signer the verifiers keep their earlier behavior and
+trust host-written JSON artifacts.
+
+Provenance. Fields of a `SandboxResult` (fingerprint, image, exit code) can be filled in
+by any runner, including `FakeSandboxRunner`, so they are not provenance. The recorder
+records only when the runner object configured on the `CommandCatalog` is one the host
+named in `trusted_runners` (or a runner sharing a trusted `DockerSandboxRunner`'s
+`provenance_domain`, which includes runners from `bound_to`). A fake or unnamed runner
+produces no evidence even with fully populated result fields. A custom runner is
+supported by passing it explicitly; that is a host trust decision, and the platform
+cannot check that such a runner really isolates or really executed anything.
+
+What the HMAC proves: the artifact content and its labels were produced by a holder of
+the signing key and have not been altered since, in this tenant, user, and run. It does
+not prove that a command ran in a sandbox, that the runner is honest, or that the key was
+kept secret. Those remain the trusted host's responsibility: choose the trusted runners,
+keep the Docker daemon and client trusted, protect the key (anyone holding it can forge
+evidence), and give the model no way to write signed artifacts.
+
+### Execution integrity
+
+Each run executes in a fresh per-run copy of the snapshot, verified against its digests
+when it is created. That copy is writable by the container user (so tests can write
+output), which means it is not immutable:
+
+- The per-run directory is owner-only (`0700`), so another local user cannot reach the
+  world-writable copy inside it. Earlier revisions created it `0711`, which allowed any
+  local user who learned the path to modify the files between verification and
+  container start; this is fixed.
+- After the container has stopped, the runner re-hashes every snapshot file in the copy.
+  Any snapshot file that was changed, deleted, or replaced (for example by a symbolic
+  link) sets `snapshot_unchanged=False` and lists `modified_paths`; new files, such as
+  caches and test output, are allowed. A result that is not verified unchanged never
+  passes the gate, so a command cannot rewrite its own sources or tests and still earn
+  evidence for the original fingerprint.
+- This is a post-run comparison, not immutability. A process running as the same host
+  user or as root, or a compromised Docker daemon, can still change bytes during a run,
+  including changing and restoring them within one run. Commands that legitimately
+  rewrite tracked files (formatters with write mode) will fail this check by design.
 
 ### Unattended test, lint and typecheck
 

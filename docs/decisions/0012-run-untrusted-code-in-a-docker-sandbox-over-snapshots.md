@@ -28,6 +28,13 @@ carrying `status: pass` satisfied a verifier regardless of who wrote it.
   `JsonArtifactVerifier` accepts an optional `EvidenceSigner`; with it, only authenticated
   evidence counts and the verdict is derived from recorded execution facts. Without it
   the verifier is unchanged.
+- Evidence provenance is host-owned: `CommandEvidenceRecorder` records only for runners the
+  host names in `trusted_runners`, never because a `SandboxResult` carries a fingerprint
+  or image. The HMAC authenticates the artifact's origin and integrity, not the runner's
+  honesty.
+- After each run the runner compares the per-run copy with the snapshot digests;
+  a run that modified or removed snapshot files cannot produce passing evidence. The
+  per-run directory is owner-only.
 - `testing_tools` can drop approval for `test`, `lint` and `typecheck` presets only when
   the host lists them explicitly and the runner declares real isolation.
   `commands.run_allowed` and `build` keep approval. No package-installation or
@@ -42,5 +49,8 @@ carrying `status: pass` satisfied a verifier regardless of who wrote it.
   excluded directories are absent from the sandbox, and the network is off by default;
   projects needing them require a prepared image. Evidence does not cover excluded paths.
 - The evidence signer is a symmetric host secret; anyone holding it can forge evidence.
+- Execution is not immutable. Same-user or root processes and a compromised daemon can
+  alter the writable per-run copy; the post-run comparison detects most such changes but
+  not a change that is restored before the run ends.
 - Verified on Linux CI only. Windows Docker Desktop, macOS, rootless Docker, and Podman
   are not exercised or supported by this decision.
