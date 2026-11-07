@@ -523,3 +523,119 @@ def test_git_tools_fail_closed_for_ignore_names_that_cannot_be_expressed(tmp_pat
         assert isinstance(error.value.__cause__, ValueError)
 
     asyncio.run(scenario())
+
+
+# Repository-controlled Git configuration must never start external programs through the
+# read-only tools. Each hook below only writes a marker file outside the repository.
+
+
+def _marker_command(marker: Path, *, then: str = "exit 1") -> str:
+    return f"echo executed > '{marker.as_posix()}'; {then}"
+
+
+def _hostile_repository(tmp_path: Path) -> tuple[Path, Path]:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    subprocess.run(["git", "init", "--quiet", str(repository)], check=True)
+    _commit_files(repository, {"a.txt": "one\n", "b.dat": "binary-one\n"}, "initial")
+    _create(repository, "a.txt", "changed-content-a\n")
+    _create(repository, "b.dat", "changed-content-b\n")
+    return repository, tmp_path / "marker"
+
+
+@requires_git
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        ("git.status", {}),
+        ("git.diff", {}),
+        ("git.log", {}),
+        ("git.show", {"revision": "HEAD"}),
+    ],
+)
+def test_repository_fsmonitor_config_is_never_executed(
+    tmp_path: Path, tool: str, arguments: dict[str, object]
+) -> None:
+    repository, marker = _hostile_repository(tmp_path)
+    _git(repository, "config", "core.fsmonitor", _marker_command(marker))
+    filesystem = _filesystem(repository)
+
+    output = asyncio.run(_run_git_with(filesystem, tool, arguments))
+
+    assert output["stdout"]
+    assert not marker.exists(), "repository core.fsmonitor program was executed"
+
+
+@requires_git
+@pytest.mark.parametrize(
+    ("tool", "arguments"), [("git.diff", {}), ("git.show", {"revision": "HEAD"})]
+)
+def test_repository_textconv_config_is_never_executed(
+    tmp_path: Path, tool: str, arguments: dict[str, object]
+) -> None:
+    repository, marker = _hostile_repository(tmp_path)
+    _git(repository, "config", "diff.evil.textconv", _marker_command(marker, then="cat"))
+    _create(repository, ".gitattributes", "*.dat diff=evil\n")
+    _create(repository, "b.dat", "committed-change-b\n")
+    _git(repository, "add", "-A")
+    _git(repository, "commit", "-q", "-m", "converted file change")
+    _create(repository, "b.dat", "changed-again-b\n")
+    filesystem = _filesystem(repository)
+
+    output = asyncio.run(_run_git_with(filesystem, tool, arguments))
+
+    assert output["stdout"]
+    assert not marker.exists(), "repository textconv program was executed"
+
+
+@requires_git
+@pytest.mark.parametrize("attributes_file", [".gitattributes", ".git/info/attributes"])
+@pytest.mark.parametrize("tool", ["git.diff", "git.status"])
+def test_repository_clean_filter_config_is_never_executed(
+    tmp_path: Path, attributes_file: str, tool: str
+) -> None:
+    repository, marker = _hostile_repository(tmp_path)
+    _git(repository, "config", "filter.evil.clean", _marker_command(marker, then="cat"))
+    _git(repository, "config", "filter.evil.smudge", "cat")
+    (repository / attributes_file).write_text("*.txt filter=evil\n", encoding="utf-8")
+    _create(repository, "a.txt", "changed-content-a-longer\n")
+    filesystem = _filesystem(repository)
+
+    output = asyncio.run(_run_git_with(filesystem, tool, {}))
+
+    assert "a.txt" in output["stdout"]
+    assert not marker.exists(), "repository clean filter was executed"
+
+
+@requires_git
+def test_nested_repository_fsmonitor_config_is_never_executed(tmp_path: Path) -> None:
+    repository, marker = _hostile_repository(tmp_path)
+    nested = repository / "sub"
+    nested.mkdir()
+    subprocess.run(["git", "init", "--quiet", str(nested)], check=True)
+    _commit_files(nested, {"s.txt": "s\n"}, "nested")
+    _git(nested, "config", "core.fsmonitor", _marker_command(marker))
+    _create(nested, "s.txt", "dirty\n")
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=nested, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    _git(repository, "update-index", "--add", "--cacheinfo", f"160000,{head},sub")
+    filesystem = _filesystem(repository)
+
+    for tool in ("git.status", "git.diff"):
+        asyncio.run(_run_git_with(filesystem, tool, {}))
+
+    assert not marker.exists(), "nested repository core.fsmonitor program was executed"
+
+
+@requires_git
+def test_git_tools_fail_closed_for_unrepresentable_driver_config(tmp_path: Path) -> None:
+    repository, marker = _hostile_repository(tmp_path)
+    _git(repository, "config", "filter.a=b.clean", _marker_command(marker, then="cat"))
+    filesystem = _filesystem(repository)
+
+    with pytest.raises(ToolExecutionError) as error:
+        asyncio.run(_run_git_with(filesystem, "git.diff", {}))
+
+    assert isinstance(error.value.__cause__, ValueError)
+    assert not marker.exists()

@@ -26,7 +26,12 @@ grant therefore never exposes a secret value to a model. Name matching ignores c
 NTFS stream suffixes, and trailing dots or spaces, and symlinks are checked after
 resolution. The read-only Git tools reject `rev:path` revisions, apply the same policy
 to their `path` argument, and exclude protected files from diff, show, and status
-output, using the same effective policy including host-configured ignored names. See
+output, using the same effective policy including host-configured ignored names.
+Git processes run without a filesystem monitor, hooks, pager, text converters,
+external diff, clean or smudge filters, or submodule traversal, and repository
+configuration naming such programs is overridden on the command line. This is a
+configuration denylist, not a sandbox; the host should still run Git under
+operating-system isolation when repositories are untrusted. See
 ADR 0010. The policy is path-based: it does not detect secret values inside ordinary
 files, and historical diffs show a protected file that was renamed to an ordinary name.
 

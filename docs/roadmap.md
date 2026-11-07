@@ -251,6 +251,14 @@ implementation. No second policy engine or tool pipeline was added.
       `git.status` listed tracked `.env` changes. Git output is now filtered by
       pathspecs derived from the effective workspace policy; unrepresentable ignore
       names fail closed.
+- [x] Reproduced and fixed after a second independent review: repository-controlled
+      Git configuration executed programs through the read-only tools. Reproduced with
+      marker-file hooks: `core.fsmonitor` (`git.status`, `git.diff`, and in a nested
+      repository), `diff.<driver>.textconv` (`git.diff`, `git.show`), and clean filters
+      selected by `.gitattributes` or `.git/info/attributes` (`git.diff`). Mitigated at
+      the shared subprocess boundary (fixed overrides plus per-repository key
+      overrides, `--no-textconv`, `--ignore-submodules=all`). Not reproduced, disabled
+      as defense in depth: hooks, `log.showSignature` with `gpg.program`.
 - [x] Reviewed with existing passing tests, no defect found: policy precedence
       (deny over approval over allow), custom allow cannot bypass permissions or
       approval, sandbox-unavailable fails closed, MCP output cannot expand the toolset,
@@ -266,6 +274,8 @@ implementation. No second policy engine or tool pipeline was added.
   Windows; time-of-check to time-of-use races on symlinks; secret values embedded in
   ordinary files (redaction of model-facing tool output); MCP descriptor text reaching
   the model; real sandbox isolation (none ships).
+- The Git execution mitigation is a denylist of known program-launching keys, not a
+  sandbox; an unlisted key or a future Git feature could start a program.
 - Tested guarantees are limited to the path-based policy above. Git history is
   filtered by current path only (a renamed protected file appears under its ordinary
   name), `git.log` shows commit metadata, and secrets inside ordinary files are not

@@ -26,6 +26,13 @@ read protected blobs with `rev:path` revisions and printed protected files in di
   name, matched at any depth and case-insensitively. Model-facing Git tools therefore
   neither print protected contents nor enumerate protected paths. Names that cannot be
   expressed as a safe pathspec make the Git tools fail closed.
+- Repository-controlled Git configuration must not start external programs through
+  the read-only tools. Every Git process runs with `core.fsmonitor=false`, a null hooks
+  path, no pager, and signature verification disabled; diff and show pass
+  `--no-ext-diff` and `--no-textconv`; status and diff and show ignore submodules. The
+  effective repository configuration is listed first, and every clean, smudge,
+  process, text-conversion, external-diff, and GPG program key found is overridden on
+  the command line. Keys that cannot be passed safely make the tools fail closed.
 - A future explicit, host-owned grant for a named protected file would require a new
   decision record and an audit event.
 
@@ -34,6 +41,12 @@ read protected blobs with `rev:path` revisions and printed protected files in di
 - Tools can no longer read or write `build`, `dist`, `node_modules`, and similar
   ignored directories, which were already hidden from listing and line reads.
 - The policy is path-based. Secret values inside ordinary files are not detected.
+- The Git mitigation is a configuration denylist over known program-launching
+  keys, verified for filesystem monitors (including in a nested repository), text
+  converters, and clean filters. Hooks and signature-verification programs are
+  disabled but were not reproduced as execution paths. It is not Git sandboxing: a
+  future Git feature or an unlisted key could start a program, and process isolation
+  remains the host's responsibility.
 - Git history is filtered by current path only. A protected file that was renamed to
   an ordinary name appears under that name in historical diffs, and `git.log` shows
   commit metadata unfiltered.
