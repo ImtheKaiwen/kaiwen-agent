@@ -24,7 +24,7 @@ have a trusted Linux Docker engine. It is optional; the default remains the fail
 
 Trusted host configuration (`DockerSandboxConfig`): a digest-pinned image
 (`name@sha256:...`, enforced unless `require_digest=False` for local development), the
-Docker client path, a non-root numeric `user`, memory, CPU, process, and `/tmp` size
+Docker client path, an optional non-root numeric `user`, memory, CPU, process, and `/tmp` size
 limits, an optional network opt-in, and a small static environment. The model selects
 only a host-registered command preset; it never reaches the image, a flag, a mount, or a
 host path.
@@ -42,9 +42,18 @@ Enforced for every run:
   host-path mounts other than one private per-run copy of the execution snapshot;
 - no host environment forwarded to the container; the Docker client receives only an
   allowlist of its own variables (for example `PATH`, `DOCKER_HOST`);
-- wall-clock timeout, bounded stdout and stderr (runaway output stops the container),
-  and removal of the container and temporary files after success, failure, timeout, or
-  cancellation;
+- wall-clock timeout, bounded stdout and stderr (runaway output stops the container; the
+  UTF-8 encoded text stays within the byte budget even for invalid output, and
+  `output_truncated` reports any cut), and removal of the container and temporary files
+  after success, failure, timeout, or cancellation;
+- the container user defaults to the host's non-root uid:gid on POSIX (`65534:65534`
+  elsewhere, never root), so directories the container creates, even restrictive ones,
+  stay removable by the host. If the temporary run directory still cannot be removed
+  (for example an explicit `user` that differs from the host user, rootless Docker, or
+  user-namespace remapping), the runner logs an error and sets `cleanup_failed=True` on
+  the result; it never reports success silently. Running as the host uid trades the
+  anonymous `nobody` identity for the host user's id inside the container; capabilities
+  are still dropped and only the per-run copy is mounted;
 - model-facing errors are generic; engine details are logged server-side only.
 
 Anything that cannot be verified (engine unreachable, not Linux, image missing or not
