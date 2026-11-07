@@ -12,6 +12,35 @@ Browser application
   -> versioned @imthekaiwen/agent-protocol events
 ```
 
+## Repository and product relationship
+
+This repository is the reusable platform. `kaiwen.com.tr` is a separate consuming
+application and the first integration target; it does not own the platform
+architecture.
+
+- Cross-product Python orchestration belongs in `kaiwen-agent`, stable shared wire
+  contracts in `@imthekaiwen/agent-protocol`, and headless browser state, transports,
+  and React bindings in `@imthekaiwen/agent-ui`.
+- Product tools, database models, routes, authentication composition, prompts,
+  localized copy, branding, page layout, and admin workflows stay in the consuming
+  application. A product feature moves here only after a product-neutral interface
+  exists.
+- Consumers install pinned releases and integrate through public APIs. Platform
+  source is never copied into a product to bypass packaging.
+- The public visitor-facing assistant and the authenticated admin agent are separate
+  product surfaces. This repository owns headless UI states and a themeable
+  reference component; each product owns final motion, styling, and layout.
+- Text and voice converge on the same durable conversation and task systems. Parallel
+  chat, voice, admin, or telephony agent implementations are avoided.
+- Provider-specific behavior stays in adapters. SQLite and in-memory stores are
+  references for local use, not an implicit production deployment choice.
+- Short-term session summaries remain distinct from durable memory. Standards
+  describe evidence-backed delivery requirements and grant no permissions.
+- Implemented does not authorize publishing, pushing, or deploying; those are
+  explicit release actions and published package versions are immutable.
+
+## Composition layer
+
 The next composition layer is governed by ADRs 0005-0007. `AgentRuntime` is a
 single-agent-first facade, not another model loop or scheduler. Standards and runtime
 quality remain distinct from prompts, policy, skills, and offline evaluation.

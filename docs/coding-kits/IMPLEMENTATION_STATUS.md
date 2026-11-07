@@ -1,5 +1,10 @@
 # Coding Kits implementation status
 
+> Historical snapshot: this document records the state at the time it was written
+> and is not updated as the code evolves. Current status is in `docs/roadmap.md`.
+> The plan file it references, `KAIWEN_AGENT_CODING_KITS_IMPLEMENTATION_PLAN.md`, is
+> not present in this repository.
+
 This table records the evidence-backed baseline and incremental implementation of
 `KAIWEN_AGENT_CODING_KITS_IMPLEMENTATION_PLAN.md`. The checked-out code remains the
 authority when the plan and implementation differ.

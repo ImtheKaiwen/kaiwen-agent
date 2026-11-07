@@ -1,5 +1,8 @@
 # Release readiness
 
+> Historical snapshot: this document records the state at the time it was written
+> and is not updated as the code evolves. Current status is in `docs/roadmap.md`.
+
 ## Decision
 
 **Release complete.** There are no known critical or high-severity runtime failures,

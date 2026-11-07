@@ -1,5 +1,8 @@
 # Feature validation matrix
 
+> Historical snapshot: this document records the state at the time it was written
+> and is not updated as the code evolves. Current status is in `docs/roadmap.md`.
+
 | Capability | Evidence | Status | Release impact |
 | --- | --- | --- | --- |
 | Minimal single-agent chat and system context | `test_unified_runtime.py`, installed `simple-runtime` | Pass | None |

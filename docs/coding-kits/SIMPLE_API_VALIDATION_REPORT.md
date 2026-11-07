@@ -1,5 +1,8 @@
 # Simple Coding API validation report
 
+> Historical snapshot: this document records the state at the time it was written
+> and is not updated as the code evolves. Current status is in `docs/roadmap.md`.
+
 Status: deterministic release-readiness validation complete; no package has been
 published.
 

@@ -10,7 +10,7 @@ models, routes, branding, and tools belong in consuming applications.
 - Browser state, transports, semantic client actions, React UI:
   `@imthekaiwen/agent-ui` and `@imthekaiwen/agent-ui/react`.
 
-Read `docs/architecture.md`, `docs/AI_CONTEXT.md`, and the accepted records under
+Read `docs/architecture.md`, `docs/roadmap.md`, and the accepted records under
 `docs/decisions/` before changing boundaries. For a frontend integration, read
 `packages/ui-agent/INTEGRATION.md`. For runnable patterns, use the matching directory
 under `examples/`.
@@ -35,6 +35,10 @@ npm.cmd test
 .\backend\.venv\Scripts\python.exe -m ruff check backend
 .\backend\.venv\Scripts\python.exe -m mypy backend/src
 ```
+
+Prefer deterministic fakes and contract tests for repeatable automated testing, while
+using real-provider integration tests when needed to verify actual external
+compatibility.
 
 Publishing is an explicit release action. Never publish from a feature task or
 commit `.env`, tokens, generated databases, or local virtual environments.

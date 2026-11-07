@@ -1,5 +1,8 @@
 # Coding Kits implementation report
 
+> Historical snapshot: this document records the state at the time it was written
+> and is not updated as the code evolves. Current status is in `docs/roadmap.md`.
+
 ## Baseline and architecture
 
 - Baseline commit: `4706b8961e5c001b081484cfa43f92d9a520af64`.
