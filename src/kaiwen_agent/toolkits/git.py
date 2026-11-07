@@ -19,12 +19,22 @@ from kaiwen_agent.tools.definition import ToolDefinition
 
 _REVISION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@{}~^:+-]{0,199}$")
 
-# Git output is filtered by pathspec so diffs and commits never include secret files.
-_SENSITIVE_PATHSPECS = (
-    *(f":(exclude,glob,icase)**/{name}" for name in sorted(SENSITIVE_FILE_NAMES)),
-    *(f":(exclude,glob,icase)**/{prefix}*" for prefix in SENSITIVE_FILE_PREFIXES),
-    *(f":(exclude,glob,icase)**/*{suffix}" for suffix in SENSITIVE_FILE_SUFFIXES),
-)
+# Git output is filtered by pathspec so that model-facing tools neither print the
+# contents of protected files nor enumerate their paths. The filter is derived from the
+# same effective policy as WorkspaceFilesystem, including host-configured ignored names.
+_GLOB_CLASSES = {"[": "[[]", "*": "[*]", "?": "[?]"}
+
+
+def _glob_literal(name: str) -> str:
+    """Escape glob metacharacters with bracket classes, which Git for Windows keeps intact.
+
+    Backslash escapes are rewritten to path separators on Windows, so names that cannot
+    be expressed safely are rejected and the Git tools fail closed.
+    """
+
+    if not name or "\\" in name or "/" in name or "\x00" in name or "\n" in name:
+        raise ValueError("Ignored name cannot be expressed as a safe Git pathspec")
+    return "".join(_GLOB_CLASSES.get(character, character) for character in name)
 
 
 class GitUnavailableError(RuntimeError):
@@ -89,6 +99,26 @@ class ReadOnlyGitRepository:
 
     def require_context(self, context: AgentContext) -> None:
         self.filesystem.require_context(context)
+
+    def exclude_pathspecs(self) -> tuple[str, ...]:
+        """Exclusion pathspecs for the effective workspace read policy."""
+
+        specs = [
+            *(f":(exclude,glob,icase)**/{_glob_literal(name)}" for name in SENSITIVE_FILE_NAMES),
+            *(
+                f":(exclude,glob,icase)**/{_glob_literal(prefix)}*"
+                for prefix in SENSITIVE_FILE_PREFIXES
+            ),
+            *(
+                f":(exclude,glob,icase)**/*{_glob_literal(suffix)}"
+                for suffix in SENSITIVE_FILE_SUFFIXES
+            ),
+        ]
+        for name in self.filesystem.ignored_names:
+            literal = _glob_literal(name)
+            specs.append(f":(exclude,glob,icase)**/{literal}")
+            specs.append(f":(exclude,glob,icase)**/{literal}/**")
+        return tuple(sorted(set(specs)))
 
     def validate_revision(self, revision: str) -> str:
         # "rev:path" would read a blob by path and bypass the workspace read policy.
@@ -173,6 +203,8 @@ def git_read_tools(repository: ReadOnlyGitRepository) -> tuple[ToolDefinition, .
             "--short",
             "--branch",
             f"--untracked-files={untracked}",
+            "--",
+            *repository.exclude_pathspecs(),
         )
 
     async def diff(context: AgentContext, arguments: BaseModel) -> object:
@@ -187,7 +219,7 @@ def git_read_tools(repository: ReadOnlyGitRepository) -> tuple[ToolDefinition, .
         argv.append("--")
         if arguments.path is not None:
             argv.append(repository.validate_path(arguments.path))
-        argv.extend(_SENSITIVE_PATHSPECS)
+        argv.extend(repository.exclude_pathspecs())
         return await repository.run(*argv)
 
     async def log(context: AgentContext, arguments: BaseModel) -> object:
@@ -215,7 +247,7 @@ def git_read_tools(repository: ReadOnlyGitRepository) -> tuple[ToolDefinition, .
         ]
         if arguments.path is not None:
             argv.append(repository.validate_path(arguments.path))
-        argv.extend(_SENSITIVE_PATHSPECS)
+        argv.extend(repository.exclude_pathspecs())
         return await repository.run(*argv)
 
     permission = frozenset({"git.read"})

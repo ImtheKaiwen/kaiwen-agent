@@ -25,9 +25,10 @@ credential files such as `.netrc` and `.npmrc`. A `workspace.read` or `workspace
 grant therefore never exposes a secret value to a model. Name matching ignores case,
 NTFS stream suffixes, and trailing dots or spaces, and symlinks are checked after
 resolution. The read-only Git tools reject `rev:path` revisions, apply the same policy
-to their `path` argument, and exclude protected files from diff and show output. See
-ADR 0010. The policy is path-based and does not detect secret values inside ordinary
-files.
+to their `path` argument, and exclude protected files from diff, show, and status
+output, using the same effective policy including host-configured ignored names. See
+ADR 0010. The policy is path-based: it does not detect secret values inside ordinary
+files, and historical diffs show a protected file that was renamed to an ordinary name.
 
 Deletion and unrestricted shell execution are intentionally absent.
 

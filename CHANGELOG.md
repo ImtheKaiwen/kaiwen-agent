@@ -7,7 +7,8 @@
   directories). Matching is case-insensitive and normalizes Windows aliases, and
   `.git` stays protected when a host supplies its own ignore list.
 - Security: read-only Git tools reject `rev:path` revisions, apply the path policy to
-  their `path` argument, and omit sensitive files from diff and show output.
+  their `path` argument, and omit protected files, including host-configured ignored
+  directories, from diff, show, and status output.
 
 ## 0.7.0a1 — 2026-10-18
 
