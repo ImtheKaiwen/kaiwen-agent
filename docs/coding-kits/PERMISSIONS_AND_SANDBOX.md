@@ -133,6 +133,20 @@ output), which means it is not immutable:
   including changing and restoring them within one run. Commands that legitimately
   rewrite tracked files (formatters with write mode) will fail this check by design.
 
+### Freshness across coding cycles
+
+Evidence names the snapshot fingerprint it ran against, and the gate compares it with the
+fingerprint it is given. Coding workflows should give it the current state, not a value
+taken at the start: configure `WorkflowController(fingerprint_provider=
+WorkspaceFingerprintProvider(SnapshotBuilder(...)))` (see `docs/workflows.md`). Evidence
+for source state A then cannot satisfy state B, evidence for B cannot satisfy a later
+state C, and a concurrent change during the gate blocks completion. `SnapshotBuilder.fingerprint()`
+reads the workspace under the same policy as a snapshot, without copying it, and equals the
+fingerprint of a snapshot of the same bytes. `TrustedEvidencePipeline` wires one
+`ArtifactManager`, one `EvidenceSigner`, the recorder and the signed verifiers together
+(a signer is mandatory), and workers obtain the run identity with `trusted_task_context`.
+The workspace read is point-in-time, so this does not make verification atomic.
+
 ### Unattended test, lint and typecheck
 
 `testing_tools(catalog, unattended_categories=frozenset({"test", "lint", "typecheck"}))`

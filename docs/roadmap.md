@@ -385,7 +385,7 @@ Each defect was reproduced with a failing test before its fix.
 - [x] Merged as pull request 6 (squash commit `8b74b65`) after all 10 CI jobs passed on
       the exact head.
 
-### M6.2: Secure container execution and evidence pipeline (in review)
+### M6.2: Secure container execution and evidence pipeline (completed)
 
 - [x] `DockerSandboxRunner` (ADR 0012): digest-pinned image, no pulls, non-root, no
       network by default, dropped capabilities, read-only root, resource/time/output
@@ -403,13 +403,33 @@ Each defect was reproduced with a failing test before its fix.
       modified snapshot files. A flaky fixed-sleep M5 test was changed to a bounded poll.
 - Verified: scripted-engine tests for argv, limits, timeout, cancellation, cleanup and
   fail-closed paths; real-container tests run on Linux CI only (required there).
-- Not exercised or supported: Windows Docker Desktop/WSL2, macOS, rootless Docker,
-  Podman. Docker could not be started on the development Windows machine, so no local
-  real-container run was performed. Not done: pinning the execution snapshot to workflow
-  runs and refreshing the fingerprint between workflow cycles (M6.3), `CodingRunControl`,
-  a prepared-dependency image workflow, evidence for excluded paths.
-- [~] Not complete until the pull request CI passes on the exact head and the owner
-      merges it.
+- Not exercised or supported: macOS, rootless Docker, Podman. Not done: pinning the
+  execution snapshot to workflow runs and refreshing the fingerprint between workflow
+  cycles (M6.3.1), `CodingRunControl`, a prepared-dependency image workflow, evidence for
+  excluded paths.
+- [x] Merged as pull request 7 (squash commit `87d913a`) after all 10 CI jobs passed on
+      the exact head, including the real Docker tests and example on Linux.
+
+### M6.3.1: Run identity, fresh snapshots and evidence correctness (in review)
+
+- [x] `WorkflowController(fingerprint_provider=...)` evaluates every completion gate against a
+      fresh trusted fingerprint, brackets a passing evaluation to detect a concurrent change,
+      and blocks when the state is unavailable (ADR 0013). The fixed-fingerprint behavior is
+      unchanged without a provider. `WorkflowOutcome.verified_input_fingerprint` reports what
+      was verified.
+- [x] `SnapshotBuilder.fingerprint()` and `WorkspaceFingerprintProvider`: content-aware, read-only,
+      equal to the fingerprint of a snapshot of the same bytes.
+- [x] `trusted_task_context` (durable-run-checked worker context) and `TrustedEvidencePipeline`
+      (one artifact manager and signer for recorder and verifiers).
+- [x] A real-container reader-task cleanup defect in the M6.2 timeout path (an exception left
+      unretrieved) was reproduced by a failing test and fixed.
+- Verified: workflow-level A -> B -> C regressions with real snapshots and signed evidence
+  (deterministic runner), the same A -> B -> C flow through real containers, and two Docker
+  examples. The real Docker tests also ran locally on Windows 11 with Docker Desktop 28.3.0
+  (Linux engine, WSL2), a single development machine, in addition to Linux CI.
+- Not done: running a model agent as a worker, supervisor and delegation tools, reviewer
+  approvals and milestone acceptance (M6.3.2 to M6.3.4); atomic verification of the workspace.
+- [~] Not complete until the pull request CI passes on the exact head and the owner merges it.
 
 ### M7 design items (not started)
 
