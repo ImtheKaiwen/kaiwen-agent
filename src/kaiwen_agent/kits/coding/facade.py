@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,9 @@ from kaiwen_agent.standards import StandardsRegistry
 from kaiwen_agent.tools import ToolRegistry
 
 ProviderFactory = Callable[[str], ModelProvider]
+
+
+logger = logging.getLogger(__name__)
 
 
 class SimpleCodingAgent:
@@ -113,6 +117,9 @@ class CodingKit:
         self.owns_resources = owns_resources
         self._agent: CodingAgent | None = None
         self._closed = False
+        # Strong references: asyncio keeps only weak references to tasks, so a run whose
+        # handle was discarded must still be owned, and its failure observed, here.
+        self._background: set[asyncio.Task[Any]] = set()
 
     @classmethod
     def local(
@@ -394,7 +401,9 @@ class CodingKit:
                     "resume_unsupported",
                     "Configure a durable host resumer that reconciles scheduler state.",
                 )
-            task = asyncio.create_task(execution.control.resume(run=run, identity=self.identity))
+            task = self._track(
+                asyncio.create_task(execution.control.resume(run=run, identity=self.identity))
+            )
         return CodingRunHandle(
             run_id=run.id,
             objective=None,
@@ -405,6 +414,19 @@ class CodingKit:
             execution=execution,
             task=task,
         )
+
+    def _track(self, task: asyncio.Task[Any]) -> asyncio.Task[Any]:
+        self._background.add(task)
+        task.add_done_callback(self._background_done)
+        return task
+
+    def _background_done(self, task: asyncio.Task[Any]) -> None:
+        self._background.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()  # retrieving it also silences the unobserved warning
+        if error is not None:
+            logger.warning("Coding run background task failed: %s", type(error).__name__)
 
     async def close(self) -> None:
         if self._closed:
@@ -512,7 +534,7 @@ class CodingKit:
                 f"{coding_agent.configured.definition.id}@"
                 f"{coding_agent.configured.definition.version}"
             )
-        task = asyncio.create_task(outcome)
+        task = self._track(asyncio.create_task(outcome))
         return CodingRunHandle(
             run_id=run.id,
             objective=trusted_objective,

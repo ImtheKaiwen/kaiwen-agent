@@ -46,7 +46,13 @@ class DurableRunManager:
             user_id=user_id,
         )
 
-    async def start(self, *, run_id: str, identity: RuntimeIdentity) -> RuntimeRunRecord:
+    async def start(
+        self,
+        *,
+        run_id: str,
+        identity: RuntimeIdentity,
+        owner_lease_key: str | None = None,
+    ) -> RuntimeRunRecord:
         return await self._transition(
             run_id=run_id,
             identity=identity,
@@ -58,6 +64,7 @@ class DurableRunManager:
                 }
             ),
             status=RuntimeRunStatus.RUNNING,
+            owner_lease_key=owner_lease_key,
         )
 
     async def pause(
@@ -142,6 +149,7 @@ class DurableRunManager:
         safe_boundary: str | None = None,
         blocked_reason: str | None = None,
         terminal: bool = False,
+        owner_lease_key: str | None = None,
     ) -> RuntimeRunRecord:
         current = await self.get(run_id=run_id, identity=identity)
         if current is None:
@@ -156,6 +164,7 @@ class DurableRunManager:
                 "blocked_reason": blocked_reason,
                 "updated_at": now,
                 "completed_at": now if terminal else None,
+                **({"owner_lease_key": owner_lease_key} if owner_lease_key else {}),
             }
         )
         await self.store.save_runtime_run(updated)

@@ -58,6 +58,10 @@ class IdempotencyConflictError(AgentError):
     """Raised when an idempotency key is reused with different canonical arguments."""
 
 
+class RunOwnershipError(AgentError):
+    """Raised when a workflow run is owned by another executor or ownership was lost."""
+
+
 class DurableSideEffectsRequiredError(AgentError):
     """Raised when autonomous side effects are requested without durable coordination."""
 

@@ -3,9 +3,13 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
+from contextlib import suppress
 from hashlib import sha256
 from typing import Protocol
+from uuid import uuid4
 
+from kaiwen_agent.coordination import DistributedLease, LeaseStore
+from kaiwen_agent.exceptions import RunOwnershipError
 from kaiwen_agent.quality import (
     CompletionGate,
     CompletionGateResult,
@@ -23,6 +27,7 @@ from kaiwen_agent.runtime import (
 from kaiwen_agent.standards import StandardResolution
 from kaiwen_agent.tasks import AgentTask, TaskGraph, TaskScheduler, TaskStatus
 from kaiwen_agent.tools.durability import ActionIntentStatus, ActionIntentStore
+from kaiwen_agent.types import utc_now
 from kaiwen_agent.workflow.compiler import WorkflowCompiler, WorkflowPlanError
 from kaiwen_agent.workflow.models import (
     WorkflowLimits,
@@ -43,6 +48,10 @@ class WorkflowRevisionPlanner(Protocol):
     async def revise(self, request: WorkflowRevisionRequest) -> WorkflowPlan | None: ...
 
 
+class _Ownership:
+    lost = False
+
+
 class WorkflowController:
     """Finite control plane over TaskScheduler and CompletionGate."""
 
@@ -57,7 +66,13 @@ class WorkflowController:
         revision_planner: WorkflowRevisionPlanner | None = None,
         limits: WorkflowLimits | None = None,
         action_intents: ActionIntentStore | None = None,
+        leases: LeaseStore | None = None,
+        lease_owner_id: str | None = None,
+        lease_ttl_seconds: float = 30.0,
     ) -> None:
+        if lease_ttl_seconds <= 0:
+            raise ValueError("lease_ttl_seconds must be positive")
+
         self.runs = runs
         self.compiler = compiler
         self.scheduler_factory = scheduler_factory
@@ -68,6 +83,11 @@ class WorkflowController:
         # Optional: lets cancellation distinguish a safe stop from an unknown
         # external outcome. Without it, cancellation is recorded as CANCELLED.
         self.action_intents = action_intents
+        # Optional run ownership: the controller holds a heartbeat lease while it
+        # executes so recovery can tell a live owner from a dead one.
+        self.leases = leases
+        self.lease_owner_id = lease_owner_id or f"controller-{uuid4().hex}"
+        self.lease_ttl_seconds = lease_ttl_seconds
 
     async def execute(
         self,
@@ -78,6 +98,20 @@ class WorkflowController:
         standards: StandardResolution,
         protected_input_fingerprint: str,
     ) -> WorkflowOutcome:
+        lease: DistributedLease | None = None
+        heartbeat: asyncio.Task[None] | None = None
+        ownership = _Ownership()
+        if self.leases is not None:
+            lease = await self.leases.acquire(
+                key=f"runtime-run:{run.id}",
+                owner_id=self.lease_owner_id,
+                ttl_seconds=self.lease_ttl_seconds,
+            )
+            if lease is None:
+                raise RunOwnershipError("Workflow run is owned by another executor")
+            owner_task = asyncio.current_task()
+            assert owner_task is not None
+            heartbeat = asyncio.create_task(self._heartbeat(lease, owner_task, ownership))
         try:
             return await self._execute(
                 run=run,
@@ -85,10 +119,44 @@ class WorkflowController:
                 plan=plan,
                 standards=standards,
                 protected_input_fingerprint=protected_input_fingerprint,
+                owner_lease_key=lease.key if lease is not None else None,
             )
         except asyncio.CancelledError:
+            if ownership.lost:
+                # Another executor may now own the run; do not write state on its behalf.
+                current = asyncio.current_task()
+                if current is not None:
+                    current.uncancel()
+                raise RunOwnershipError(
+                    "Run ownership was lost; execution stopped without recording state"
+                ) from None
             await asyncio.shield(self._record_cancellation(run=run, identity=identity))
             raise
+        finally:
+            if heartbeat is not None:
+                heartbeat.cancel()
+                with suppress(asyncio.CancelledError):
+                    await heartbeat
+            if lease is not None and self.leases is not None and not ownership.lost:
+                with suppress(Exception):
+                    await asyncio.shield(self.leases.release(lease))
+
+    async def _heartbeat(
+        self, lease: DistributedLease, owner: asyncio.Task[object], ownership: _Ownership
+    ) -> None:
+        assert self.leases is not None
+        current = lease
+        while True:
+            await asyncio.sleep(self.lease_ttl_seconds / 3)
+            try:
+                renewed = await self.leases.renew(current, ttl_seconds=self.lease_ttl_seconds)
+            except Exception:  # noqa: BLE001 - a transient store error is retried until expiry
+                renewed = None if utc_now() >= current.expires_at else current
+            if renewed is None:
+                ownership.lost = True
+                owner.cancel()
+                return
+            current = renewed
 
     async def _record_cancellation(
         self, *, run: RuntimeRunRecord, identity: RuntimeIdentity
@@ -129,6 +197,7 @@ class WorkflowController:
         plan: WorkflowPlan,
         standards: StandardResolution,
         protected_input_fingerprint: str,
+        owner_lease_key: str | None = None,
     ) -> WorkflowOutcome:
         if run.status not in {
             RuntimeRunStatus.CREATED,
@@ -136,7 +205,9 @@ class WorkflowController:
             RuntimeRunStatus.BLOCKED,
         }:
             raise ValueError(f"Workflow run cannot start from {run.status}")
-        current_run = await self.runs.start(run_id=run.id, identity=identity)
+        current_run = await self.runs.start(
+            run_id=run.id, identity=identity, owner_lease_key=owner_lease_key
+        )
         current_plan = plan
         all_tasks: list[AgentTask] = []
         latest_quality: CompletionGateResult | None = None

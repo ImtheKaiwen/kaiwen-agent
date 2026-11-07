@@ -45,6 +45,8 @@ class RuntimeRunRecord(BaseModel):
     status: RuntimeRunStatus = RuntimeRunStatus.CREATED
     safe_boundary: str | None = Field(default=None, max_length=500)
     blocked_reason: str | None = Field(default=None, max_length=1_000)
+    # Lease key held by the executing controller; recovery only judges runs that have one.
+    owner_lease_key: str | None = Field(default=None, min_length=1, max_length=300)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
     completed_at: datetime | None = None
@@ -87,6 +89,7 @@ class RecoveryReport(BaseModel):
 
     uncertain_action_ids: tuple[str, ...] = ()
     blocked_run_ids: tuple[str, ...] = ()
+    owner_lost_run_ids: tuple[str, ...] = ()
 
 
 class RuntimeRecoveryManager:
@@ -153,9 +156,51 @@ class RuntimeRecoveryManager:
                         )
                     )
                     blocked.add(run.id)
+            owner_lost = await self._block_unowned_runs(owner_id=owner_id, limit=limit)
             return RecoveryReport(
                 uncertain_action_ids=tuple(uncertain),
                 blocked_run_ids=tuple(sorted(blocked)),
+                owner_lost_run_ids=tuple(owner_lost),
             )
         finally:
             await self.leases.release(lease)
+
+    async def _block_unowned_runs(self, *, owner_id: str, limit: int) -> list[str]:
+        """Block RUNNING runs whose ownership lease nobody holds; never resume them.
+
+        Age is not proof of process death, so only runs that recorded a lease key are
+        judged, and only when their lease can be acquired, which proves no live executor
+        is heartbeating it. The probe lease is held while the run is blocked so an
+        executor cannot start concurrently.
+        """
+
+        owner_lost: list[str] = []
+        runs = await self.stores.runs.list_runtime_runs(
+            statuses=frozenset({RuntimeRunStatus.RUNNING}), limit=limit
+        )
+        for run in runs:
+            if run.owner_lease_key is None:
+                continue
+            probe = await self.leases.acquire(
+                key=run.owner_lease_key,
+                owner_id=owner_id,
+                ttl_seconds=self.lease_ttl_seconds,
+            )
+            if probe is None:
+                continue
+            try:
+                await self.stores.runs.save_runtime_run(
+                    run.model_copy(
+                        update={
+                            "status": RuntimeRunStatus.BLOCKED,
+                            "blocked_reason": "owner_lost",
+                            "updated_at": utc_now(),
+                        }
+                    )
+                )
+                owner_lost.append(run.id)
+            except ValueError:
+                pass  # the run changed state concurrently; leave it to its owner
+            finally:
+                await self.leases.release(probe)
+        return owner_lost
