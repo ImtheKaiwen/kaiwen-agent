@@ -18,6 +18,17 @@ different workspace by adding an argument. Hosts should still use operating-syst
 container isolation when untrusted local processes can concurrently modify symlinks;
 the adapter is not a replacement for a sandbox.
 
+Protected paths are denied for every read, write, patch, stat, listing, and search,
+independently of tool permissions: `.git`, the host ignore list (`.env`, `.venv`,
+`node_modules`, and similar), `.env*` files, private keys and certificates, and
+credential files such as `.netrc` and `.npmrc`. A `workspace.read` or `workspace.write`
+grant therefore never exposes a secret value to a model. Name matching ignores case,
+NTFS stream suffixes, and trailing dots or spaces, and symlinks are checked after
+resolution. The read-only Git tools reject `rev:path` revisions, apply the same policy
+to their `path` argument, and exclude protected files from diff and show output. See
+ADR 0010. The policy is path-based and does not detect secret values inside ordinary
+files.
+
 Deletion and unrestricted shell execution are intentionally absent.
 
 ## MCP tools

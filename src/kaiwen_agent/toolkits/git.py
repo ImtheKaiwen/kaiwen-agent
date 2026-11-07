@@ -10,9 +10,21 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from kaiwen_agent.context import AgentContext
 from kaiwen_agent.integrations import WorkspaceFilesystem, WorkspacePathError
+from kaiwen_agent.integrations.filesystem import (
+    SENSITIVE_FILE_NAMES,
+    SENSITIVE_FILE_PREFIXES,
+    SENSITIVE_FILE_SUFFIXES,
+)
 from kaiwen_agent.tools.definition import ToolDefinition
 
 _REVISION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@{}~^:+-]{0,199}$")
+
+# Git output is filtered by pathspec so diffs and commits never include secret files.
+_SENSITIVE_PATHSPECS = (
+    *(f":(exclude,glob,icase)**/{name}" for name in sorted(SENSITIVE_FILE_NAMES)),
+    *(f":(exclude,glob,icase)**/{prefix}*" for prefix in SENSITIVE_FILE_PREFIXES),
+    *(f":(exclude,glob,icase)**/*{suffix}" for suffix in SENSITIVE_FILE_SUFFIXES),
+)
 
 
 class GitUnavailableError(RuntimeError):
@@ -79,7 +91,8 @@ class ReadOnlyGitRepository:
         self.filesystem.require_context(context)
 
     def validate_revision(self, revision: str) -> str:
-        if not _REVISION.fullmatch(revision) or revision.startswith("-"):
+        # "rev:path" would read a blob by path and bypass the workspace read policy.
+        if not _REVISION.fullmatch(revision) or revision.startswith("-") or ":" in revision:
             raise ValueError("Git revision is not allowed")
         return revision
 
@@ -90,7 +103,10 @@ class ReadOnlyGitRepository:
         candidate = (self.repo_root / supplied).resolve(strict=False)
         if not candidate.is_relative_to(self.repo_root):
             raise WorkspacePathError("Git path escapes the repository")
-        return candidate.relative_to(self.repo_root).as_posix()
+        relative = candidate.relative_to(self.repo_root).as_posix()
+        if relative != "." and self.filesystem.is_protected(self.root, relative):
+            raise WorkspacePathError("Git path is excluded by the host read policy")
+        return relative
 
     async def run(self, *arguments: str) -> dict[str, object]:
         environment = {
@@ -171,6 +187,7 @@ def git_read_tools(repository: ReadOnlyGitRepository) -> tuple[ToolDefinition, .
         argv.append("--")
         if arguments.path is not None:
             argv.append(repository.validate_path(arguments.path))
+        argv.extend(_SENSITIVE_PATHSPECS)
         return await repository.run(*argv)
 
     async def log(context: AgentContext, arguments: BaseModel) -> object:
@@ -198,6 +215,7 @@ def git_read_tools(repository: ReadOnlyGitRepository) -> tuple[ToolDefinition, .
         ]
         if arguments.path is not None:
             argv.append(repository.validate_path(arguments.path))
+        argv.extend(_SENSITIVE_PATHSPECS)
         return await repository.run(*argv)
 
     permission = frozenset({"git.read"})

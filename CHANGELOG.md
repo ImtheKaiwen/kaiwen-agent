@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Security: workspace `read_text`, `write_text`, and `apply_patch` now enforce the
+  ignore and sensitive-path policy (`.env*`, private keys, `.git`, ignored
+  directories). Matching is case-insensitive and normalizes Windows aliases, and
+  `.git` stays protected when a host supplies its own ignore list.
+- Security: read-only Git tools reject `rev:path` revisions, apply the path policy to
+  their `path` argument, and omit sensitive files from diff and show output.
+
 ## 0.7.0a1 — 2026-10-18
 
 - Add the optional `CodingKit` Simple Coding API for lazy local or authenticated-host
