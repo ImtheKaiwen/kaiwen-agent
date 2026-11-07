@@ -195,7 +195,7 @@ small, independently reviewable changes with their own acceptance criteria.
   package files and contents are identical to a pre-move build; `METADATA` differs
   only in the long description and a `licenses/LICENSE` entry was added.
 
-### M3: CI/CD and packaging hardening (in review)
+### M3: CI/CD and packaging hardening (code complete; owner configuration pending)
 
 - [x] Reusable `verify.yml` shared by `ci.yml` and `release.yml`: Ruff, mypy, pytest
       on Python 3.11, 3.12, and 3.13 (Linux) and 3.11 and 3.13 (Windows), executable
@@ -210,8 +210,9 @@ small, independently reviewable changes with their own acceptance criteria.
       and distribution contents. Python and npm versions remain independent.
 - [x] Repository URLs in `pyproject.toml` and both `package.json` files corrected to
       `ImtheKaiwen/kaiwen-agent`.
-- [~] Not complete until pull request CI passes on the exact head and the owner
-      merges it.
+- [x] Merged as pull request 3 (squash commit `c760659`) after exact-head CI passed
+      (14 jobs: Python 3.11 to 3.13 on Linux, 3.11 and 3.13 on Windows, Node 20 and
+      22, package, quality, gate).
 - [!] Owner actions (remote settings, not changed by this work): ruleset on `main`
       requiring a pull request and the `CI gate` check; required reviewers and a
       `main`-only deployment branch policy on the `npm` and `pypi` environments;
@@ -230,11 +231,57 @@ small, independently reviewable changes with their own acceptance criteria.
   PyPI artifact upload have not been exercised, by design), Python 3.11 and 3.13
   locally.
 
-### M4: Security and behavioural validation (planned)
+### M4: Security hardening (in review)
 
-- [ ] Add negative tests first, then fix confirmed defects.
-- [ ] Real-contract tests for the OpenAI adapter using recorded SDK response shapes.
-- [ ] Coverage measurement for policy, approval, and durability paths.
+Scope: reproduce concrete defects with failing tests, then fix them in the existing
+implementation. No second policy engine or tool pipeline was added.
+
+- [x] Reproduced and fixed: `WorkspaceFilesystem.read_text` and `write_text` bypassed
+      the ignore and sensitive-path policy, exposing `.env`, keys, and `.git` through
+      `workspace.read_text` and `workspace.apply_patch`, and allowing writes to
+      `.git/hooks`. 33 of the first 37 new tests failed before the fix.
+- [x] Reproduced and fixed: ignored-name matching was case-sensitive and did not
+      normalize Windows aliases (`.GIT`, `.git.`, `.env:stream`); a host-supplied
+      ignore list removed `.git` protection; `.npmrc`, `.netrc`, `.pypirc`, SSH keys,
+      `.pfx`, and `.jks` were not treated as sensitive.
+- [x] Reproduced and fixed: the read-only Git tools returned protected blobs through
+      `rev:path` revisions and printed protected files in diff and show output.
+- [x] Reproduced and fixed after independent review: committed files under configured
+      ignored directories (`build`, `node_modules`) appeared in `git.show`, and
+      `git.status` listed tracked `.env` changes. Git output is now filtered by
+      pathspecs derived from the effective workspace policy; unrepresentable ignore
+      names fail closed.
+- [x] Reproduced and fixed after a second independent review: repository-controlled
+      Git configuration executed programs through the read-only tools. Reproduced with
+      marker-file hooks: `core.fsmonitor` (`git.status`, `git.diff`, and in a nested
+      repository), `diff.<driver>.textconv` (`git.diff`, `git.show`), and clean filters
+      selected by `.gitattributes` or `.git/info/attributes` (`git.diff`). Mitigated at
+      the shared subprocess boundary (fixed overrides plus per-repository key
+      overrides, `--no-textconv`, `--ignore-submodules=all`). Not reproduced, disabled
+      as defense in depth: hooks, `log.showSignature` with `gpg.program`.
+- [x] Reviewed with existing passing tests, no defect found: policy precedence
+      (deny over approval over allow), custom allow cannot bypass permissions or
+      approval, sandbox-unavailable fails closed, MCP output cannot expand the toolset,
+      concurrent tenant and user isolation. Added a test in which a scripted model
+      receives injected file content as a tool result, then requests a write without
+      the `workspace.write` permission; the policy denies it at execution. The model is
+      scripted, so this verifies the permission boundary, not model resistance to
+      injection.
+- Rejected: model-supplied idempotency keys (no adapter populates
+  `ToolCall.idempotency_key`); cross-tenant job listing (`JobContext` requires tenant
+  and user).
+- Not verified or not addressed: 8.3 short names, junctions, and hard links on
+  Windows; time-of-check to time-of-use races on symlinks; secret values embedded in
+  ordinary files (redaction of model-facing tool output); MCP descriptor text reaching
+  the model; real sandbox isolation (none ships).
+- The Git execution mitigation is a denylist of known program-launching keys, not a
+  sandbox; an unlisted key or a future Git feature could start a program.
+- Tested guarantees are limited to the path-based policy above. Git history is
+  filtered by current path only (a renamed protected file appears under its ordinary
+  name), `git.log` shows commit metadata, and secrets inside ordinary files are not
+  detected. Hosts must still isolate untrusted local processes.
+- [~] Not complete until pull request CI passes on the exact head and the owner
+      merges it.
 
 ### M5: Runtime and multi-agent reliability (planned)
 
@@ -247,12 +294,11 @@ small, independently reviewable changes with their own acceptance criteria.
 
 ### Open risks from the initial audit
 
-These come from a read-only code review on 2026-11-07. None has been reproduced by
-execution; each needs a failing test before a fix is attempted.
+These come from a read-only code review on 2026-11-07. Items are reproduced by a
+failing test before a fix is attempted; those not yet reproduced remain unverified.
 
-- `WorkspaceFilesystem.read_text` and `write_text` appear not to apply the host
-  ignore and sensitive-path policy that `list_files`, `stat`, and `read_lines`
-  apply; `workspace.read_text` and `workspace.apply_patch` use them. Targeted by M4.
+- `WorkspaceFilesystem.read_text` and `write_text` did not apply the ignore and
+  sensitive-path policy. Reproduced and fixed in M4 (pull request in review).
 - `Agent.run` and `TaskScheduler` handle `Exception` but not `CancelledError`,
   which may leave run or task state non-terminal. Targeted by M5.
 - No first-party shipped provider adapter raises `RetryableModelProviderError`, so

@@ -17,6 +17,32 @@ class WorkspacePathError(PermissionError):
     pass
 
 
+# Paths that no tool permission can expose or modify. They are enforced for every
+# operation regardless of the host-supplied ignore list.
+ALWAYS_PROTECTED_NAMES = frozenset({".git"})
+SENSITIVE_FILE_NAMES = frozenset(
+    {
+        ".env",
+        ".git-credentials",
+        ".netrc",
+        ".npmrc",
+        ".pypirc",
+        "id_dsa",
+        "id_ecdsa",
+        "id_ed25519",
+        "id_rsa",
+    }
+)
+SENSITIVE_FILE_PREFIXES = (".env.",)
+SENSITIVE_FILE_SUFFIXES = (".jks", ".key", ".p12", ".pem", ".pfx")
+
+
+def normalize_path_part(part: str) -> str:
+    """Fold case, NTFS stream suffixes, and trailing dots or spaces that Windows ignores."""
+
+    return part.split(":", 1)[0].rstrip(" .").casefold()
+
+
 class WorkspaceFilesystem:
     """Bounded filesystem adapter for one host-authorized workspace."""
 
@@ -45,7 +71,7 @@ class WorkspaceFilesystem:
         self.max_write_bytes = max_write_bytes
         self.tenant_id = tenant_id
         self.user_id = user_id
-        self.ignored_names = ignored_names or frozenset(
+        configured_names = ignored_names or frozenset(
             {
                 ".env",
                 ".git",
@@ -61,9 +87,14 @@ class WorkspaceFilesystem:
                 "venv",
             }
         )
+        self.ignored_names = (
+            frozenset(normalize_path_part(name) for name in configured_names)
+            | ALWAYS_PROTECTED_NAMES
+        )
 
     def read_text(self, root: str, relative_path: str) -> str:
         path = self._resolve(root, relative_path, must_exist=True)
+        self._reject_ignored(path)
         if not path.is_file():
             raise WorkspacePathError("Workspace path is not a file")
         if path.stat().st_size > self.max_read_bytes:
@@ -80,6 +111,7 @@ class WorkspaceFilesystem:
         if len(encoded) > self.max_write_bytes:
             raise ValueError("Workspace write exceeds the configured byte limit")
         path = self._resolve(root, relative_path, must_exist=False)
+        self._reject_ignored(path)
         if not path.parent.is_dir():
             raise WorkspacePathError("Workspace parent directory does not exist")
         handle, temporary = tempfile.mkstemp(prefix=".kaiwen-", dir=path.parent)
@@ -274,6 +306,11 @@ class WorkspaceFilesystem:
     def _relative(self, root: str, path: Path) -> str:
         return path.resolve(strict=False).relative_to(self.roots[root]).as_posix() or "."
 
+    def is_protected(self, root: str, relative_path: str) -> bool:
+        """Return whether the host read and write policy excludes this path."""
+
+        return self._is_ignored(self._resolve(root, relative_path, must_exist=False))
+
     def _is_ignored(self, path: Path) -> bool:
         resolved = path.resolve(strict=False)
         parts = path.parts
@@ -281,7 +318,9 @@ class WorkspaceFilesystem:
             if resolved.is_relative_to(root):
                 parts = resolved.relative_to(root).parts
                 break
-        return any(part in self.ignored_names for part in parts) or self._is_sensitive_path(path)
+        return any(
+            normalize_path_part(part) in self.ignored_names for part in parts
+        ) or self._is_sensitive_path(path)
 
     def _reject_ignored(self, path: Path) -> None:
         if self._is_ignored(path):
@@ -289,11 +328,11 @@ class WorkspaceFilesystem:
 
     @staticmethod
     def _is_sensitive_path(path: Path) -> bool:
-        name = path.name.casefold()
+        name = normalize_path_part(path.name)
         return (
-            name == ".env"
-            or name.startswith(".env.")
-            or path.suffix.casefold() in {".key", ".p12", ".pem"}
+            name in SENSITIVE_FILE_NAMES
+            or name.startswith(SENSITIVE_FILE_PREFIXES)
+            or name.endswith(SENSITIVE_FILE_SUFFIXES)
         )
 
 
