@@ -4,7 +4,7 @@ This provider-free example delegates one bounded read-only review to the
 least-privileged registered team member:
 
 ```powershell
-.\backend\.venv\Scripts\python.exe examples\software-agent-team\main.py
+.\.venv\Scripts\python.exe examples\software-agent-team\main.py
 ```
 
 Teams are optional composition over `SubagentDelegator`, `JobManager`, and the Task

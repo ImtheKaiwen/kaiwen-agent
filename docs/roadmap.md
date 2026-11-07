@@ -180,17 +180,29 @@ small, independently reviewable changes with their own acceptance criteria.
   2026-11-07 by link check, diff inspection, and hash comparison; no tests were run
   because no code changed.
 
-### M2: Root-level Python restructuring (planned)
+### M2: Root-level Python restructuring (in review)
 
-- [ ] Move `backend/src`, `backend/tests`, and `backend/pyproject.toml` to the
-      repository root; fold `backend/README.md` into the root README; remove the
-      `backend/` wrapper after all consumers are updated.
-- Known hazards: the PyPI long description follows `readme` in `pyproject.toml`;
-  the root sdist needs an explicit include list; `tests/test_protocol_contract.py`
-  resolves protocol fixtures with `parents[2]`; CI, release workflow, `AGENTS.md`,
-  `docs/releasing.md`, and example READMEs reference `backend/`.
-- Acceptance: identical test count and results, identical wheel contents, clean
-  sdist, CI and release verification updated and passing.
+- [x] `backend/src`, `backend/tests`, and `backend/pyproject.toml` moved to the
+      repository root with Git-aware renames; `backend/README.md` consolidated into
+      the root README (links are absolute so the PyPI long description renders);
+      the `backend/` directory removed.
+- [x] CI and release workflows, `AGENTS.md`, `docs/releasing.md`, and example
+      READMEs updated; `tests/test_protocol_contract.py` fixture path adjusted.
+- [x] sdist constrained to `src/kaiwen_agent`, `tests`, `README.md`, `LICENSE`, and
+      `pyproject.toml`. Distribution name and version are unchanged (`0.7.0a1`).
+- [~] Not complete until the pull request is reviewed, exact-head CI passes, and the
+      owner merges it.
+- Verified locally on 2026-11-07 (Python 3.13.5, Node 22.16.0): clean editable
+  install; `ruff format --check` and `ruff check` on `src tests examples`; mypy on
+  `src/kaiwen_agent` and the 13 CI-typed examples; pytest `282 passed, 1 skipped`,
+  identical to the pre-move baseline; the 10 CI-executed examples; wheel and sdist
+  builds; `twine check`; `npm ci`, build, protocol check, tests, typecheck, and
+  `pack:check`.
+- Wheel comparison against a pre-move build: the package file list and file contents
+  are identical. The only differences are the long description in `METADATA` and an
+  added `licenses/LICENSE` entry, because `LICENSE` now sits next to `pyproject.toml`.
+- Not verified locally: Python 3.11 and 3.12, Linux, and the release workflow
+  (`workflow_dispatch` only, not exercised).
 
 ### M3: CI/CD and packaging hardening (planned)
 

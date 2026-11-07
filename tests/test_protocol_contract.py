@@ -6,7 +6,7 @@ from pydantic import ValidationError
 
 from kaiwen_agent.events import AgentEvent
 
-FIXTURES = Path(__file__).parents[2] / "packages" / "protocol" / "fixtures"
+FIXTURES = Path(__file__).parents[1] / "packages" / "protocol" / "fixtures"
 
 
 def read_fixture(name: str) -> dict[str, object]:

@@ -26,7 +26,7 @@ No long-lived npm or PyPI token is required after trusted publishing is enabled.
 1. Keep all three package versions aligned conceptually. Python alpha
    `0.1.0a1` corresponds to npm `0.1.0-alpha.1`.
 2. Update changelog/release notes and run all local checks.
-3. Confirm `npm run pack:check` and `python -m twine check backend/dist/*`.
+3. Confirm `npm run pack:check` and `python -m twine check dist/*`.
 4. Commit and push the release state.
 5. Run the `Release packages` GitHub workflow manually, selecting only the
    registries intended for that run.

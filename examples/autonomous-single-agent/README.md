@@ -4,7 +4,7 @@ This provider-free example compiles a finite workflow into the existing durable 
 Runtime. It uses a temporary SQLite database and requires no API key:
 
 ```powershell
-.\backend\.venv\Scripts\python.exe examples\autonomous-single-agent\main.py
+.\.venv\Scripts\python.exe examples\autonomous-single-agent\main.py
 ```
 
 The plan is trusted example input. Production applications must validate untrusted

@@ -66,6 +66,15 @@ release = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/kaiwen_agent"]
 
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src/kaiwen_agent",
+  "/tests",
+  "/README.md",
+  "/LICENSE",
+  "/pyproject.toml",
+]
+
 [tool.pytest.ini_options]
 addopts = "-q -p no:cacheprovider"
 testpaths = ["tests"]
