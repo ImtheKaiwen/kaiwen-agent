@@ -32,7 +32,7 @@ jobs:
           for example in simple-runtime autonomous-single-agent software-agent-team \
             speech-pipeline validation-consumer legal-domain-validation coding-kit-fake \
             coding-kit-openai coding-simple-chat coding-simple-agent coding-simple-team \
-            coding-simple-ollama coding-simple-custom-host; do
+            coding-simple-ollama coding-simple-custom-host coding-docker-evidence; do
             echo "mypy examples/$example"
             python -m mypy --no-incremental "examples/$example/main.py"
           done
@@ -63,7 +63,12 @@ jobs:
       - run: python -m pip install -e ".[dev]"
       - run: python -m pip check
       - run: python -c "import kaiwen_agent, kaiwen_agent.kits.coding"
-      - run: python -m pytest
+      - name: Run tests
+        # Linux runners provide a real Docker engine; the container integration tests
+        # are required there. Windows runners cannot run Linux containers and skip them.
+        env:
+          KAIWEN_REQUIRE_DOCKER: ${{ runner.os == 'Linux' && '1' || '' }}
+        run: python -m pytest -rs
       - name: Run executable examples
         shell: bash
         env:
