@@ -9,6 +9,7 @@ image reference to use a different image.
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import os
 import shutil
@@ -331,7 +332,10 @@ def test_real_container_timeout_memory_and_cleanup(tmp_path: Path) -> None:
         memory_mb=128,
     )
 
+    unobserved: list[dict[str, object]] = []
+
     async def scenario() -> None:
+        asyncio.get_running_loop().set_exception_handler(lambda _l, c: unobserved.append(c))
         catalog = catalog_for(runner)
         timed = await catalog.execute(
             context(), CommandRunInput(command_id="sleeper"), category="test"
@@ -344,6 +348,8 @@ def test_real_container_timeout_memory_and_cleanup(tmp_path: Path) -> None:
         assert killed.exit_code != 0 and "600" not in killed.stdout
 
     asyncio.run(scenario())
+    gc.collect()
+    assert unobserved == [], "a reader task exception was never retrieved"
     assert leftover_containers() == []
 
 
@@ -491,4 +497,173 @@ def test_real_container_with_a_foreign_uid_reports_a_failed_cleanup(tmp_path: Pa
                 capture_output=True,
                 timeout=120,
             )
+    assert leftover_containers() == []
+
+
+def test_real_container_workflow_invalidates_evidence_when_the_coder_changes_source(
+    tmp_path: Path,
+) -> None:
+    """A -> B -> C through the real controller, real containers and the signed gate."""
+
+    from kaiwen_agent.control import RunControl
+    from kaiwen_agent.kits.coding import WorkspaceFingerprintProvider
+    from kaiwen_agent.persistence import SQLitePersistence
+    from kaiwen_agent.runtime import (
+        AutonomyLevel,
+        DurableRunManager,
+        RuntimeIdentity,
+        RuntimeVersionPins,
+    )
+    from kaiwen_agent.tasks import TaskScheduler
+    from kaiwen_agent.toolkits import SnapshotBuilder
+    from kaiwen_agent.workers import FunctionWorker, WorkerRegistry
+    from kaiwen_agent.workflow import (
+        WorkflowCompiler,
+        WorkflowController,
+        WorkflowOutcomeStatus,
+        WorkflowPlan,
+        WorkflowTaskSpec,
+        trusted_task_context,
+    )
+
+    root, runner, artifacts, catalog_for, gate = build_stack(tmp_path, (UNIT_TESTS,))
+    catalog = catalog_for(runner)
+    builder = SnapshotBuilder(runner.filesystem, "main")
+    store = SQLitePersistence(tmp_path / "state.sqlite3")
+    runs = DurableRunManager(store)
+    owner = RuntimeIdentity(
+        session_id="session-1", tenant_id="tenant-1", user_id="user-1", trace_id="trace-1"
+    )
+    pins = RuntimeVersionPins(
+        workspace_id="workspace",
+        workspace_version=1,
+        agent_id="agent",
+        agent_version=1,
+        prompt_id="prompt",
+        prompt_version=1,
+        prompt_checksum="prompt-checksum",
+        capability_manifest_id="agent",
+        capability_manifest_version=1,
+        provider_ref="fake",
+        tool_names=(),
+        toolset_checksum="toolset-checksum",
+    )
+    results: list[object] = []
+
+    async def verify(task, task_context):  # type: ignore[no-untyped-def]
+        agent_context = await trusted_task_context(
+            task, runs=runs, permissions=frozenset({"tests.run"}), workspace_id="workspace-1"
+        )
+        result = await catalog.execute(
+            agent_context, CommandRunInput(command_id="unit.tests"), category="test"
+        )
+        results.append(result)
+        return {"exit_code": result.exit_code}
+
+    async def edit(task, task_context):  # type: ignore[no-untyped-def]
+        (root / "pkg" / "calc.py").write_text(str(task.input["content"]))
+        return {}
+
+    workers = WorkerRegistry()
+    workers.register("tester", FunctionWorker(verify))
+    workers.register("editor", FunctionWorker(edit))
+
+    class Revisions:
+        def __init__(self, *plans: WorkflowPlan) -> None:
+            self.plans = list(plans)
+
+        async def revise(self, request):  # type: ignore[no-untyped-def]
+            return self.plans.pop(0) if self.plans else None
+
+    def controller(revisions: Revisions) -> WorkflowController:
+        return WorkflowController(
+            runs=runs,
+            compiler=WorkflowCompiler(
+                workers=workers, worker_allowlist=frozenset({"tester", "editor"})
+            ),
+            scheduler_factory=lambda graph: TaskScheduler(
+                graph=graph,
+                workers=workers,
+                store=store,
+                control=RunControl(checkpoints=store),
+            ),
+            completion_gate=gate,
+            revision_planner=revisions,
+            fingerprint_provider=WorkspaceFingerprintProvider(builder),
+        )
+
+    def tester(task_id: str, *after: str) -> WorkflowTaskSpec:
+        return WorkflowTaskSpec(
+            id=task_id, name="Run tests", worker_id="tester", dependencies=after
+        )
+
+    def editor(task_id: str, content: str, *after: str) -> WorkflowTaskSpec:
+        return WorkflowTaskSpec(
+            id=task_id,
+            name="Edit",
+            worker_id="editor",
+            dependencies=after,
+            input={"content": content},
+        )
+
+    state_b = "def add(a, b):\n    return b + a\n"
+    state_c = "def add(a, b):\n    return a - b\n"
+
+    async def scenario() -> None:
+        fingerprint_a = builder.fingerprint()
+        run = await runs.create(
+            identity=owner, autonomy=AutonomyLevel.AUTONOMOUS, version_pins=pins
+        )
+        revisions = Revisions(WorkflowPlan(objective="Ship", tasks=(tester("test-b"),)))
+        first = await controller(revisions).execute(
+            run=run,
+            identity=owner,
+            plan=WorkflowPlan(
+                objective="Ship", tasks=(tester("test-a"), editor("to-b", state_b, "test-a"))
+            ),
+            standards=resolution(),
+            protected_input_fingerprint="objective-1",
+        )
+        fingerprint_b = builder.fingerprint()
+        assert fingerprint_a != fingerprint_b
+        assert first.status == WorkflowOutcomeStatus.COMPLETED and first.cycles == 2
+        assert first.verified_input_fingerprint == fingerprint_b
+        assert [item.exit_code for item in results] == [0, 0]  # type: ignore[attr-defined]
+        assert [item.snapshot_fingerprint for item in results] == [  # type: ignore[attr-defined]
+            fingerprint_a,
+            fingerprint_b,
+        ]
+
+        # State C breaks the tests: B's evidence cannot complete it, and C's failure cannot either.
+        second_run = await runs.create(
+            identity=owner, autonomy=AutonomyLevel.AUTONOMOUS, version_pins=pins
+        )
+        second = await controller(Revisions()).execute(
+            run=second_run,
+            identity=owner,
+            plan=WorkflowPlan(
+                objective="Break",
+                tasks=(tester("test-b"), editor("to-c", state_c, "test-b")),
+            ),
+            standards=resolution(),
+            protected_input_fingerprint="objective-2",
+        )
+        assert second.status == WorkflowOutcomeStatus.BLOCKED
+        fingerprint_c = builder.fingerprint()
+        assert fingerprint_c not in {item.snapshot_fingerprint for item in results[2:]}  # type: ignore[attr-defined]
+        third_run = await runs.create(
+            identity=owner, autonomy=AutonomyLevel.AUTONOMOUS, version_pins=pins
+        )
+        third = await controller(Revisions()).execute(
+            run=third_run,
+            identity=owner,
+            plan=WorkflowPlan(objective="Test C", tasks=(tester("test-c"),)),
+            standards=resolution(),
+            protected_input_fingerprint="objective-3",
+        )
+        assert third.status == WorkflowOutcomeStatus.BLOCKED  # C is tested and fails
+        assert results[-1].exit_code != 0  # type: ignore[attr-defined]
+        assert results[-1].snapshot_fingerprint == fingerprint_c  # type: ignore[attr-defined]
+
+    asyncio.run(scenario())
     assert leftover_containers() == []

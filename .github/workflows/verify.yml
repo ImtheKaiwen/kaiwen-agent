@@ -32,7 +32,8 @@ jobs:
           for example in simple-runtime autonomous-single-agent software-agent-team \
             speech-pipeline validation-consumer legal-domain-validation coding-kit-fake \
             coding-kit-openai coding-simple-chat coding-simple-agent coding-simple-team \
-            coding-simple-ollama coding-simple-custom-host coding-docker-evidence; do
+            coding-simple-ollama coding-simple-custom-host coding-docker-evidence \
+            coding-evidence-freshness; do
             echo "mypy examples/$example"
             python -m mypy --no-incremental "examples/$example/main.py"
           done
@@ -69,7 +70,7 @@ jobs:
         env:
           KAIWEN_REQUIRE_DOCKER: ${{ runner.os == 'Linux' && '1' || '' }}
         run: python -m pytest -rs
-      - name: Run the Docker evidence example against a real engine
+      - name: Run the Docker evidence examples against a real engine
         if: runner.os == 'Linux'
         env:
           KAIWEN_REQUIRE_DOCKER: "1"
@@ -77,6 +78,7 @@ jobs:
         run: |
           docker pull --quiet "$KAIWEN_DOCKER_IMAGE"
           python examples/coding-docker-evidence/main.py
+          python examples/coding-evidence-freshness/main.py
       - name: Run executable examples
         shell: bash
         env:
