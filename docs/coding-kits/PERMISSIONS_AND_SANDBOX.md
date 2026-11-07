@@ -89,8 +89,10 @@ redacted output, signed with a host-held `EvidenceSigner`. Pass the same signer 
 `install_coding_verifiers(..., signer=...)`: the command verifiers (`coding.tests`,
 `coding.acceptance`) then accept only signed evidence and derive the verdict from the
 recorded exit code and flags. Failure, timeout, cancellation, missing evidence, a
-different run or owner, a different snapshot fingerprint, or a run that changed its own
-snapshot files never pass. The run id comes from the trusted `runtime_run_id` in the
+different run or owner, a different snapshot fingerprint, a run that changed its own
+snapshot files, or a run whose temporary directory was not verified removed
+(`cleanup_failed` true or not recorded) never pass. A zero exit code remains a command
+success in the result; only verified completion is blocked. The run id comes from the trusted `runtime_run_id` in the
 agent context metadata. Without a signer the verifiers keep their earlier behavior and
 trust host-written JSON artifacts.
 

@@ -14,7 +14,8 @@
   change their own snapshot files never pass, and the per-run directory is owner-only.
   The container user defaults to the non-root host uid so run directories can be removed
   (failures set `SandboxResult.cleanup_failed`), and sandbox output is held to its byte
-  budget after UTF-8 decoding. See ADR 0012 and `docs/coding-kits/PERMISSIONS_AND_SANDBOX.md`.
+  budget after UTF-8 decoding. Evidence now records `cleanup_failed`, and a failed or
+  unreported cleanup blocks the completion gate. See ADR 0012 and `docs/coding-kits/PERMISSIONS_AND_SANDBOX.md`.
 - Fix recent-conversation context freezing after 1,000 stored messages, context budgets
   dropping the newest turns, and conversation compaction stalling after the first 1,000
   messages. Add the optional `ConversationWindowStore` capability

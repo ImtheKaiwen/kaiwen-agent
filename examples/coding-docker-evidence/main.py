@@ -153,7 +153,7 @@ async def main() -> None:
             problems.append(f"expected a passing gate, got {executed_verdict}")
         if changed_verdict == "pass":
             problems.append("a changed source must not pass on old evidence")
-        if executed.cleanup_failed:
+        if executed.cleanup_failed is not False:
             problems.append("the sandbox could not remove its temporary run directory")
         if problems:
             raise SystemExit("Docker evidence example failed: " + "; ".join(problems))

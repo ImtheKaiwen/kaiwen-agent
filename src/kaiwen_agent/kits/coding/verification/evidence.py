@@ -161,7 +161,11 @@ class CommandEvidenceRecorder:
             run_id=run_id,
         )
         outcome = _outcome(
-            result.exit_code, result.timed_out, result.cancelled, result.snapshot_unchanged
+            result.exit_code,
+            result.timed_out,
+            result.cancelled,
+            result.snapshot_unchanged,
+            result.cleanup_failed,
         )
         references: list[str] = []
         for binding in bindings:
@@ -184,6 +188,7 @@ class CommandEvidenceRecorder:
                 "duration_seconds": result.duration_seconds,
                 "output_truncated": result.output_truncated,
                 "snapshot_unchanged": result.snapshot_unchanged,
+                "cleanup_failed": result.cleanup_failed,
                 "modified_paths": list(result.modified_paths),
                 "stdout": self._stream(result.stdout),
                 "stderr": self._stream(result.stderr),
@@ -228,8 +233,14 @@ class CommandEvidenceRecorder:
 
 
 def _outcome(
-    exit_code: int, timed_out: bool, cancelled: bool, snapshot_unchanged: bool | None
+    exit_code: int,
+    timed_out: bool,
+    cancelled: bool,
+    snapshot_unchanged: bool | None,
+    cleanup_failed: bool | None,
 ) -> str:
+    """The command exit code alone is a command result; verified completion needs more."""
+
     if cancelled:
         return "cancelled"
     if timed_out:
@@ -238,4 +249,8 @@ def _outcome(
         return "failed"
     if snapshot_unchanged is False:
         return "snapshot_modified"
-    return "passed" if snapshot_unchanged is True else "unverified"
+    if cleanup_failed is True:
+        return "cleanup_failed"
+    if snapshot_unchanged is True and cleanup_failed is False:
+        return "passed"
+    return "unverified"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from typing import Any
 
 from kaiwen_agent.artifacts import ArtifactManager, ArtifactMetadata
 from kaiwen_agent.kits.coding.verification.evidence import EVIDENCE_ORIGIN, EvidenceSigner
@@ -129,17 +130,12 @@ class JsonArtifactVerifier:
                 and payload.get("timed_out") is False
                 and payload.get("cancelled") is False
                 and payload.get("snapshot_unchanged") is True
+                and payload.get("cleanup_failed") is False
             ):
                 return self._result(
                     requirement, VerificationStatus.PASS, evidence_refs=(metadata.id,)
                 )
-            outcome = payload.get("outcome")
-            reason = (
-                outcome
-                if outcome
-                in {"failed", "timed_out", "cancelled", "snapshot_modified", "unverified"}
-                else "failed"
-            )
+            reason = _failure_reason(payload)
             return self._result(
                 requirement,
                 VerificationStatus.FAIL,
@@ -165,6 +161,22 @@ class JsonArtifactVerifier:
             findings=findings,
             verifier_id=self.verifier_id,
         )
+
+
+def _failure_reason(payload: dict[str, Any]) -> str:
+    """Derived from recorded facts; missing or non-boolean fields are never success."""
+
+    if payload.get("cancelled") is not False:
+        return "cancelled" if payload.get("cancelled") is True else "unverified"
+    if payload.get("timed_out") is not False:
+        return "timed_out" if payload.get("timed_out") is True else "unverified"
+    if payload.get("exit_code") != 0:
+        return "failed"
+    if payload.get("snapshot_unchanged") is False:
+        return "snapshot_modified"
+    if payload.get("cleanup_failed") is True:
+        return "cleanup_failed"
+    return "unverified"
 
 
 def coding_verifiers(

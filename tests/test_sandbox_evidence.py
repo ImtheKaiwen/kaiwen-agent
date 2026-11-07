@@ -71,6 +71,7 @@ def result(
     fingerprint: str | None = FINGERPRINT,
     stdout: str = "OK",
     unchanged: bool | None = True,
+    cleanup_failed: bool | None = False,
 ) -> SandboxResult:
     return SandboxResult(
         exit_code=exit_code,
@@ -82,6 +83,7 @@ def result(
         image_ref="python@sha256:" + "a" * 64,
         image_id="sha256:" + "b" * 64,
         snapshot_unchanged=unchanged,
+        cleanup_failed=cleanup_failed,
     )
 
 
@@ -190,6 +192,7 @@ def test_passing_real_result_produces_pass_with_attribution(tmp_path: Path) -> N
         assert payload["snapshot_fingerprint"] == FINGERPRINT
         assert payload["image"]["id"] == "sha256:" + "b" * 64
         assert payload["exit_code"] == 0 and payload["outcome"] == "passed"
+        assert payload["cleanup_failed"] is False and payload["snapshot_unchanged"] is True
         assert payload["stdout"]["sha256"] and payload["stdout"]["bytes"] == 2
         labels = artifact.metadata.labels
         assert labels["input_fingerprint"] == FINGERPRINT and labels["evidence_origin"]
@@ -643,8 +646,10 @@ def test_recorder_requires_an_explicit_trusted_runner() -> None:
     [
         (result(unchanged=False), "command_snapshot_modified"),
         (result(unchanged=None), "command_unverified"),
+        (result(cleanup_failed=True), "command_cleanup_failed"),
+        (result(cleanup_failed=None), "command_unverified"),
     ],
-    ids=["modified", "not-verified"],
+    ids=["modified", "not-verified", "cleanup-failed", "cleanup-not-reported"],
 )
 def test_passing_exit_code_without_verified_unmodified_snapshot_never_passes(
     tmp_path: Path, scripted: SandboxResult, finding: str
@@ -656,5 +661,97 @@ def test_passing_exit_code_without_verified_unmodified_snapshot_never_passes(
         gate = await harness.evaluate()
         assert gate.status == CompletionGateStatus.BLOCKED
         assert finding in gate.verifications[0].findings
+
+    run(scenario())
+
+
+def test_failed_cleanup_blocks_verified_completion_but_keeps_the_command_result(
+    tmp_path: Path,
+) -> None:
+    """Reproduces the incorrect PASS: exit 0 and an unchanged snapshot with a leaked run dir."""
+
+    harness = Harness(tmp_path, ScriptedRunner(result(cleanup_failed=True)))
+
+    async def scenario() -> None:
+        executed = await harness.execute()
+        assert executed.exit_code == 0 and executed.cleanup_failed is True  # command succeeded
+        context = ArtifactContext(
+            tenant_id="tenant-1", user_id="user-1", session_id="s", trace_id="t", run_id="run-1"
+        )
+        artifact = await harness.artifacts.read(context, executed.artifact_refs[0])
+        payload = json.loads(artifact.content)
+        assert payload["exit_code"] == 0 and payload["snapshot_unchanged"] is True
+        assert payload["cleanup_failed"] is True and payload["outcome"] == "cleanup_failed"
+        assert artifact.metadata.labels["outcome"] == "cleanup_failed"
+        gate = await harness.evaluate()
+        assert gate.status == CompletionGateStatus.BLOCKED
+        assert "command_cleanup_failed" in gate.verifications[0].findings
+
+    run(scenario())
+
+
+def test_later_clean_run_supersedes_an_earlier_failed_cleanup(tmp_path: Path) -> None:
+    runner = ScriptedRunner(result(cleanup_failed=True))
+    harness = Harness(tmp_path, runner)
+
+    async def scenario() -> None:
+        await harness.execute()
+        assert (await harness.evaluate()).status == CompletionGateStatus.BLOCKED
+        runner.result = result(cleanup_failed=False)
+        await asyncio.sleep(0.01)
+        await harness.execute()
+        assert (await harness.evaluate()).status == CompletionGateStatus.PASS
+
+    run(scenario())
+
+
+def test_signed_evidence_without_cleanup_information_is_not_treated_as_success(
+    tmp_path: Path,
+) -> None:
+    """Historical or incomplete signed evidence must stay conservative."""
+
+    harness = Harness(tmp_path, ScriptedRunner(result()))
+    owner = ArtifactContext(
+        tenant_id="tenant-1", user_id="user-1", session_id="s", trace_id="t", run_id="run-1"
+    )
+
+    async def scenario() -> None:
+        payload = {
+            "origin": "trusted_sandbox",
+            "run_id": "run-1",
+            "requirement_id": "coding.tests.run",
+            "snapshot_fingerprint": FINGERPRINT,
+            "exit_code": 0,
+            "timed_out": False,
+            "cancelled": False,
+            "snapshot_unchanged": True,
+            "outcome": "passed",
+        }  # genuinely signed, but it has no cleanup_failed field
+        content = json.dumps(payload).encode()
+        labels = {
+            "evidence_origin": "trusted_sandbox",
+            "requirement_id": "coding.tests.run",
+            "evidence_type": "test_run",
+            "input_fingerprint": FINGERPRINT,
+        }
+        labels["evidence_mac"] = SIGNER.sign(
+            tenant_id="tenant-1",
+            owner_user_id="user-1",
+            run_id="run-1",
+            content=content,
+            labels=labels,
+        )
+        await harness.artifacts.create(
+            owner,
+            ArtifactCreate(
+                type=ArtifactType.REPORT,
+                mime_type="application/json",
+                content=content,
+                labels=labels,
+            ),
+        )
+        gate = await harness.evaluate()
+        assert gate.status == CompletionGateStatus.BLOCKED
+        assert "command_unverified" in gate.verifications[0].findings
 
     run(scenario())
