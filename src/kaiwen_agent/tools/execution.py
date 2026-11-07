@@ -255,6 +255,40 @@ class ToolExecutor:
         finally:
             self._inflight.pop(flight_key, None)
 
+    async def _find_intent_with_other_id(
+        self,
+        store: ActionIntentStore,
+        intent: ActionIntentRecord,
+        definition: ToolDefinition,
+    ) -> ActionIntentRecord | None:
+        lookup = getattr(store, "get_action_intent_by_key", None)
+        if lookup is None:
+            return None  # the store's own key uniqueness still guards re-execution
+        found: ActionIntentRecord | None = await lookup(
+            tenant_id=intent.tenant_id,
+            user_id=intent.user_id,
+            runtime_run_id=intent.runtime_run_id,
+            idempotency_key=intent.idempotency_key,
+        )
+        if found is None or found.id == intent.id:
+            return None
+        if (found.tool_name, found.conversation_id) != (intent.tool_name, intent.conversation_id):
+            raise IdempotencyConflictError(
+                f"Idempotency key for {definition.name} was already used with a different binding"
+            )
+        return found
+
+    @staticmethod
+    async def _prepare_intent(
+        store: ActionIntentStore, intent: ActionIntentRecord, definition: ToolDefinition
+    ) -> ActionIntentRecord:
+        try:
+            return await store.prepare_action_intent(intent)
+        except ValueError as error:
+            raise IdempotencyConflictError(
+                f"Idempotency key for {definition.name} was already used with a different binding"
+            ) from error
+
     async def _execute_guarded(
         self,
         definition: ToolDefinition,
@@ -277,6 +311,17 @@ class ToolExecutor:
                 tenant_id=action_intent.tenant_id,
                 user_id=action_intent.user_id,
             )
+            if existing_intent is None:
+                legacy = await self._find_intent_with_other_id(
+                    action_store, action_intent, definition
+                )
+                if legacy is not None:
+                    # Same operation persisted under a pre-M5 id: keep its state, receipt,
+                    # and approvals instead of treating the action as new.
+                    existing_intent = legacy
+                    action_intent = action_intent.model_copy(
+                        update={"id": legacy.id, "call_id": legacy.call_id}
+                    )
             if (
                 existing_intent is not None
                 and existing_intent.arguments_checksum != arguments_checksum
@@ -307,7 +352,7 @@ class ToolExecutor:
                     action_intent_id=existing_intent.id,
                 )
             if existing_intent is None:
-                await action_store.prepare_action_intent(action_intent)
+                await self._prepare_intent(action_store, action_intent, definition)
 
         if decision.decision in {
             PolicyDecisionType.REQUIRE_APPROVAL,
@@ -371,7 +416,7 @@ class ToolExecutor:
 
         if action_intent is not None:
             assert action_store is not None
-            prepared = await action_store.prepare_action_intent(action_intent)
+            prepared = await self._prepare_intent(action_store, action_intent, definition)
             if prepared.arguments_checksum != arguments_checksum:
                 raise IdempotencyConflictError(
                     f"Idempotency key for {definition.name} was used with different arguments"

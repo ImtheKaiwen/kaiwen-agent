@@ -54,12 +54,19 @@ class ActionOutcomeUncertainError(ToolExecutionError):
         self.action_intent_id = action_intent_id
 
 
-class IdempotencyConflictError(AgentError):
-    """Raised when an idempotency key is reused with different canonical arguments."""
+class IdempotencyConflictError(AgentError, ValueError):
+    """Raised when an idempotency key is reused with different canonical arguments.
+
+    It is also a ValueError so callers that caught the store's earlier binding error keep working.
+    """
 
 
 class RunOwnershipError(AgentError):
     """Raised when a workflow run is owned by another executor or ownership was lost."""
+
+
+class ActionLookupIncompleteError(AgentError):
+    """Raised when in-flight action intents cannot be listed completely."""
 
 
 class DurableSideEffectsRequiredError(AgentError):

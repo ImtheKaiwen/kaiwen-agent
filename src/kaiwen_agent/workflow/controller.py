@@ -5,11 +5,11 @@ import logging
 from collections.abc import Callable
 from contextlib import suppress
 from hashlib import sha256
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import uuid4
 
 from kaiwen_agent.coordination import DistributedLease, LeaseStore
-from kaiwen_agent.exceptions import RunOwnershipError
+from kaiwen_agent.exceptions import ActionLookupIncompleteError, RunOwnershipError
 from kaiwen_agent.quality import (
     CompletionGate,
     CompletionGateResult,
@@ -21,6 +21,7 @@ from kaiwen_agent.quality import (
 from kaiwen_agent.runtime import (
     DurableRunManager,
     RuntimeIdentity,
+    RuntimeRunConflictError,
     RuntimeRunRecord,
     RuntimeRunStatus,
 )
@@ -43,6 +44,8 @@ SchedulerFactory = Callable[[TaskGraph], TaskScheduler]
 
 logger = logging.getLogger(__name__)
 
+_UNCERTAIN_PAGE = 1_000
+
 
 class WorkflowRevisionPlanner(Protocol):
     async def revise(self, request: WorkflowRevisionRequest) -> WorkflowPlan | None: ...
@@ -50,6 +53,65 @@ class WorkflowRevisionPlanner(Protocol):
 
 class _Ownership:
     lost = False
+
+
+class _RunWriter:
+    """Run-state writes for one execution, conditional on the owner's fencing token.
+
+    Every write also requires the stored status to be unchanged since it was read, so a
+    stale executor whose lease was taken over cannot overwrite the new owner's state; it
+    stops with `RunOwnershipError` instead.
+    """
+
+    def __init__(self, runs: DurableRunManager, fence: int | None) -> None:
+        self.runs = runs
+        self.fence = fence
+
+    async def start(
+        self, *, run_id: str, identity: RuntimeIdentity, owner_lease_key: str | None
+    ) -> RuntimeRunRecord:
+        return await self._guard(
+            self.runs.start(
+                run_id=run_id,
+                identity=identity,
+                owner_lease_key=owner_lease_key,
+                owner_fence=self.fence,
+            )
+        )
+
+    async def fail(
+        self, *, run_id: str, identity: RuntimeIdentity, reason: str
+    ) -> RuntimeRunRecord:
+        return await self._guard(
+            self.runs.fail(run_id=run_id, identity=identity, reason=reason, owner_fence=self.fence)
+        )
+
+    async def complete(self, *, run_id: str, identity: RuntimeIdentity) -> RuntimeRunRecord:
+        return await self._guard(
+            self.runs.complete(run_id=run_id, identity=identity, owner_fence=self.fence)
+        )
+
+    async def block(
+        self, *, run_id: str, identity: RuntimeIdentity, reason: str
+    ) -> RuntimeRunRecord:
+        return await self._guard(
+            self.runs.block(run_id=run_id, identity=identity, reason=reason, owner_fence=self.fence)
+        )
+
+    async def cancel(self, *, run_id: str, identity: RuntimeIdentity) -> RuntimeRunRecord:
+        return await self._guard(
+            self.runs.cancel(run_id=run_id, identity=identity, owner_fence=self.fence)
+        )
+
+    @staticmethod
+    async def _guard(write: Any) -> RuntimeRunRecord:
+        try:
+            result: RuntimeRunRecord = await write
+            return result
+        except RuntimeRunConflictError as error:
+            raise RunOwnershipError(
+                "The run changed under another owner; this executor stopped without writing"
+            ) from error
 
 
 class WorkflowController:
@@ -101,6 +163,7 @@ class WorkflowController:
         lease: DistributedLease | None = None
         heartbeat: asyncio.Task[None] | None = None
         ownership = _Ownership()
+        writer = _RunWriter(self.runs, None)
         if self.leases is not None:
             lease = await self.leases.acquire(
                 key=f"runtime-run:{run.id}",
@@ -111,6 +174,7 @@ class WorkflowController:
                 raise RunOwnershipError("Workflow run is owned by another executor")
             owner_task = asyncio.current_task()
             assert owner_task is not None
+            writer = _RunWriter(self.runs, lease.fencing_token)
             heartbeat = asyncio.create_task(self._heartbeat(lease, owner_task, ownership))
         try:
             return await self._execute(
@@ -120,6 +184,7 @@ class WorkflowController:
                 standards=standards,
                 protected_input_fingerprint=protected_input_fingerprint,
                 owner_lease_key=lease.key if lease is not None else None,
+                writer=writer,
             )
         except asyncio.CancelledError:
             if ownership.lost:
@@ -130,7 +195,9 @@ class WorkflowController:
                 raise RunOwnershipError(
                     "Run ownership was lost; execution stopped without recording state"
                 ) from None
-            await asyncio.shield(self._record_cancellation(run=run, identity=identity))
+            await asyncio.shield(
+                self._record_cancellation(run=run, identity=identity, writer=writer)
+            )
             raise
         finally:
             if heartbeat is not None:
@@ -159,31 +226,52 @@ class WorkflowController:
             current = renewed
 
     async def _record_cancellation(
-        self, *, run: RuntimeRunRecord, identity: RuntimeIdentity
+        self, *, run: RuntimeRunRecord, identity: RuntimeIdentity, writer: _RunWriter
     ) -> None:
+        # Cancellation is only recorded as safe when the lookup proves that no action is
+        # in flight. An incomplete or failed lookup is not proof, so the run is blocked.
+        unverified: str | None = None
+        uncertain: list[str] = []
         try:
             uncertain = await self._uncertain_actions(run)
-            if uncertain:
-                await self.runs.block(
+        except ActionLookupIncompleteError:
+            unverified = "lookup_incomplete"
+        except Exception:  # noqa: BLE001 - any lookup failure must fail closed
+            logger.warning("Could not look up in-flight actions for run %s", run.id, exc_info=True)
+            unverified = "unverified"
+        try:
+            if uncertain or unverified is not None:
+                await writer.block(
                     run_id=run.id,
                     identity=identity,
-                    reason=f"uncertain_action:{uncertain[0]}",
+                    reason=f"uncertain_action:{uncertain[0] if uncertain else unverified}",
                 )
             else:
-                await self.runs.cancel(run_id=run.id, identity=identity)
-        except (KeyError, ValueError):
+                await writer.cancel(run_id=run.id, identity=identity)
+        except (KeyError, ValueError, RunOwnershipError):
             logger.warning("Could not record cancellation for run %s", run.id, exc_info=True)
 
     async def _uncertain_actions(self, run: RuntimeRunRecord) -> list[str]:
-        if self.action_intents is None:
+        store = self.action_intents
+        if store is None:
             return []
-        intents = await self.action_intents.list_action_intents(
-            statuses=frozenset({ActionIntentStatus.EXECUTING, ActionIntentStatus.UNCERTAIN}),
-            limit=1_000,
-        )
+        statuses = frozenset({ActionIntentStatus.EXECUTING, ActionIntentStatus.UNCERTAIN})
+        scoped = getattr(store, "list_run_action_intents", None)
+        if scoped is not None:
+            scoped_intents = await scoped(
+                tenant_id=run.tenant_id,
+                user_id=run.user_id,
+                runtime_run_id=run.id,
+                statuses=statuses,
+            )
+            return sorted(intent.id for intent in scoped_intents)
+        page = await store.list_action_intents(statuses=statuses, limit=_UNCERTAIN_PAGE)
+        if len(page) >= _UNCERTAIN_PAGE:
+            # A full page may hide this run's intents behind unrelated ones.
+            raise ActionLookupIncompleteError("In-flight action listing may be truncated")
         return sorted(
             intent.id
-            for intent in intents
+            for intent in page
             if intent.runtime_run_id == run.id
             and intent.tenant_id == run.tenant_id
             and intent.user_id == run.user_id
@@ -198,6 +286,7 @@ class WorkflowController:
         standards: StandardResolution,
         protected_input_fingerprint: str,
         owner_lease_key: str | None = None,
+        writer: _RunWriter,
     ) -> WorkflowOutcome:
         if run.status not in {
             RuntimeRunStatus.CREATED,
@@ -205,7 +294,7 @@ class WorkflowController:
             RuntimeRunStatus.BLOCKED,
         }:
             raise ValueError(f"Workflow run cannot start from {run.status}")
-        current_run = await self.runs.start(
+        current_run = await writer.start(
             run_id=run.id, identity=identity, owner_lease_key=owner_lease_key
         )
         current_plan = plan
@@ -221,7 +310,7 @@ class WorkflowController:
                     cycle=cycle,
                 )
             except WorkflowPlanError as error:
-                failed = await self.runs.fail(
+                failed = await writer.fail(
                     run_id=run.id,
                     identity=identity,
                     reason="invalid_plan",
@@ -238,7 +327,7 @@ class WorkflowController:
             except asyncio.CancelledError:
                 raise
             except Exception as error:
-                failed = await self.runs.fail(
+                failed = await writer.fail(
                     run_id=run.id,
                     identity=identity,
                     reason="scheduler_failed",
@@ -276,6 +365,7 @@ class WorkflowController:
                     raise
                 except Exception as error:
                     return await self._revision_failure(
+                        writer=writer,
                         run=run,
                         identity=identity,
                         cycle=cycle,
@@ -285,7 +375,7 @@ class WorkflowController:
                 if revised is not None and cycle < self.limits.max_cycles:
                     current_plan = revised
                     continue
-                failed = await self.runs.fail(
+                failed = await writer.fail(
                     run_id=run.id,
                     identity=identity,
                     reason="task_execution_failed",
@@ -313,7 +403,7 @@ class WorkflowController:
             except asyncio.CancelledError:
                 raise
             except Exception as error:
-                failed = await self.runs.fail(
+                failed = await writer.fail(
                     run_id=run.id,
                     identity=identity,
                     reason="completion_gate_failed",
@@ -326,7 +416,7 @@ class WorkflowController:
                     reason=f"completion_gate_failed:{type(error).__name__}",
                 )
             if latest_quality.status == CompletionGateStatus.PASS:
-                completed = await self.runs.complete(run_id=run.id, identity=identity)
+                completed = await writer.complete(run_id=run.id, identity=identity)
                 return WorkflowOutcome(
                     status=WorkflowOutcomeStatus.COMPLETED,
                     run=completed,
@@ -339,6 +429,7 @@ class WorkflowController:
                 CompletionGateStatus.CONFIGURATION_ERROR,
             }:
                 return await self._blocked(
+                    writer=writer,
                     run=run,
                     identity=identity,
                     cycle=cycle,
@@ -365,6 +456,7 @@ class WorkflowController:
                 raise
             except Exception as error:
                 return await self._revision_failure(
+                    writer=writer,
                     run=run,
                     identity=identity,
                     cycle=cycle,
@@ -375,6 +467,7 @@ class WorkflowController:
                 current_plan = revised
                 continue
             return await self._blocked(
+                writer=writer,
                 run=run,
                 identity=identity,
                 cycle=cycle,
@@ -384,6 +477,7 @@ class WorkflowController:
             )
 
         return await self._blocked(
+            writer=writer,
             run=run,
             identity=identity,
             cycle=self.limits.max_cycles,
@@ -425,6 +519,7 @@ class WorkflowController:
     async def _blocked(
         self,
         *,
+        writer: _RunWriter,
         run: RuntimeRunRecord,
         identity: RuntimeIdentity,
         cycle: int,
@@ -432,7 +527,7 @@ class WorkflowController:
         quality: CompletionGateResult | None,
         reason: str,
     ) -> WorkflowOutcome:
-        blocked = await self.runs.block(run_id=run.id, identity=identity, reason=reason)
+        blocked = await writer.block(run_id=run.id, identity=identity, reason=reason)
         return WorkflowOutcome(
             status=WorkflowOutcomeStatus.BLOCKED,
             run=blocked,
@@ -445,13 +540,14 @@ class WorkflowController:
     async def _revision_failure(
         self,
         *,
+        writer: _RunWriter,
         run: RuntimeRunRecord,
         identity: RuntimeIdentity,
         cycle: int,
         tasks: list[AgentTask],
         error: Exception,
     ) -> WorkflowOutcome:
-        failed = await self.runs.fail(
+        failed = await writer.fail(
             run_id=run.id,
             identity=identity,
             reason="revision_planner_failed",

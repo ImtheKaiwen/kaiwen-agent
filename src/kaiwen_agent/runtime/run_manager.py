@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import inspect
+
+from kaiwen_agent.exceptions import RunOwnershipError
 from kaiwen_agent.runtime.durability import (
     RuntimeRunRecord,
     RuntimeRunStatus,
@@ -17,6 +20,9 @@ class DurableRunManager:
         if not getattr(store, "is_durable", False):
             raise ValueError("DurableRunManager requires a durable runtime run store")
         self.store = store
+        self._conditional_writes = (
+            "expected_status" in inspect.signature(store.save_runtime_run).parameters
+        )
 
     async def create(
         self,
@@ -52,6 +58,7 @@ class DurableRunManager:
         run_id: str,
         identity: RuntimeIdentity,
         owner_lease_key: str | None = None,
+        owner_fence: int | None = None,
     ) -> RuntimeRunRecord:
         return await self._transition(
             run_id=run_id,
@@ -65,10 +72,17 @@ class DurableRunManager:
             ),
             status=RuntimeRunStatus.RUNNING,
             owner_lease_key=owner_lease_key,
+            owner_fence=owner_fence,
+            take_ownership=owner_lease_key is not None or owner_fence is not None,
         )
 
     async def pause(
-        self, *, run_id: str, identity: RuntimeIdentity, safe_boundary: str
+        self,
+        *,
+        run_id: str,
+        identity: RuntimeIdentity,
+        safe_boundary: str,
+        owner_fence: int | None = None,
     ) -> RuntimeRunRecord:
         return await self._transition(
             run_id=run_id,
@@ -76,10 +90,16 @@ class DurableRunManager:
             expected=frozenset({RuntimeRunStatus.RUNNING}),
             status=RuntimeRunStatus.PAUSED,
             safe_boundary=safe_boundary,
+            owner_fence=owner_fence,
         )
 
     async def block(
-        self, *, run_id: str, identity: RuntimeIdentity, reason: str
+        self,
+        *,
+        run_id: str,
+        identity: RuntimeIdentity,
+        reason: str,
+        owner_fence: int | None = None,
     ) -> RuntimeRunRecord:
         return await self._transition(
             run_id=run_id,
@@ -93,9 +113,12 @@ class DurableRunManager:
             ),
             status=RuntimeRunStatus.BLOCKED,
             blocked_reason=reason,
+            owner_fence=owner_fence,
         )
 
-    async def cancel(self, *, run_id: str, identity: RuntimeIdentity) -> RuntimeRunRecord:
+    async def cancel(
+        self, *, run_id: str, identity: RuntimeIdentity, owner_fence: int | None = None
+    ) -> RuntimeRunRecord:
         return await self._transition(
             run_id=run_id,
             identity=identity,
@@ -109,19 +132,28 @@ class DurableRunManager:
             ),
             status=RuntimeRunStatus.CANCELLED,
             terminal=True,
+            owner_fence=owner_fence,
         )
 
-    async def complete(self, *, run_id: str, identity: RuntimeIdentity) -> RuntimeRunRecord:
+    async def complete(
+        self, *, run_id: str, identity: RuntimeIdentity, owner_fence: int | None = None
+    ) -> RuntimeRunRecord:
         return await self._transition(
             run_id=run_id,
             identity=identity,
             expected=frozenset({RuntimeRunStatus.RUNNING}),
             status=RuntimeRunStatus.COMPLETED,
             terminal=True,
+            owner_fence=owner_fence,
         )
 
     async def fail(
-        self, *, run_id: str, identity: RuntimeIdentity, reason: str
+        self,
+        *,
+        run_id: str,
+        identity: RuntimeIdentity,
+        reason: str,
+        owner_fence: int | None = None,
     ) -> RuntimeRunRecord:
         return await self._transition(
             run_id=run_id,
@@ -137,6 +169,7 @@ class DurableRunManager:
             status=RuntimeRunStatus.FAILED,
             blocked_reason=reason,
             terminal=True,
+            owner_fence=owner_fence,
         )
 
     async def _transition(
@@ -150,6 +183,8 @@ class DurableRunManager:
         blocked_reason: str | None = None,
         terminal: bool = False,
         owner_lease_key: str | None = None,
+        owner_fence: int | None = None,
+        take_ownership: bool = False,
     ) -> RuntimeRunRecord:
         current = await self.get(run_id=run_id, identity=identity)
         if current is None:
@@ -164,11 +199,39 @@ class DurableRunManager:
                 "blocked_reason": blocked_reason,
                 "updated_at": now,
                 "completed_at": now if terminal else None,
-                **({"owner_lease_key": owner_lease_key} if owner_lease_key else {}),
+                **(
+                    {"owner_lease_key": owner_lease_key, "owner_fencing_token": owner_fence}
+                    if take_ownership
+                    else {}
+                ),
             }
         )
-        await self.store.save_runtime_run(updated)
+        await self._save(
+            updated,
+            expected_status=current.status,
+            expected_owner_fence=None if take_ownership else owner_fence,
+        )
         return updated
+
+    async def _save(
+        self,
+        updated: RuntimeRunRecord,
+        *,
+        expected_status: RuntimeRunStatus,
+        expected_owner_fence: int | None,
+    ) -> None:
+        if self._conditional_writes:
+            await self.store.save_runtime_run(
+                updated,
+                expected_status=expected_status,
+                expected_owner_fence=expected_owner_fence,
+            )
+            return
+        if expected_owner_fence is not None:
+            raise RunOwnershipError(
+                "The runtime run store cannot enforce ownership-conditional writes"
+            )
+        await self.store.save_runtime_run(updated)
 
 
 def _required_owner(identity: RuntimeIdentity) -> tuple[str, str]:
