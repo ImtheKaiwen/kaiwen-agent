@@ -8,12 +8,14 @@ from kaiwen_agent.kits.coding.verification.evidence import (
     EvidenceBinding,
     EvidenceSigner,
 )
+from kaiwen_agent.kits.coding.verification.pipeline import TrustedEvidencePipeline
 
 __all__ = [
     "CommandEvidenceRecorder",
     "EvidenceBinding",
     "EvidenceSigner",
     "JsonArtifactVerifier",
+    "TrustedEvidencePipeline",
     "coding_verifiers",
     "install_coding_verifiers",
 ]

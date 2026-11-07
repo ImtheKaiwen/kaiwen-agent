@@ -51,6 +51,16 @@ class WorkflowRevisionPlanner(Protocol):
     async def revise(self, request: WorkflowRevisionRequest) -> WorkflowPlan | None: ...
 
 
+class ProtectedInputFingerprintProvider(Protocol):
+    """Trusted, host-owned source of the current state fingerprint for the gate.
+
+    It is called by the controller, never by a model or task. An exception means the
+    state cannot be established, and completion then fails closed.
+    """
+
+    async def current(self, *, run: RuntimeRunRecord, identity: RuntimeIdentity) -> str: ...
+
+
 class _Ownership:
     lost = False
 
@@ -131,6 +141,7 @@ class WorkflowController:
         leases: LeaseStore | None = None,
         lease_owner_id: str | None = None,
         lease_ttl_seconds: float = 30.0,
+        fingerprint_provider: ProtectedInputFingerprintProvider | None = None,
     ) -> None:
         if lease_ttl_seconds <= 0:
             raise ValueError("lease_ttl_seconds must be positive")
@@ -150,6 +161,10 @@ class WorkflowController:
         self.leases = leases
         self.lease_owner_id = lease_owner_id or f"controller-{uuid4().hex}"
         self.lease_ttl_seconds = lease_ttl_seconds
+        # Optional. Without it the fingerprint passed to `execute` is used for every
+        # gate evaluation (the original behavior). With it, each evaluation uses a
+        # freshly obtained value and the passed fingerprint only names the input.
+        self.fingerprint_provider = fingerprint_provider
 
     async def execute(
         self,
@@ -388,6 +403,23 @@ class WorkflowController:
                     reason="task_execution_failed",
                 )
 
+            gate_fingerprint = protected_input_fingerprint
+            if self.fingerprint_provider is not None:
+                try:
+                    gate_fingerprint = await self._fresh_fingerprint(run, identity)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.warning("Current protected input unavailable", exc_info=True)
+                    return await self._blocked(
+                        writer=writer,
+                        run=run,
+                        identity=identity,
+                        cycle=cycle,
+                        tasks=all_tasks,
+                        quality=None,
+                        reason="protected_input_unavailable",
+                    )
             try:
                 latest_quality = await self.completion_gate.evaluate(
                     standards,
@@ -397,7 +429,7 @@ class WorkflowController:
                         session_id=run.session_id,
                         trace_id=identity.trace_id or f"trace_{run.id}",
                         run_id=run.id,
-                        protected_input_fingerprint=protected_input_fingerprint,
+                        protected_input_fingerprint=gate_fingerprint,
                     ),
                 )
             except asyncio.CancelledError:
@@ -416,6 +448,29 @@ class WorkflowController:
                     reason=f"completion_gate_failed:{type(error).__name__}",
                 )
             if latest_quality.status == CompletionGateStatus.PASS:
+                if self.fingerprint_provider is not None:
+                    # Bracket the evaluation: a different state afterwards means the
+                    # verdict may describe state that no longer exists. This detects a
+                    # concurrent writer; it does not make the workspace atomic.
+                    try:
+                        confirmed = await self._fresh_fingerprint(run, identity)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.warning("Protected input unavailable after gate", exc_info=True)
+                        confirmed = ""
+                    if confirmed != gate_fingerprint:
+                        return await self._blocked(
+                            writer=writer,
+                            run=run,
+                            identity=identity,
+                            cycle=cycle,
+                            tasks=all_tasks,
+                            quality=None,
+                            reason="workspace_changed_during_verification"
+                            if confirmed
+                            else "protected_input_unavailable",
+                        )
                 completed = await writer.complete(run_id=run.id, identity=identity)
                 return WorkflowOutcome(
                     status=WorkflowOutcomeStatus.COMPLETED,
@@ -423,6 +478,7 @@ class WorkflowController:
                     cycles=cycle,
                     tasks=tuple(all_tasks),
                     quality_result=latest_quality,
+                    verified_input_fingerprint=gate_fingerprint,
                 )
             if latest_quality.status in {
                 CompletionGateStatus.APPROVAL_REQUIRED,
@@ -485,6 +541,13 @@ class WorkflowController:
             quality=latest_quality,
             reason="workflow_cycle_limit",
         )
+
+    async def _fresh_fingerprint(self, run: RuntimeRunRecord, identity: RuntimeIdentity) -> str:
+        assert self.fingerprint_provider is not None
+        value = await self.fingerprint_provider.current(run=run, identity=identity)
+        if not isinstance(value, str) or not value:
+            raise ValueError("The fingerprint provider returned no fingerprint")
+        return value
 
     async def _revise(
         self, request: WorkflowRevisionRequest, *, allow: bool

@@ -20,6 +20,7 @@ from kaiwen_agent.kits.coding.factory import (
     CodingPreflightIssue,
     CodingPreflightResult,
 )
+from kaiwen_agent.kits.coding.fingerprint import WorkspaceFingerprintProvider
 from kaiwen_agent.kits.coding.handles import CodingRunHandle, CodingRunResult
 from kaiwen_agent.kits.coding.observability import (
     CodingEventEmitter,
@@ -81,6 +82,7 @@ from kaiwen_agent.kits.coding.verification import (
     EvidenceBinding,
     EvidenceSigner,
     JsonArtifactVerifier,
+    TrustedEvidencePipeline,
     coding_verifiers,
     install_coding_verifiers,
 )
@@ -107,6 +109,8 @@ __all__ = [
     "CodingRoleConfig",
     "CodingRunManifest",
     "CodingRunControl",
+    "TrustedEvidencePipeline",
+    "WorkspaceFingerprintProvider",
     "CommandEvidenceRecorder",
     "EvidenceBinding",
     "EvidenceSigner",

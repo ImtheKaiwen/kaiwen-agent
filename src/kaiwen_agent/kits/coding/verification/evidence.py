@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import logging
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from hashlib import sha256
@@ -21,6 +22,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from kaiwen_agent.artifacts import ArtifactContext, ArtifactCreate, ArtifactManager, ArtifactType
 from kaiwen_agent.audit import SecretRedactor
 from kaiwen_agent.toolkits.commands import CommandExecution
+
+logger = logging.getLogger(__name__)
 
 EVIDENCE_ORIGIN = "trusted_sandbox"
 EVIDENCE_SCHEMA_VERSION = 1
@@ -152,6 +155,10 @@ class CommandEvidenceRecorder:
             or result.snapshot_fingerprint is None
         ):
             # Without a trusted run, owner, and executed snapshot nothing may be claimed.
+            logger.warning(
+                "No evidence recorded for %s: trusted run, owner, or snapshot identity missing",
+                execution.preset.id,
+            )
             return ()
         artifact_context = ArtifactContext(
             tenant_id=context.tenant_id,

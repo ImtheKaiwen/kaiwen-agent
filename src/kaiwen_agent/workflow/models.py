@@ -107,3 +107,5 @@ class WorkflowOutcome(BaseModel):
     tasks: tuple[AgentTask, ...]
     quality_result: CompletionGateResult | None = None
     reason: str | None = None
+    # The protected-input fingerprint the completion gate actually evaluated.
+    verified_input_fingerprint: str | None = None
