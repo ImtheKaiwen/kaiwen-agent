@@ -31,9 +31,9 @@ under `examples/`.
 npm.cmd run build
 npm.cmd run typecheck
 npm.cmd test
-.\backend\.venv\Scripts\python.exe -m pytest backend/tests
-.\backend\.venv\Scripts\python.exe -m ruff check backend
-.\backend\.venv\Scripts\python.exe -m mypy backend/src
+.\.venv\Scripts\python.exe -m pytest tests
+.\.venv\Scripts\python.exe -m ruff check src tests examples
+.\.venv\Scripts\python.exe -m mypy src
 ```
 
 Prefer deterministic fakes and contract tests for repeatable automated testing, while

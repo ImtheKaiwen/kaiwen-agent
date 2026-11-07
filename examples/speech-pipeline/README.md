@@ -4,7 +4,7 @@ This provider-free example demonstrates the ephemeral STT → text handler → T
 composition with explicit audio-processing permission and one trusted identity.
 
 ```powershell
-.\backend\.venv\Scripts\python.exe examples\speech-pipeline\main.py
+.\.venv\Scripts\python.exe examples\speech-pipeline\main.py
 ```
 
 The fake adapters do not persist audio or require provider credentials.

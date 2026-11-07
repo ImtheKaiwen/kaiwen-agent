@@ -36,57 +36,31 @@ jobs:
       - run: npm test
       - run: npm run typecheck
       - run: python -m pip install -e ".[dev,release]"
-        working-directory: backend
-      - run: python -m ruff format --config pyproject.toml --check . ../examples
-        working-directory: backend
-      - run: python -m ruff check --config pyproject.toml . ../examples
-        working-directory: backend
+      - run: python -m ruff format --config pyproject.toml --check src tests examples
+      - run: python -m ruff check --config pyproject.toml src tests examples
       - run: python -m mypy --no-incremental src/kaiwen_agent
-        working-directory: backend
-      - run: python -m mypy --no-incremental ../examples/simple-runtime/main.py
-        working-directory: backend
-      - run: python -m mypy --no-incremental ../examples/autonomous-single-agent/main.py
-        working-directory: backend
-      - run: python -m mypy --no-incremental ../examples/software-agent-team/main.py
-        working-directory: backend
-      - run: python -m mypy --no-incremental ../examples/speech-pipeline/main.py
-        working-directory: backend
-      - run: python -m mypy --no-incremental ../examples/validation-consumer/main.py
-        working-directory: backend
-      - run: python -m mypy --no-incremental ../examples/legal-domain-validation/main.py
-        working-directory: backend
-      - run: python -m mypy --no-incremental ../examples/coding-kit-fake/main.py
-        working-directory: backend
-      - run: python -m mypy --no-incremental ../examples/coding-kit-openai/main.py
-        working-directory: backend
-      - run: python -m mypy --no-incremental ../examples/coding-simple-chat/main.py
-        working-directory: backend
-      - run: python -m mypy --no-incremental ../examples/coding-simple-agent/main.py
-        working-directory: backend
-      - run: python -m mypy --no-incremental ../examples/coding-simple-team/main.py
-        working-directory: backend
-      - run: python -m mypy --no-incremental ../examples/coding-simple-ollama/main.py
-        working-directory: backend
-      - run: python -m mypy --no-incremental ../examples/coding-simple-custom-host/main.py
-        working-directory: backend
+      - run: python -m mypy --no-incremental examples/simple-runtime/main.py
+      - run: python -m mypy --no-incremental examples/autonomous-single-agent/main.py
+      - run: python -m mypy --no-incremental examples/software-agent-team/main.py
+      - run: python -m mypy --no-incremental examples/speech-pipeline/main.py
+      - run: python -m mypy --no-incremental examples/validation-consumer/main.py
+      - run: python -m mypy --no-incremental examples/legal-domain-validation/main.py
+      - run: python -m mypy --no-incremental examples/coding-kit-fake/main.py
+      - run: python -m mypy --no-incremental examples/coding-kit-openai/main.py
+      - run: python -m mypy --no-incremental examples/coding-simple-chat/main.py
+      - run: python -m mypy --no-incremental examples/coding-simple-agent/main.py
+      - run: python -m mypy --no-incremental examples/coding-simple-team/main.py
+      - run: python -m mypy --no-incremental examples/coding-simple-ollama/main.py
+      - run: python -m mypy --no-incremental examples/coding-simple-custom-host/main.py
       - run: python -m pytest
-        working-directory: backend
-      - run: python ../examples/validation-consumer/main.py "$RUNNER_TEMP/todo-consumer"
-        working-directory: backend
-      - run: python ../examples/legal-domain-validation/main.py "$RUNNER_TEMP/legal-consumer"
-        working-directory: backend
-      - run: python ../examples/coding-simple-chat/main.py
-        working-directory: backend
-      - run: python ../examples/coding-simple-agent/main.py
-        working-directory: backend
-      - run: python ../examples/coding-simple-team/main.py
-        working-directory: backend
-      - run: python ../examples/coding-simple-custom-host/main.py
-        working-directory: backend
+      - run: python examples/validation-consumer/main.py "$RUNNER_TEMP/todo-consumer"
+      - run: python examples/legal-domain-validation/main.py "$RUNNER_TEMP/legal-consumer"
+      - run: python examples/coding-simple-chat/main.py
+      - run: python examples/coding-simple-agent/main.py
+      - run: python examples/coding-simple-team/main.py
+      - run: python examples/coding-simple-custom-host/main.py
       - run: python -m build
-        working-directory: backend
       - run: python -m twine check dist/*
-        working-directory: backend
 
   npm:
     if: inputs.publish_npm
@@ -119,7 +93,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install build
-      - run: python -m build backend
+      - run: python -m build
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages-dir: backend/dist/
+          packages-dir: dist/
