@@ -18,6 +18,9 @@ class SchedulerStalledError(RuntimeError):
     pass
 
 
+_RESOURCE_POLL_SECONDS = 0.02
+
+
 class TaskScheduler:
     def __init__(
         self,
@@ -103,6 +106,11 @@ class TaskScheduler:
                 await asyncio.sleep(max(0, min(delayed) - asyncio.get_running_loop().time()))
                 continue
             if not scheduled and not self.graph.complete:
+                if any(task.status == TaskStatus.WAITING_RESOURCE for task in self.graph.tasks()):
+                    # This scheduler holds nothing, so the lock belongs to another scheduler
+                    # sharing the ResourceManager. Wait for it instead of failing the task.
+                    await asyncio.sleep(_RESOURCE_POLL_SECONDS)
+                    continue
                 raise SchedulerStalledError("No runnable tasks and no active workers")
 
         return self.graph.tasks()
