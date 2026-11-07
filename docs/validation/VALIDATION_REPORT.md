@@ -1,5 +1,8 @@
 # Validation report
 
+> Historical snapshot: this document records the state at the time it was written
+> and is not updated as the code evolves. Current status is in `docs/roadmap.md`.
+
 Validated on 2026-10-17 from local commit `f1c117b` plus the validation changes in
 the working tree. This report distinguishes deterministic integration coverage from
 live-provider verification.

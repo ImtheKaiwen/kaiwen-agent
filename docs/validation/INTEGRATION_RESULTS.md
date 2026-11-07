@@ -1,5 +1,8 @@
 # Integration results
 
+> Historical snapshot: this document records the state at the time it was written
+> and is not updated as the code evolves. Current status is in `docs/roadmap.md`.
+
 ## Unified runtime
 
 ### A. Simple agent

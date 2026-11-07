@@ -1,5 +1,8 @@
 # Simple Coding API implementation status
 
+> Historical snapshot: this document records the state at the time it was written
+> and is not updated as the code evolves. Current status is in `docs/roadmap.md`.
+
 Baseline: published `kaiwen-agent==0.6.0a1`. The checkout and its accepted ADRs are
 authoritative. The Simple API is additive and does not change existing constructors
 or execution semantics.

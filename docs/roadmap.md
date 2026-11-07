@@ -3,6 +3,12 @@
 The detailed architecture lives outside product applications. This repository tracks
 implementation status for the reusable packages.
 
+Status markers: `[x]` completed, `[~]` in progress, `[ ]` planned, `[!]` blocked.
+This file records verified progress only. Entries marked completed reflect the
+changelog, accepted ADRs, and repository contents; they are not a statement that
+tests were re-run when the entry was last edited. Dated reports under
+`docs/validation/` and `docs/coding-kits/` are historical snapshots.
+
 ## Completed
 
 - [x] Phase A: repository boundaries, canonical JSON Schema, shared fixtures, CI.
@@ -132,6 +138,16 @@ implementation status for the reusable packages.
       the remaining crash/multitenant/load matrices, and expanded developer
       documentation remain.
 
+- [x] Phase K1 (0.6.0a1): opt-in first-party Coding Kits under `kaiwen_agent.kits`:
+      packaged role prompts, adaptive standards, evidence verifiers, bounded project
+      discovery, read/patch/Git/command toolkits with approval-gated writes, and
+      `CodingAgent` / `CodingTeam` composition over existing runtime systems
+      (ADR 0008). Command execution requires a host-supplied sandbox runner; no
+      first-party isolated runner ships.
+- [x] Phase K2 (0.7.0a1): thin Simple Coding API facade (`CodingKit`) with
+      owner-scoped durable run handles, capability preflight, and deterministic
+      consumer examples (ADR 0009).
+
 - [ ] Phase R4 / G: authenticated portfolio admin integration, WebRTC bootstrap route,
       Dynamic Island voice states, task notifications, and semantic UI dispatch.
 - [ ] Phase R5A.2: policy-controlled lifecycle actions, reasoning integration, and
@@ -146,5 +162,80 @@ implementation status for the reusable packages.
       summaries written through the memory policy.
 - [ ] Phase R10: security hardening, abuse controls, retention enforcement, and
       production readiness review.
+
+## Repository milestones (M1-M5)
+
+Each milestone requires explicit owner approval before it starts. Milestones are
+small, independently reviewable changes with their own acceptance criteria.
+
+### M1: Repository and documentation foundation (completed)
+
+- [x] Add `CLAUDE.md`, retire `docs/AI_CONTEXT.md` into `docs/architecture.md`,
+      move the three legacy Turkish planning documents to `docs/archive/`, refresh
+      `README.md` and this roadmap, label dated reports as historical snapshots.
+- Acceptance: no broken relative Markdown links; no production source, test,
+  package manifest, or workflow changes; no emojis introduced in new or modified
+  documentation (pre-existing content in archived documents is preserved unchanged);
+  changes reviewed and accepted by the owner. All criteria were verified on
+  2026-11-07 by link check, diff inspection, and hash comparison; no tests were run
+  because no code changed.
+
+### M2: Root-level Python restructuring (planned)
+
+- [ ] Move `backend/src`, `backend/tests`, and `backend/pyproject.toml` to the
+      repository root; fold `backend/README.md` into the root README; remove the
+      `backend/` wrapper after all consumers are updated.
+- Known hazards: the PyPI long description follows `readme` in `pyproject.toml`;
+  the root sdist needs an explicit include list; `tests/test_protocol_contract.py`
+  resolves protocol fixtures with `parents[2]`; CI, release workflow, `AGENTS.md`,
+  `docs/releasing.md`, and example READMEs reference `backend/`.
+- Acceptance: identical test count and results, identical wheel contents, clean
+  sdist, CI and release verification updated and passing.
+
+### M3: CI/CD and packaging hardening (planned)
+
+- [ ] Python version and operating-system matrix matching declared support; build,
+      `twine check`, and `npm pack` checks on pull requests; release verification
+      aligned with CI; publish the verified artifact; version-consistency check;
+      release restricted to the default branch; least-privilege workflow
+      permissions; pinned actions.
+- [!] Branch protection and required reviewers on the `npm` and `pypi` environments
+      are remote repository settings and require the owner. A read-only query on
+      2026-11-07 reported no protection on `main`, no rulesets, and no environment
+      protection rules.
+- [ ] Reconcile repository URLs (`kaiwen-agent-platform` in package manifests versus
+      `kaiwen-agent` as the current remote) after confirming trusted-publisher
+      configuration on PyPI and npm.
+
+### M4: Security and behavioural validation (planned)
+
+- [ ] Add negative tests first, then fix confirmed defects.
+- [ ] Real-contract tests for the OpenAI adapter using recorded SDK response shapes.
+- [ ] Coverage measurement for policy, approval, and durability paths.
+
+### M5: Runtime and multi-agent reliability (planned)
+
+- [ ] Explicit cancellation handling and terminal-state persistence in `Agent`,
+      `TaskScheduler`, and `JobManager`.
+- [ ] Decide the policy for tool and malformed-model-output errors during a run.
+- [ ] Provider error classification so failover is reachable with shipped adapters.
+- [ ] Run-level wall-clock or budget bound.
+- [ ] Durable action store requirement for side-effecting tools.
+
+### Open risks from the initial audit
+
+These come from a read-only code review on 2026-11-07. None has been reproduced by
+execution; each needs a failing test before a fix is attempted.
+
+- `WorkspaceFilesystem.read_text` and `write_text` appear not to apply the host
+  ignore and sensitive-path policy that `list_files`, `stat`, and `read_lines`
+  apply; `workspace.read_text` and `workspace.apply_patch` use them. Targeted by M4.
+- `Agent.run` and `TaskScheduler` handle `Exception` but not `CancelledError`,
+  which may leave run or task state non-terminal. Targeted by M5.
+- No first-party shipped provider adapter raises `RetryableModelProviderError`, so
+  initial-call failover depends on host-side classification.
+- The default idempotency store is in-memory and its lookup and write are not atomic.
+- Release verification omits four example runs that CI performs, and build checks
+  run only during release.
 
 Publishing, deployment, and GitHub pushes remain separate explicit release steps.
