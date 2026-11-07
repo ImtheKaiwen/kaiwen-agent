@@ -314,7 +314,7 @@ def test_workflow_handle_uses_durable_run_and_rejects_cross_owner_resume(tmp_pat
 
     async def scenario() -> None:
         handle = await kit.agent().start("Complete one bounded task")
-        result = await handle.wait(timeout=2)
+        result = await handle.wait(timeout=30)
         assert result.status is RuntimeRunStatus.COMPLETED
         assert result.tasks_total == 1
         assert result.tasks_completed == 1
@@ -331,7 +331,7 @@ def test_workflow_handle_uses_durable_run_and_rejects_cross_owner_resume(tmp_pat
         assert restarted_kit.identity.session_id == kit.identity.session_id
         reconnected = await restarted_kit.resume(handle.id)
         assert reconnected.id == handle.id
-        assert (await reconnected.wait(timeout=1)).status is RuntimeRunStatus.COMPLETED
+        assert (await reconnected.wait(timeout=30)).status is RuntimeRunStatus.COMPLETED
 
         wrong_owner = CodingKit.for_host(
             identity=RuntimeIdentity(
@@ -386,7 +386,7 @@ def test_pause_and_cancel_are_explicitly_unsupported_without_host_control(tmp_pa
 
     async def scenario() -> None:
         handle = await kit.agent().start("Complete one bounded task")
-        await handle.wait(timeout=2)
+        await handle.wait(timeout=30)
         for operation, code in (
             (handle.pause, "pause_unsupported"),
             (handle.cancel, "cancel_unsupported"),

@@ -1,5 +1,15 @@
+from kaiwen_agent.workflow.agent_worker import (
+    AgentRuntimeWorker,
+    WorkerConfigurationError,
+    WorkspaceAuthorization,
+    WorkspaceBindingError,
+)
 from kaiwen_agent.workflow.compiler import WorkflowCompiler, WorkflowPlanError
-from kaiwen_agent.workflow.context import TaskIdentityError, trusted_task_context
+from kaiwen_agent.workflow.context import (
+    TaskIdentityError,
+    trusted_task_context,
+    trusted_task_run,
+)
 from kaiwen_agent.workflow.controller import (
     ProtectedInputFingerprintProvider,
     SchedulerFactory,
@@ -17,8 +27,25 @@ from kaiwen_agent.workflow.models import (
     WorkflowTaskFailure,
     WorkflowTaskSpec,
 )
+from kaiwen_agent.workflow.task_context import (
+    TaskContextAssembler,
+    TaskContextPackage,
+    TaskContextSource,
+    TaskHandoff,
+    private_conversation_id,
+)
 
 __all__ = [
+    "AgentRuntimeWorker",
+    "TaskContextAssembler",
+    "TaskContextPackage",
+    "TaskContextSource",
+    "TaskHandoff",
+    "WorkerConfigurationError",
+    "WorkspaceAuthorization",
+    "WorkspaceBindingError",
+    "private_conversation_id",
+    "trusted_task_run",
     "ProtectedInputFingerprintProvider",
     "TaskIdentityError",
     "trusted_task_context",

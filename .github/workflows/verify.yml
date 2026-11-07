@@ -33,7 +33,7 @@ jobs:
             speech-pipeline validation-consumer legal-domain-validation coding-kit-fake \
             coding-kit-openai coding-simple-chat coding-simple-agent coding-simple-team \
             coding-simple-ollama coding-simple-custom-host coding-docker-evidence \
-            coding-evidence-freshness; do
+            coding-evidence-freshness coding-agent-worker; do
             echo "mypy examples/$example"
             python -m mypy --no-incremental "examples/$example/main.py"
           done
@@ -79,6 +79,7 @@ jobs:
           docker pull --quiet "$KAIWEN_DOCKER_IMAGE"
           python examples/coding-docker-evidence/main.py
           python examples/coding-evidence-freshness/main.py
+          python examples/coding-agent-worker/main.py
       - name: Run executable examples
         shell: bash
         env:

@@ -147,6 +147,15 @@ fingerprint of a snapshot of the same bytes. `TrustedEvidencePipeline` wires one
 (a signer is mandatory), and workers obtain the run identity with `trusted_task_context`.
 The workspace read is point-in-time, so this does not make verification atomic.
 
+### Coding workers and workspace authorization
+
+A coding worker that can produce evidence runs through `AgentRuntimeWorker` with an
+`AuthorizedCodingWorkspace` (see `docs/workflows.md` and `docs/teams.md`). Configuration fails if
+the fingerprint provider, catalog, runner, recorder, verifiers or controller disagree about the
+workspace or the signer, and at execution the durable run must be bound to that workspace. The
+binding is a durable authorization record, not a sandbox: it does not prove the runner isolates
+anything, and the verification remains point-in-time.
+
 ### Unattended test, lint and typecheck
 
 `testing_tools(catalog, unattended_categories=frozenset({"test", "lint", "typecheck"}))`

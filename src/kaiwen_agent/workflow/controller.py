@@ -24,6 +24,7 @@ from kaiwen_agent.runtime import (
     RuntimeRunConflictError,
     RuntimeRunRecord,
     RuntimeRunStatus,
+    WorkspaceBinding,
 )
 from kaiwen_agent.standards import StandardResolution
 from kaiwen_agent.tasks import AgentTask, TaskGraph, TaskScheduler, TaskStatus
@@ -142,6 +143,7 @@ class WorkflowController:
         lease_owner_id: str | None = None,
         lease_ttl_seconds: float = 30.0,
         fingerprint_provider: ProtectedInputFingerprintProvider | None = None,
+        workspace_binding: WorkspaceBinding | None = None,
     ) -> None:
         if lease_ttl_seconds <= 0:
             raise ValueError("lease_ttl_seconds must be positive")
@@ -165,6 +167,8 @@ class WorkflowController:
         # gate evaluation (the original behavior). With it, each evaluation uses a
         # freshly obtained value and the passed fingerprint only names the input.
         self.fingerprint_provider = fingerprint_provider
+        # Optional. When set, a run must carry exactly this durable workspace binding.
+        self.workspace_binding = workspace_binding
 
     async def execute(
         self,
@@ -312,6 +316,19 @@ class WorkflowController:
         current_run = await writer.start(
             run_id=run.id, identity=identity, owner_lease_key=owner_lease_key
         )
+        if self.workspace_binding is not None and (
+            current_run.workspace_binding != self.workspace_binding
+        ):
+            # Compared with the durable record just read, never with the caller's copy.
+            return await self._blocked(
+                writer=writer,
+                run=run,
+                identity=identity,
+                cycle=1,
+                tasks=[],
+                quality=None,
+                reason="workspace_binding_mismatch",
+            )
         current_plan = plan
         all_tasks: list[AgentTask] = []
         latest_quality: CompletionGateResult | None = None

@@ -54,6 +54,37 @@ run record (it must exist for that owner and be running), the run id is never re
 permissions come from the calling host. It is only a context primitive; it does not run
 agents or tools.
 
+## Run-to-workspace binding and coding workers
+
+A durable run can be bound to one workspace with `WorkspaceBinding` (workspace id, root, policy
+checksum), passed to `DurableRunManager.create(workspace_binding=...)` or set once before
+start with `bind_workspace`. It is stored in the durable run record, so it survives restarts,
+the store refuses to change it, and old records without one load unchanged.
+`WorkflowController(workspace_binding=...)` blocks a run whose durable binding differs
+(`workspace_binding_mismatch`) before any task runs; without it nothing changes for other
+workflows. A coding worker built with `AgentRuntimeWorker(workspace=AuthorizedCodingWorkspace(...))`
+re-checks the binding of the run it executes for.
+
+`AuthorizedCodingWorkspace` lists every inconsistency between the workspace policy, fingerprint
+provider, command catalog, sandbox runner, evidence pipeline and controller. A worker that can
+produce execution evidence (`evidence_tool_names`) is refused at construction unless the
+controller uses that workspace's fingerprint provider and binding and its gate uses the
+pipeline's signed verifiers. It is also refused without a controller or without a workspace
+identity. Fixed-fingerprint workflows and workers that produce no evidence are not affected.
+
+Workspace identity: the binding holds the workspace id, root alias and policy checksum, none
+of which names a physical location. `AuthorizedCodingWorkspace(identity=...)` adds a
+host-assigned opaque identifier (for example the project record id), stored only as a scoped
+digest. Two projects with the same id, alias and policy but different identities do not match,
+and the same project moved to another directory or machine keeps its binding. The host owns
+the mapping from identity to directory; the platform does not verify that the directory is the
+project, so give different projects different identities.
+
+Handoffs: a dependency's artifact references are kept only when they belong to the same run
+and owner scope. Evidence references are kept as authenticated only when the existing
+`EvidenceSigner` verifies them for this owner and run. Authenticated evidence may be stale;
+only the completion gate decides whether a requirement is satisfied.
+
 ## Recovery scope
 
 The runtime run and scheduled task records are durable when the host supplies durable

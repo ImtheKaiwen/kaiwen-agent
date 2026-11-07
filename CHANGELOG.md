@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Add `AgentRuntimeWorker`, which runs a configured `AgentRuntime` as a workflow `Worker` over
+  the existing scheduler with host-owned permissions and tools, a bounded handoff-shaped result
+  (`verified: false`) and private per-task conversation ids. Add `WorkspaceBinding` stored in the
+  durable run record (`RuntimeRunRecord.workspace_binding`, optional, write-once;
+  `DurableRunManager.bind_workspace`, `WorkflowController(workspace_binding=...)`),
+  `AuthorizedCodingWorkspace` (mandatory fresh-fingerprint and pipeline consistency for coding
+  workers), `TaskContextPackage`, `TaskContextAssembler` and `TaskHandoff` (bounded, trust
+  separated, owner- and run-scoped reference handling; evidence references are authenticated
+  with the existing `EvidenceSigner`, never by a label). Coding workers that produce evidence
+  require a controller and a host-assigned workspace identity (`identity_digest` on the
+  binding). Existing workflows are unchanged. See ADR 0014.
 - Add `WorkflowController(fingerprint_provider=...)` so completion is evaluated against a freshly
   obtained, content-aware project fingerprint at every gate evaluation (a passing result is
   re-checked and a failing or empty provider blocks the run), `WorkspaceFingerprintProvider`,

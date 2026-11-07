@@ -102,6 +102,9 @@ class ProjectCheckRunner:
         self.builder = builder
         self.passes = passes
         self.calls = 0
+        # A trusted runner names the workspace it executes in; coding workers check it.
+        self.filesystem = builder.filesystem
+        self.root = builder.root
 
     async def run(self, command: SandboxCommand) -> SandboxResult:
         self.calls += 1
@@ -158,6 +161,7 @@ class Env:
         use_provider: bool = True,
         provider_hook: Callable[[int], None] | None = None,
         fixed_provider: Any = None,
+        register_workers: bool = True,
     ) -> None:
         self.root = tmp_path / "project"
         self.root.mkdir()
@@ -206,7 +210,8 @@ class Env:
         self.hang = False
         self.started: asyncio.Event | None = None
         self.workers = WorkerRegistry()
-        self.workers.register("tester", FunctionWorker(self._tester))
+        if register_workers:
+            self.workers.register("tester", FunctionWorker(self._tester))
         self.workers.register("editor", FunctionWorker(self._editor))
         self.revisions = ScriptedRevisions()
 
@@ -231,7 +236,9 @@ class Env:
         self.source.write_text(str(task.input["content"]))
         return {"written": True}
 
-    def controller(self, *, revisions: ScriptedRevisions | None = None) -> WorkflowController:
+    def controller(
+        self, *, revisions: ScriptedRevisions | None = None, workspace_binding: Any = None
+    ) -> WorkflowController:
         return WorkflowController(
             runs=self.runs,
             compiler=WorkflowCompiler(
@@ -247,6 +254,7 @@ class Env:
             completion_gate=self.gate,
             revision_planner=revisions or self.revisions,
             fingerprint_provider=self.provider,
+            workspace_binding=workspace_binding,
         )
 
     async def new_run(self, **owner: str):  # type: ignore[no-untyped-def]
