@@ -5,6 +5,7 @@ from kaiwen_agent.models.capabilities import (
     ModelCapabilitiesRegistry,
     ModelToolStrategy,
 )
+from kaiwen_agent.models.errors import is_transient_provider_error
 from kaiwen_agent.models.failover import (
     FailoverCandidate,
     FailoverModelProvider,
@@ -37,4 +38,5 @@ __all__ = [
     "ModelToolStrategy",
     "ProviderRegistry",
     "RetryableModelProviderError",
+    "is_transient_provider_error",
 ]

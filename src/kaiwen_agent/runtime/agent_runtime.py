@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from kaiwen_agent.agent import Agent
@@ -57,6 +57,8 @@ class AgentRuntime:
         context_renderer: ContextRenderer | None = None,
         compaction_manager: ContextCompactionManager | None = None,
         max_steps: int = 8,
+        tool_errors: Literal["fail", "return"] = "fail",
+        max_tool_errors: int = 3,
     ) -> None:
         if not name:
             raise ValueError("name must not be empty")
@@ -79,6 +81,8 @@ class AgentRuntime:
         self.context_renderer = context_renderer or ContextRenderer()
         self.compaction_manager = compaction_manager
         self.max_steps = max_steps
+        self.tool_errors = tool_errors
+        self.max_tool_errors = max_tool_errors
 
     async def run(
         self,
@@ -137,6 +141,8 @@ class AgentRuntime:
                 else self.tool_executor
             ),
             max_steps=self.max_steps,
+            tool_errors=self.tool_errors,
+            max_tool_errors=self.max_tool_errors,
         )
         return await agent.run(normalized_input, context=context)
 

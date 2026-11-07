@@ -53,6 +53,7 @@ class ToolResult(BaseModel):
     call_id: str
     name: str
     output: Any
+    is_error: bool = False
 
 
 class AgentResult(BaseModel):

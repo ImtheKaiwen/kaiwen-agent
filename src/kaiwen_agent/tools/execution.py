@@ -18,6 +18,7 @@ from kaiwen_agent.exceptions import (
     ApprovalRequiredError,
     IdempotencyConflictError,
     PermissionDeniedError,
+    ToolArgumentsError,
     ToolExecutionError,
     ToolTimeoutError,
     ToolValidationError,
@@ -88,7 +89,7 @@ class ToolExecutor:
                 "failed",
                 {"error_type": type(error).__name__, "arguments": call.arguments},
             )
-            raise ToolValidationError(f"Invalid arguments for {definition.name}") from error
+            raise ToolArgumentsError(f"Invalid arguments for {definition.name}") from error
 
         policy_context = PolicyContext(
             tenant_id=context.tenant_id,

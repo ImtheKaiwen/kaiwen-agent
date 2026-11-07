@@ -31,7 +31,12 @@ class OllamaChatProvider:
         host: str | None = None,
         tool_strategy: ModelToolStrategy = ModelToolStrategy.NATIVE,
         think: bool | str | None = None,
+        timeout: float | None = None,
     ) -> None:
+        if client is not None and timeout is not None:
+            raise ValueError(
+                "timeout configures the default client; configure an injected client directly"
+            )
         if tool_strategy not in {ModelToolStrategy.NATIVE, ModelToolStrategy.TEXT_ONLY}:
             raise ValueError("Ollama adapter currently supports native or text-only tools")
         if client is None:
@@ -41,7 +46,7 @@ class OllamaChatProvider:
                 raise RuntimeError(
                     "Install the Ollama adapter with `pip install kaiwen-agent[ollama]`."
                 ) from error
-            client = AsyncClient(host=host)
+            client = AsyncClient(host=host, timeout=timeout)
         self._client = client
         self.model = model
         self.instructions = instructions

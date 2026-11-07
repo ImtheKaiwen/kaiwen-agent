@@ -18,6 +18,10 @@ class ToolValidationError(AgentError):
     """Raised when tool arguments fail schema validation."""
 
 
+class ToolArgumentsError(ToolValidationError):
+    """Raised when model-supplied arguments fail the tool input schema."""
+
+
 class ApprovalRequiredError(AgentError):
     """Raised when an approval-protected tool has no approval gate."""
 
@@ -56,3 +60,7 @@ class IdempotencyConflictError(AgentError):
 
 class DurableSideEffectsRequiredError(AgentError):
     """Raised when autonomous side effects are requested without durable coordination."""
+
+
+class ModelResponseError(AgentError):
+    """Raised when a provider returns a malformed response, such as invalid tool arguments."""
