@@ -72,8 +72,53 @@ snapshot fingerprint, evidence authentication, the gate verdict, token usage, es
 request count, latency, the abort or failure reason, and (Ollama) GPU offload and tokens per
 second when Ollama reports them. Stages are kept separate: `provider_connection`,
 `model_tool_calling`, `tool_execution`, `evidence_authentication`, `completion_gate`, and
-`overall`. `not_run` is never a pass, and a dry run reports `NOT_RUN`. Prompts, paths and
+`overall`. `not_run` is never a pass, a stage after an earlier failure is `not_run` rather than
+failed, and a dry run reports `NOT_RUN`. Prompts, paths and
 secrets are not written; configured secret values and key-shaped strings are scrubbed.
+
+## Failure diagnostics
+
+A failed run records an allowlist of structured facts and nothing else. The report never
+contains an exception message, a response body, a header, a prompt, tool arguments or a stack
+trace; free-form text from the provider is not redacted but never copied.
+
+`provider_error` (and the earliest failing stage in each scenario) has: `exception_class`,
+`category`, `stage`, `attempt`, `http_status`, `error_code`, `error_param`, `error_type`,
+`http_response_observed`, `model_response_received` and `usage_available`. Codes, parameters and
+types are kept only when they are short identifier-like strings that do not look like a key.
+
+`failure_category` is the earliest stage the host's own records confirm:
+
+| Category | Meaning |
+| --- | --- |
+| `rejected_before_transport` | Raised before any request left (SDK or adapter validation) |
+| `transport_failure` | Connection or timeout; no HTTP response was observed |
+| `http_error` | The provider answered with an error status (400, 401/403, 429, 5xx, ...) |
+| `adapter_failure_after_response` | A successful response, then an adapter or parsing failure |
+| `valid_response_without_tool_call` | A good response that did not call `testing.run` |
+| `tool_execution_failure` | The tool was called but no authentic evidence resulted |
+| `evidence_or_gate_failure` | Evidence exists but the gate did not accept it |
+| `limit_exceeded` | A configured limit stopped the run |
+| `undetermined` | The task failed and the host cannot attribute it; nothing is guessed |
+
+If the worker task fails before it produces output, `worker_output` is `unavailable` and
+`worker_verified_field` is `null`; it is never reported as a claim of verification.
+
+Usage and cost are separate. `model_requests` counts attempts that reached the transport (SDK
+retries are off), `successful_responses` those that returned, and `responses_with_usage` those
+that carried provider-reported usage. Tokens and `estimated_cost_usd` cover reported usage only
+and are `null` when no response reported any: an attempt without usage has unknown billing,
+never zero (`billing_note`, `cost_is_lower_bound`). The local budget treats such an attempt at
+its worst-case estimate.
+
+## Request compatibility warnings
+
+`request_compatibility_warnings` lists strict function schemas that are not closed with
+`additionalProperties: false` on every object, which the OpenAI function-calling and
+structured-outputs guides require. It is computed offline from the exact tool schema the adapter
+sends and does not block the run. The current `testing.run` tool reports one (its free-form
+`parameters` object). Whether the API rejects it has not been verified; a strict xfail test
+records it until an adapter decision is made.
 
 ## Troubleshooting
 

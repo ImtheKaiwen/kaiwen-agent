@@ -101,6 +101,101 @@ class LimitExceeded(RuntimeError):
     """A configured live-validation limit was reached; the run is aborted."""
 
 
+class HarnessError(RuntimeError):
+    """A harness-authored message that is safe to put in the report verbatim.
+
+    Any other exception is reported by class name only: its text may carry provider payloads
+    or secrets.
+    """
+
+
+_TOKEN = re.compile(r"^[A-Za-z0-9_.\-]{1,64}$")
+
+
+_SECRET_SHAPE = re.compile(r"(^sk-|[A-Za-z0-9]{32,})")
+
+
+def _safe_token(value: Any) -> str | None:
+    """Short identifier-like strings only; anything shaped like a key is dropped."""
+
+    if not isinstance(value, str) or not _TOKEN.fullmatch(value):
+        return None
+    return None if _SECRET_SHAPE.search(value) else value
+
+
+def _safe_status(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 100 <= value <= 599 else None
+
+
+@dataclass(frozen=True, slots=True)
+class SafeError:
+    """Allowlisted facts about one provider failure. No message, body, header or payload."""
+
+    exception_class: str | None
+    category: str
+    stage: str
+    attempt: int
+    http_status: int | None = None
+    error_code: str | None = None
+    error_param: str | None = None
+    error_type: str | None = None
+    http_response_observed: bool = False
+    model_response_received: bool = False
+    usage_available: bool = False
+
+
+def sanitize_error(
+    error: BaseException,
+    *,
+    attempt: int,
+    model_response_received: bool = False,
+    usage_available: bool = False,
+) -> SafeError:
+    """Classify a failure from structured SDK attributes only, never from its text."""
+
+    names = {item.__name__ for item in type(error).__mro__}
+    status = _safe_status(getattr(error, "status_code", None))
+    if status is None:
+        status = _safe_status(getattr(getattr(error, "response", None), "status_code", None))
+    code = _safe_token(getattr(error, "code", None))
+    if "APITimeoutError" in names or "TimeoutException" in names or isinstance(error, TimeoutError):
+        category, stage = "timeout", "transport_failure"
+    elif names & {"APIConnectionError", "ConnectError", "NetworkError", "TransportError"}:
+        category, stage = "connection", "transport_failure"
+    elif status is not None:
+        stage = "http_error"
+        known = {
+            400: "invalid_request",
+            401: "authentication",
+            403: "permission_denied",
+            404: "not_found",
+            422: "invalid_request",
+        }
+        if status == 429:
+            category = "quota_exhausted" if code == "insufficient_quota" else "rate_limited"
+        else:
+            category = known.get(status) or ("server_error" if status >= 500 else "http_error")
+    elif names & {"ValidationError", "TypeError", "ValueError"}:
+        category, stage = "sdk_validation", "rejected_before_transport"
+    else:
+        category, stage = "unclassified", "undetermined"
+    return SafeError(
+        exception_class=_safe_token(type(error).__name__),
+        category=category,
+        stage=stage,
+        attempt=attempt,
+        http_status=status,
+        error_code=code,
+        error_param=_safe_token(getattr(error, "param", None)),
+        error_type=_safe_token(getattr(error, "type", None)),
+        http_response_observed=status is not None,
+        model_response_received=model_response_received,
+        usage_available=usage_available,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class Limits:
     max_requests: int = 4
@@ -142,13 +237,24 @@ class Ledger:
 
     limits: Limits
     pricing: Pricing
+    # `requests` counts attempts that reached the transport; retries are disabled, so it is
+    # also the number of billable-at-most requests.
     requests: int = 0
+    responses: int = 0
+    usage_responses: int = 0
+    # Provider-reported usage only.
     input_tokens: int = 0
     output_tokens: int = 0
+    reported_usd: float = 0.0
+    # Budget accounting: reported cost, plus the pessimistic pre-request estimate for any
+    # attempt whose usage is unknown (failed or usage-less), so unknown is never treated as zero.
     spent_usd: float = 0.0
     scenario_tool_calls: int = 0
     abort_reason: str | None = None
     request_seconds: float = 0.0
+    guard_failures: int = 0
+    errors: list[SafeError] = field(default_factory=list)
+    _pending: float = 0.0
 
     def before(self, estimated_input_tokens: int) -> None:
         if self.requests >= self.limits.max_requests:
@@ -161,11 +267,55 @@ class Ledger:
         if projected > self.limits.budget_usd:
             self._abort("budget estimate exceeded")
         self.requests += 1
+        self._pending = self.pricing.cost(estimated_input_tokens, self.limits.max_output_tokens)
 
-    def after(self, input_tokens: int, output_tokens: int, tool_calls: int, seconds: float) -> None:
-        self.input_tokens += input_tokens
-        self.output_tokens += output_tokens
-        self.spent_usd += self.pricing.cost(input_tokens, output_tokens)
+    def record_failure(self, error: BaseException) -> None:
+        """A transport or HTTP failure at the guarded client; usage is unknown."""
+
+        self.guard_failures += 1
+        self.spent_usd += self._pending
+        if len(self.errors) < 5:
+            self.errors.append(sanitize_error(error, attempt=self.requests))
+
+    def note_exception(self, error: BaseException, *, attempted: bool, received: bool) -> None:
+        """A failure outside the client call: before transport, or after a good response."""
+
+        if len(self.errors) >= 5:
+            return
+        base = sanitize_error(error, attempt=self.requests, model_response_received=received)
+        if received:
+            category, stage = "adapter_failure", "adapter_failure_after_response"
+        elif attempted:
+            category, stage = base.category, base.stage
+        else:
+            category, stage = "adapter_error", "rejected_before_transport"
+        self.errors.append(
+            SafeError(
+                **{
+                    **{f: getattr(base, f) for f in SafeError.__slots__},
+                    "category": category,
+                    "stage": stage,
+                }
+            )
+        )
+
+    def after(
+        self,
+        input_tokens: int | None,
+        output_tokens: int | None,
+        tool_calls: int,
+        seconds: float,
+    ) -> None:
+        self.responses += 1
+        if input_tokens is None or output_tokens is None:
+            self.spent_usd += self._pending
+        else:
+            cost = self.pricing.cost(input_tokens, output_tokens)
+            self.usage_responses += 1
+            self.input_tokens += input_tokens
+            self.output_tokens += output_tokens
+            self.reported_usd += cost
+            self.spent_usd += cost
         self.request_seconds += seconds
         self.scenario_tool_calls += tool_calls
         if self.scenario_tool_calls > self.limits.max_tool_calls:
@@ -194,7 +344,11 @@ class _GuardedResponses:
         request["max_output_tokens"] = self._ledger.limits.max_output_tokens
         self._ledger.before(estimate_tokens(request))
         started = time.monotonic()
-        response = await self._inner.responses.create(**request)
+        try:
+            response = await self._inner.responses.create(**request)
+        except Exception as error:
+            self._ledger.record_failure(error)
+            raise
         usage = getattr(response, "usage", None)
         calls = sum(
             1
@@ -202,8 +356,8 @@ class _GuardedResponses:
             if getattr(item, "type", None) == "function_call"
         )
         self._ledger.after(
-            _count(getattr(usage, "input_tokens", 0)),
-            _count(getattr(usage, "output_tokens", 0)),
+            _optional_count(getattr(usage, "input_tokens", None)),
+            _optional_count(getattr(usage, "output_tokens", None)),
             calls,
             time.monotonic() - started,
         )
@@ -235,17 +389,60 @@ class GuardedOllamaClient:
         }
         self._ledger.before(estimate_tokens(request))
         started = time.monotonic()
-        response = await self._inner.chat(**request)
+        try:
+            response = await self._inner.chat(**request)
+        except Exception as error:
+            self._ledger.record_failure(error)
+            raise
         raw = _as_mapping(response)
         message = _as_mapping(raw.get("message", {}))
         calls = len(message.get("tool_calls") or [])
-        output_tokens = _count(raw.get("eval_count"))
-        self.eval_tokens += output_tokens
+        output_tokens = _optional_count(raw.get("eval_count"))
+        self.eval_tokens += output_tokens or 0
         self.eval_seconds += _count(raw.get("eval_duration")) / 1e9
         self._ledger.after(
-            _count(raw.get("prompt_eval_count")), output_tokens, calls, time.monotonic() - started
+            _optional_count(raw.get("prompt_eval_count")),
+            output_tokens,
+            calls,
+            time.monotonic() - started,
         )
         return response
+
+
+class DiagnosticProvider:
+    """Wraps any provider so a failure outside the client call is still attributed.
+
+    The guarded client sees transport and HTTP failures. This wrapper sees everything else the
+    adapter raises, and records only whether a request was attempted and whether a response
+    had been received, plus the exception class name.
+    """
+
+    def __init__(self, inner: Any, ledger: Ledger) -> None:
+        self._inner = inner
+        self._ledger = ledger
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    async def respond(self, *args: Any, **kwargs: Any) -> Any:
+        ledger = self._ledger
+        attempts, failures, responses = ledger.requests, ledger.guard_failures, ledger.responses
+        try:
+            return await self._inner.respond(*args, **kwargs)
+        except LimitExceeded:
+            raise
+        except Exception as error:
+            if ledger.guard_failures == failures:
+                ledger.note_exception(
+                    error,
+                    attempted=ledger.requests > attempts,
+                    received=ledger.responses > responses,
+                )
+            raise
+
+
+def _optional_count(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
 def _count(value: Any) -> int:
@@ -287,8 +484,13 @@ class ScenarioReport:
     snapshot_fingerprint: str | None = None
     gate_status: str | None = None
     gate_reason: str | None = None
+    worker_output: str = "unavailable"
     worker_verified_field: bool | None = None
     model_claimed_success: bool | None = None
+    task_status: str | None = None
+    task_error_code: str | None = None
+    failed_stage: str | None = None
+    failure_category: str | None = None
     reason: str | None = None
     elapsed_seconds: float = 0.0
 
@@ -302,10 +504,21 @@ class Report:
     docker: str = "not_checked"
     limits: dict[str, Any] = field(default_factory=dict)
     scenarios: list[ScenarioReport] = field(default_factory=list)
+    # Attempts that reached the transport (retries are disabled), successful responses, and
+    # how many of those carried provider-reported usage. Tokens and cost cover reported usage
+    # only and are null when no response reported any; attempts without usage have unknown
+    # billing, which is never presented as zero.
     model_requests: int = 0
-    input_tokens: int = 0
-    output_tokens: int = 0
+    successful_responses: int = 0
+    responses_with_usage: int = 0
+    unknown_usage_requests: int = 0
+    input_tokens: int | None = None
+    output_tokens: int | None = None
     estimated_cost_usd: float | None = None
+    cost_is_lower_bound: bool = False
+    billing_note: str | None = None
+    provider_error: dict[str, Any] | None = None
+    request_compatibility_warnings: list[str] = field(default_factory=list)
     worst_case_cost_usd: float | None = None
     request_seconds: float = 0.0
     elapsed_seconds: float = 0.0
@@ -432,6 +645,8 @@ async def run_validation(
         limits=asdict(config.limits),
         worst_case_cost_usd=round(worst_case_cost(config.limits, config.pricing), 4),
     )
+    if config.provider == "openai":
+        report.request_compatibility_warnings = probe_openai_tool_schemas()
     if not config.live:
         report.finish()
         return report
@@ -446,8 +661,15 @@ async def run_validation(
         report.failure = f"aborted: {error}"
     except TimeoutError:
         report.failure = "overall timeout reached"
+    except HarnessError as error:
+        report.failure = str(error)
     except Exception as error:  # noqa: BLE001 - reported, never raised past the harness
-        report.failure = f"{type(error).__name__}: {str(error)[:300]}"
+        # Class name only: the text of an arbitrary exception may carry a payload or a secret.
+        report.failure = f"unexpected harness error: {_safe_token(type(error).__name__)}"
+    if report.billing_note is None:
+        # Accounting runs once requests were possible; failing earlier means none was sent.
+        report.estimated_cost_usd = 0.0
+        report.billing_note = "no request was sent"
     report.elapsed_seconds = round(time.monotonic() - started, 2)
     report.finish()
     return report
@@ -468,7 +690,9 @@ async def _live(
     try:
         await _check_provider(config, inner)
     except Exception as error:
-        raise RuntimeError(f"provider unavailable: {type(error).__name__}") from error
+        safe = sanitize_error(error, attempt=0)
+        report.provider_error = asdict(safe)
+        raise HarnessError(f"provider unavailable: {safe.category}") from None
     guarded = (
         GuardedOpenAIClient(inner, ledger)
         if config.provider == "openai"
@@ -503,21 +727,49 @@ async def _live(
         if ledger.abort_reason and report.abort_reason is None:
             report.abort_reason = ledger.abort_reason
             report.failure = report.failure or f"aborted: {ledger.abort_reason}"
-        report.model_requests = ledger.requests
+        _account(report, ledger, config)
+        if config.provider == "ollama":
+            report.hardware = await _ollama_hardware(inner, guarded, config.model)
+
+
+def _account(report: Report, ledger: Ledger, config: Config) -> None:
+    report.model_requests = ledger.requests
+    report.successful_responses = ledger.responses
+    report.responses_with_usage = ledger.usage_responses
+    report.unknown_usage_requests = ledger.requests - ledger.usage_responses
+    report.request_seconds = round(ledger.request_seconds, 2)
+    if ledger.errors:
+        report.provider_error = asdict(ledger.errors[0])
+    if ledger.usage_responses:
         report.input_tokens = ledger.input_tokens
         report.output_tokens = ledger.output_tokens
-        report.request_seconds = round(ledger.request_seconds, 2)
-        if config.provider == "openai":
-            report.estimated_cost_usd = round(ledger.spent_usd, 6)
-        else:
-            report.estimated_cost_usd = 0.0
-            report.hardware = await _ollama_hardware(inner, guarded, config.model)
+    if config.provider != "openai":
+        report.estimated_cost_usd = 0.0
+        report.billing_note = "local model; no provider billing"
+        return
+    if ledger.requests == 0:
+        report.estimated_cost_usd = 0.0
+        report.billing_note = "no request was sent"
+    elif ledger.usage_responses:
+        report.estimated_cost_usd = round(ledger.reported_usd, 6)
+        report.cost_is_lower_bound = report.unknown_usage_requests > 0
+        report.billing_note = (
+            "cost covers provider-reported usage only; some requests have unknown billing"
+            if report.cost_is_lower_bound
+            else "cost computed from provider-reported usage at assumed prices"
+        )
+    else:
+        report.estimated_cost_usd = None
+        report.billing_note = (
+            "request(s) were sent but the provider reported no usage: billing is unknown, "
+            "check the provider dashboard"
+        )
 
 
 def _real_client(config: Config, environment: Mapping[str, str]) -> Any:
     if config.provider == "openai":
         if not environment.get("OPENAI_API_KEY"):
-            raise RuntimeError("OPENAI_API_KEY is not configured")
+            raise HarnessError("OPENAI_API_KEY is not configured")
         from openai import AsyncOpenAI
 
         # No hidden retries: every request is counted by the ledger.
@@ -624,7 +876,7 @@ async def _scenario(
     except SandboxUnavailableError:
         report.docker = "unavailable"
         outcome_report.reason = "sandbox unavailable; nothing was executed"
-        raise RuntimeError("Docker sandbox unavailable") from None
+        raise HarnessError("Docker sandbox unavailable") from None
     signer = EvidenceSigner(key=os.urandom(32))
     artifacts = ArtifactManager()
     pipeline = TrustedEvidencePipeline.build(
@@ -682,7 +934,7 @@ async def _scenario(
     )
     runtime = AgentRuntime(
         name="tester",
-        model=build_provider(config, client, instructions),
+        model=DiagnosticProvider(build_provider(config, client, instructions), ledger),
         tools=testing_tools(catalog, unattended_categories=frozenset({"test"})),
         permissions=frozenset({"tests.run"}),
         tool_executor=ToolExecutor(action_intent_store=store),
@@ -780,6 +1032,10 @@ async def _assess(
     output: dict[str, Any] = (
         task.output if task is not None and isinstance(task.output, dict) else {}
     )
+    result.worker_output = "available" if output else "unavailable"
+    if task is not None:
+        result.task_status = task.status.value
+        result.task_error_code = _safe_token(task.error_code)
     calls = [item for item in output.get("tool_calls", []) if isinstance(item, dict)]
     result.tool_calls = calls[:10]
     result.tool_errors = sum(1 for item in calls if item.get("is_error"))
@@ -789,7 +1045,10 @@ async def _assess(
     result.gate_status = outcome.status.value
     result.gate_reason = outcome.reason
     asked = any(item.get("tool") == "testing.run" for item in calls)
-    result.stages.model_tool_calling = "pass" if asked else "fail"
+    if asked:
+        result.stages.model_tool_calling = "pass"
+    elif output and ledger.responses:
+        result.stages.model_tool_calling = "fail"
 
     context = ArtifactContext(
         tenant_id="local", user_id="local", session_id="live", trace_id="live", run_id=run_id
@@ -812,34 +1071,94 @@ async def _assess(
         if isinstance(payload, dict) and payload.get("run_id") == run_id:
             authenticated.append(payload)
     result.sandbox_executed = bool(authenticated)
-    result.stages.tool_execution = "pass" if authenticated else "fail"
-    result.stages.evidence_authentication = "pass" if authenticated else "fail"
+    if authenticated:
+        result.stages.tool_execution = "pass"
+        result.stages.evidence_authentication = "pass"
+    elif asked:
+        result.stages.tool_execution = "fail"
+        result.stages.evidence_authentication = "fail"
     if authenticated:
         latest = authenticated[-1]
         result.sandbox_exit_code = latest.get("exit_code")
         fingerprint = latest.get("snapshot_fingerprint")
         result.snapshot_fingerprint = fingerprint[:16] if isinstance(fingerprint, str) else None
     completed = outcome.status == WorkflowOutcomeStatus.COMPLETED
-    result.stages.completion_gate = "pass" if completed else "fail"
-    if result.worker_verified_field is not False:
+    if completed:
+        result.stages.completion_gate = "pass"
+    elif outcome.quality_result is not None:
+        result.stages.completion_gate = "fail"  # the gate ran and did not pass
+    if output and result.worker_verified_field is not False:
         result.reason = "worker output claimed verification"
+        result.stages.overall = "fail"
+    elif not output:
         result.stages.overall = "fail"
     elif result.name == "pass":
         ok = asked and bool(authenticated) and completed and result.sandbox_exit_code == 0
         result.stages.overall = "pass" if ok else "fail"
-        if not ok:
-            result.reason = ledger.abort_reason or _first_failure(result, completed)
     else:
         # The model must have run the tests; only then does a block prove anything.
         failed_run = bool(authenticated) and result.sandbox_exit_code not in (0, None)
         ok = asked and failed_run and not completed
         result.stages.overall = "pass" if ok else "fail"
-        if not ok:
-            result.reason = ledger.abort_reason or (
-                "the gate completed a failing project"
-                if completed
-                else "inconclusive: the model did not execute the tests"
+    if result.stages.overall != "pass":
+        _classify(result, ledger, completed, asked, bool(authenticated), has_output=bool(output))
+
+
+def _classify(
+    result: ScenarioReport,
+    ledger: Ledger,
+    completed: bool,
+    asked: bool,
+    authenticated: bool,
+    *,
+    has_output: bool,
+) -> None:
+    """The earliest failing stage that the host's own records confirm; else undetermined."""
+
+    if ledger.abort_reason:
+        result.failure_category = result.failed_stage = "limit_exceeded"
+        result.reason = f"aborted: {ledger.abort_reason}"
+    elif not has_output:
+        error = ledger.errors[0] if ledger.errors else None
+        if error is not None:
+            result.failure_category = error.stage
+            result.failed_stage = error.stage
+            result.reason = _describe(error)
+        else:
+            result.failure_category = "undetermined"
+            result.failed_stage = "worker_execution"
+            result.reason = (
+                "the worker task failed before producing output and no provider error was observed"
             )
+    elif result.reason == "worker output claimed verification":
+        result.failure_category = result.failed_stage = "worker_contract"
+    elif not asked:
+        result.failure_category = "valid_response_without_tool_call"
+        result.failed_stage = "model_tool_calling"
+        result.reason = result.reason or _first_failure(result, completed)
+        if result.name == "negative":
+            result.reason = "inconclusive: the model did not execute the tests"
+    elif result.tool_errors or not authenticated:
+        result.failure_category = result.failed_stage = "tool_execution_failure"
+        result.reason = result.reason or _first_failure(result, completed)
+    else:
+        result.failure_category = result.failed_stage = "evidence_or_gate_failure"
+        result.reason = result.reason or (
+            "the gate completed a failing project"
+            if completed and result.name == "negative"
+            else _first_failure(result, completed)
+        )
+
+
+def _describe(error: SafeError) -> str:
+    parts = [error.stage, error.category]
+    if error.http_status is not None:
+        parts.append(f"HTTP {error.http_status}")
+    if error.error_code:
+        parts.append(f"code {error.error_code}")
+    if error.error_param:
+        parts.append(f"param {error.error_param}")
+    return ": ".join(parts[:2]) + (f" ({', '.join(parts[2:])})" if parts[2:] else "")
 
 
 def _first_failure(result: ScenarioReport, completed: bool) -> str:
@@ -850,6 +1169,75 @@ def _first_failure(result: ScenarioReport, completed: bool) -> str:
     if not completed:
         return f"completion gate did not pass ({result.gate_reason or result.gate_status})"
     return "unexpected result"
+
+
+def strict_schema_issues(tool: Mapping[str, Any]) -> list[str]:
+    """Objects in a strict function schema that are not closed with additionalProperties false.
+
+    The OpenAI function-calling and structured-outputs guides require
+    `additionalProperties: false` on every object of a strict schema.
+    """
+
+    if tool.get("strict") is not True:
+        return []
+    issues: list[str] = []
+
+    def visit(node: Any, path: str) -> None:
+        if isinstance(node, dict):
+            if (node.get("type") == "object" or "properties" in node) and node.get(
+                "additionalProperties"
+            ) is not False:
+                issues.append(f"{tool.get('name')}: {path or 'parameters'} is an open object")
+            for key, value in node.items():
+                if key == "properties" and isinstance(value, dict):
+                    for name, child in value.items():
+                        visit(child, f"{path}.{name}" if path else name)
+                elif key in {"items", "anyOf", "oneOf", "allOf", "$defs", "definitions"}:
+                    visit(value, path)
+        elif isinstance(node, list):
+            for value in node:
+                visit(value, path)
+
+    visit(tool.get("parameters"), "")
+    return issues
+
+
+class _NullRunner:
+    """Stands in for a sandbox only to build tool schemas offline. It never runs anything."""
+
+    provides_isolation = True
+
+    def __init__(self, filesystem: WorkspaceFilesystem) -> None:
+        self.filesystem = filesystem
+        self.root = "main"
+
+    async def run(self, command: Any) -> Any:
+        raise AssertionError("the schema probe never executes a command")
+
+
+def probe_openai_tool_schemas() -> list[str]:
+    """Offline check of the exact strict tool schemas the OpenAI adapter would send."""
+
+    from kaiwen_agent.models.openai_tools import serialize_openai_tool
+
+    with tempfile.TemporaryDirectory(prefix="kaiwen-probe-", ignore_cleanup_errors=True) as tmp:
+        root = Path(tmp)
+        make_project(root)
+        filesystem = WorkspaceFilesystem(workspace_id="probe", roots={"main": root})
+        catalog = CommandCatalog(
+            filesystem=filesystem,
+            root="main",
+            runner=_NullRunner(filesystem),
+            presets=(
+                CommandPreset(
+                    id="unit.tests", category="test", executable="python", arguments=("-V",)
+                ),
+            ),
+        )
+        issues: list[str] = []
+        for definition in testing_tools(catalog, unattended_categories=frozenset({"test"})):
+            issues.extend(strict_schema_issues(serialize_openai_tool(definition)))
+        return issues
 
 
 def build_parser() -> argparse.ArgumentParser:

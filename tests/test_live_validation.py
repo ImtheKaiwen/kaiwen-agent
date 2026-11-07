@@ -246,8 +246,10 @@ def test_a_model_that_only_claims_success_is_not_a_pass() -> None:
     scenario = report.scenarios[0]
     assert report.verdict == "FAIL"
     assert scenario.stages.model_tool_calling == "fail"
-    assert scenario.stages.evidence_authentication == "fail" and not scenario.sandbox_executed
+    assert scenario.stages.evidence_authentication == "not_run" and not scenario.sandbox_executed
     assert scenario.stages.completion_gate == "fail" and scenario.stages.overall == "fail"
+    assert scenario.failure_category == "valid_response_without_tool_call"
+    assert scenario.worker_output == "available" and scenario.worker_verified_field is False
     assert scenario.model_claimed_success is True
     assert "did not call testing.run" in (scenario.reason or "")
 
