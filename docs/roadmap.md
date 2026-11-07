@@ -163,7 +163,7 @@ tests were re-run when the entry was last edited. Dated reports under
 - [ ] Phase R10: security hardening, abuse controls, retention enforcement, and
       production readiness review.
 
-## Repository milestones (M1-M5)
+## Repository milestones (M1-M6.1)
 
 Each milestone requires explicit owner approval before it starts. Milestones are
 small, independently reviewable changes with their own acceptance criteria.
@@ -283,7 +283,7 @@ implementation. No second policy engine or tool pipeline was added.
 - [x] Merged as pull request 4 (squash commit `4c5ff65`) after exact-head CI passed
       (10 checks).
 
-### M5: Runtime and multi-agent reliability (in review)
+### M5: Runtime and multi-agent reliability (completed)
 
 Each item was reproduced with a failing test before its fix (see ADR 0011).
 
@@ -345,8 +345,51 @@ Each item was reproduced with a failing test before its fix (see ADR 0011).
   action-intent ids no longer include the arguments checksum (legacy intents are
   adopted, see `docs/persistence.md`); one durability test now expects
   `IdempotencyConflictError` for a changed-argument replay.
+- [x] Merged as pull request 5 (squash commit `95537fb`).
+
+### M6.0: Capability, architecture and developer-experience audit (completed)
+
+- [x] Read-only audit of the coding team, developer experience, memory and context, and
+      lifecycle at `95537fb`. It changed no repository files. Findings that are
+      reproduced are fixed in M6.1; the rest are unverified or planned and are not
+      recorded as complete here.
+
+### M6.1: Context correctness and regression hardening (in review)
+
+Each defect was reproduced with a failing test before its fix.
+
+- [x] Recent conversation: `RecentConversationSource` read the first 1,000 stored
+      messages and took the end of that window, so "recent" context froze at message
+      1,000. It now reads the newest window through the optional
+      `ConversationWindowStore.list_latest_messages` capability (in-memory and SQLite
+      implement it, filtered by tenant, conversation and user in the query), with a
+      bounded forward-paging fallback for custom stores that implement only
+      `ConversationStore`. `list_messages` and its `after_id` contract are unchanged.
+- [x] Budget priority: items of equal priority and relevance were kept oldest-first, so
+      constrained budgets dropped the newest turns. `ContextItem.order` (optional)
+      makes the allocator keep the newest first and then list survivors
+      chronologically. Items without `order` behave exactly as before; required items,
+      priorities and the current input are unaffected.
+- [x] Compaction: `ContextCompactionManager` read the oldest `message_limit` messages
+      and looked for its cursor there, so it never advanced after the first 1,000
+      messages. It now reads forward from the stored cursor with `after_id`, gathers at
+      most `message_limit` candidates plus `recent_messages`, and keeps raw history
+      untouched. A missing cursor is still rejected (`source_cursor_missing`) when the
+      store provides `message_exists`.
+- Not done or not verified: a long backlog is summarized one bounded batch per
+  compaction; `source_message_ids` on a summary grows with the conversation; stores
+  without the window capability read the conversation from its start to find the
+  newest window and cannot tell a missing cursor from an empty tail; the in-memory
+  long-term memory store and its scaling limits (M6.0) are untouched.
+- Deliberately not changed: Coding Team, sandbox, supervisor and lifecycle code.
 - [~] Not complete until the pull request CI passes on the exact head and the owner
       merges it.
+
+### M7 design items (not started)
+
+- Lifecycle failure recovery: a failed cycle leaves `LifecycleRuntime` in `failed`, and
+  `run_next_due` then raises until `start()` is called. A recovery policy needs a
+  design (retry, degrade, operator action) before any automatic restart is added.
 
 ### Open risks from the initial audit
 
