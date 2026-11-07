@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Add `DockerSandboxRunner`, a first-party `SandboxRunner` that runs preset commands in a
+  locked-down container (digest-pinned image, non-root, no network, dropped capabilities,
+  read-only root, CPU/memory/process/time/output limits, no host fallback) over a private
+  `ExecutionSnapshot` with a content-aware fingerprint. Add `CommandEvidenceRecorder` and
+  signed evidence verification so real test results feed the completion gate; failed,
+  timed-out, stale, or unsigned evidence never passes. `testing_tools` can run test, lint
+  and typecheck presets without approval only for an isolating runner. `CommandCatalog`
+  gains optional observers and `SandboxResult` gains optional snapshot and image fields.
+  See ADR 0012 and `docs/coding-kits/PERMISSIONS_AND_SANDBOX.md`.
 - Fix recent-conversation context freezing after 1,000 stored messages, context budgets
   dropping the newest turns, and conversation compaction stalling after the first 1,000
   messages. Add the optional `ConversationWindowStore` capability

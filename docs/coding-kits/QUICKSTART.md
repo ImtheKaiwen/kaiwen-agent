@@ -33,7 +33,11 @@ and returns unknown rather than guessing unsupported facts.
 
 Use `workspace.apply_patch` with an exact preimage SHA-256. Register exact command
 presets in `CommandCatalog` and inject a host sandbox implementing `SandboxRunner`.
-The library deliberately has no unrestricted shell or fallback subprocess runner.
+The library deliberately has no unrestricted shell or fallback subprocess runner. For a
+real isolated runner on a trusted Linux Docker engine, use `DockerSandboxRunner` over an
+execution snapshot with `CommandEvidenceRecorder`; see
+[Permissions and sandbox boundary](PERMISSIONS_AND_SANDBOX.md) and
+`examples/coding-docker-evidence`.
 
 ## Teams
 

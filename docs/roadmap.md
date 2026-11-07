@@ -163,7 +163,7 @@ tests were re-run when the entry was last edited. Dated reports under
 - [ ] Phase R10: security hardening, abuse controls, retention enforcement, and
       production readiness review.
 
-## Repository milestones (M1-M6.1)
+## Repository milestones (M1-M6.2)
 
 Each milestone requires explicit owner approval before it starts. Milestones are
 small, independently reviewable changes with their own acceptance criteria.
@@ -354,7 +354,7 @@ Each item was reproduced with a failing test before its fix (see ADR 0011).
       reproduced are fixed in M6.1; the rest are unverified or planned and are not
       recorded as complete here.
 
-### M6.1: Context correctness and regression hardening (in review)
+### M6.1: Context correctness and regression hardening (completed)
 
 Each defect was reproduced with a failing test before its fix.
 
@@ -382,6 +382,28 @@ Each defect was reproduced with a failing test before its fix.
   newest window and cannot tell a missing cursor from an empty tail; the in-memory
   long-term memory store and its scaling limits (M6.0) are untouched.
 - Deliberately not changed: Coding Team, sandbox, supervisor and lifecycle code.
+- [x] Merged as pull request 6 (squash commit `8b74b65`) after all 10 CI jobs passed on
+      the exact head.
+
+### M6.2: Secure container execution and evidence pipeline (in review)
+
+- [x] `DockerSandboxRunner` (ADR 0012): digest-pinned image, no pulls, non-root, no
+      network by default, dropped capabilities, read-only root, resource/time/output
+      limits, cleanup on timeout and cancellation, fail-closed without host fallback.
+- [x] `ExecutionSnapshot` / `SnapshotBuilder`: validated private copy under the
+      workspace read policy with a content-aware fingerprint; symlinks, special files,
+      and over-limit workspaces are rejected; per-run copies are re-verified.
+- [x] `CommandEvidenceRecorder` and signed `JsonArtifactVerifier` mode: evidence is
+      generated from the runner's result, and failed, timed-out, stale, unsigned, or
+      other-owner evidence never passes. Optional unattended approval for test, lint and
+      typecheck presets with an isolating runner.
+- Verified: scripted-engine tests for argv, limits, timeout, cancellation, cleanup and
+  fail-closed paths; real-container tests run on Linux CI only (required there).
+- Not exercised or supported: Windows Docker Desktop/WSL2, macOS, rootless Docker,
+  Podman. Docker could not be started on the development Windows machine, so no local
+  real-container run was performed. Not done: pinning the execution snapshot to workflow
+  runs and refreshing the fingerprint between workflow cycles (M6.3), `CodingRunControl`,
+  a prepared-dependency image workflow, evidence for excluded paths.
 - [~] Not complete until the pull request CI passes on the exact head and the owner
       merges it.
 
