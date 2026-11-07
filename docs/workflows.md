@@ -26,6 +26,34 @@ Side-effecting workers must separately compose the durable U5 action-intent,
 approval, permission, and idempotency pipeline. Workflow compilation does not grant
 tool authority.
 
+## Fresh state fingerprints and run identity
+
+A workflow has two different identities that must not be confused. The objective (and its
+protected input) and the durable run id stay fixed for the whole run. The state of the
+project changes whenever a worker edits it.
+
+`WorkflowController.execute(..., protected_input_fingerprint=...)` keeps its meaning: with
+no provider configured, that single value is passed to every `CompletionGate` evaluation,
+exactly as before. A fixed value taken before the coder edits therefore lets evidence for
+the earlier state satisfy the gate for the later one.
+
+Hosts running coding workflows configure `WorkflowController(fingerprint_provider=...)`
+(`ProtectedInputFingerprintProvider`; `WorkspaceFingerprintProvider` in the Coding Kit). Each
+evaluation then uses a freshly obtained, content-aware fingerprint of the workspace, and
+the passed value only names the input. The controller also asks the provider again after a
+passing evaluation and refuses to complete when the value changed
+(`workspace_changed_during_verification`); a provider that fails or returns nothing blocks
+the run (`protected_input_unavailable`). This detects a concurrent writer; it does not make
+the workspace atomic, and the workspace can still change after the final check. The value
+that was verified is reported as `WorkflowOutcome.verified_input_fingerprint`.
+
+`trusted_task_context(task, runs=..., permissions=...)` builds the `AgentContext` a worker
+passes to tools. The tenant, user, session and run id are re-checked against the durable
+run record (it must exist for that owner and be running), the run id is never read from
+`task.input` or tool arguments, the trace id stays distinct from the run id, and
+permissions come from the calling host. It is only a context primitive; it does not run
+agents or tools.
+
 ## Recovery scope
 
 The runtime run and scheduled task records are durable when the host supplies durable

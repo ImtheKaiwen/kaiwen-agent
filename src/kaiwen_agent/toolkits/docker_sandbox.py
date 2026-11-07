@@ -24,7 +24,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Protocol
+from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -416,12 +416,10 @@ class DockerSandboxRunner:
         except TimeoutError:
             timed_out = True
         except asyncio.CancelledError:
-            readers.cancel()
-            await asyncio.shield(self._terminate(process, name))
+            await asyncio.shield(self._terminate(process, name, readers))
             raise
         if timed_out or stdout.flooded or stderr.flooded:
-            readers.cancel()
-            await asyncio.shield(self._terminate(process, name))
+            await asyncio.shield(self._terminate(process, name, readers))
             timed_out = timed_out or stdout.flooded or stderr.flooded
         returncode = _TIMEOUT_EXIT_CODE if timed_out else (process.returncode or 0)
         out, err = stdout.text(), stderr.text()
@@ -440,7 +438,13 @@ class DockerSandboxRunner:
             output_truncated=stdout.truncated or stderr.truncated,
         )
 
-    async def _terminate(self, process: ProcessHandle, name: str) -> None:
+    async def _terminate(
+        self, process: ProcessHandle, name: str, readers: asyncio.Future[Any]
+    ) -> None:
+        # Cancel the stream readers and collect their outcome so no task exception is left
+        # unretrieved (a killed client can reset its pipes).
+        readers.cancel()
+        await asyncio.gather(readers, return_exceptions=True)
         await self._remove_container(name)
         with contextlib.suppress(ProcessLookupError, OSError):
             process.kill()

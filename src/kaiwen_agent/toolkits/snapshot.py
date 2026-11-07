@@ -202,8 +202,19 @@ class SnapshotBuilder:
             total_bytes=total,
         )
 
+    def fingerprint(self) -> str:
+        """The fingerprint `capture()` would produce now, without writing a copy.
+
+        Uses the same walk, limits, and exclusions, so an incomplete or unsafe
+        workspace raises `SnapshotError` here too. It is a point-in-time read: the
+        workspace can change immediately afterwards.
+        """
+
+        files, skipped, _total = self._copy_tree(self.filesystem.roots[self.root], None)
+        return _fingerprint(files, skipped)
+
     def _copy_tree(
-        self, base: Path, directory: Path
+        self, base: Path, directory: Path | None
     ) -> tuple[tuple[SnapshotFile, ...], tuple[str, ...], int]:
         files: list[SnapshotFile] = []
         skipped: list[str] = []
@@ -243,10 +254,11 @@ class SnapshotBuilder:
                 total += len(data)
                 if total > self.limits.max_total_bytes:
                     raise SnapshotError("Workspace exceeds the snapshot size limit")
-                target = directory / PurePosixPath(relative.as_posix())
-                _make_directories(directory, target.parent, writable=False, private=True)
-                with open(target, "xb") as stream:
-                    stream.write(data)
+                if directory is not None:
+                    target = directory / PurePosixPath(relative.as_posix())
+                    _make_directories(directory, target.parent, writable=False, private=True)
+                    with open(target, "xb") as stream:
+                        stream.write(data)
                 files.append(
                     SnapshotFile(
                         path=relative.as_posix(),

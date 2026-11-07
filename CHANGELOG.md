@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Add `WorkflowController(fingerprint_provider=...)` so completion is evaluated against a freshly
+  obtained, content-aware project fingerprint at every gate evaluation (a passing result is
+  re-checked and a failing or empty provider blocks the run), `WorkspaceFingerprintProvider`,
+  `SnapshotBuilder.fingerprint()`, `trusted_task_context` for run-identity-checked worker
+  contexts, `TrustedEvidencePipeline`, and `WorkflowOutcome.verified_input_fingerprint`.
+  Workflows that pass a fixed fingerprint behave as before. Fix a reader-task exception left
+  unretrieved when a sandboxed command timed out. See ADR 0013.
 - Add `DockerSandboxRunner`, a first-party `SandboxRunner` that runs preset commands in a
   locked-down container (digest-pinned image, non-root, no network, dropped capabilities,
   read-only root, CPU/memory/process/time/output limits, no host fallback) over a private
