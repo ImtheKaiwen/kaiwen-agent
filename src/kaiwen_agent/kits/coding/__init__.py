@@ -77,6 +77,9 @@ from kaiwen_agent.kits.coding.team import (
     select_coding_roles,
 )
 from kaiwen_agent.kits.coding.verification import (
+    CommandEvidenceRecorder,
+    EvidenceBinding,
+    EvidenceSigner,
     JsonArtifactVerifier,
     coding_verifiers,
     install_coding_verifiers,
@@ -104,6 +107,9 @@ __all__ = [
     "CodingRoleConfig",
     "CodingRunManifest",
     "CodingRunControl",
+    "CommandEvidenceRecorder",
+    "EvidenceBinding",
+    "EvidenceSigner",
     "CodingRunHandle",
     "CodingRunResult",
     "CodingSimpleAPIError",

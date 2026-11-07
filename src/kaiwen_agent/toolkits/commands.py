@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
@@ -12,6 +14,8 @@ from kaiwen_agent.audit import SecretRedactor
 from kaiwen_agent.context import AgentContext
 from kaiwen_agent.integrations import WorkspaceFilesystem, WorkspacePathError
 from kaiwen_agent.tools.definition import ToolDefinition
+
+logger = logging.getLogger(__name__)
 
 
 class SandboxUnavailableError(RuntimeError):
@@ -103,10 +107,42 @@ class SandboxResult(BaseModel):
     timed_out: bool = False
     cancelled: bool = False
     artifact_refs: tuple[str, ...] = ()
+    # Set only by a runner that executed against a captured snapshot in a verified image.
+    snapshot_fingerprint: str | None = None
+    image_ref: str | None = None
+    image_id: str | None = None
+    output_truncated: bool = False
+    # None: the runner did not check. False: a file of the captured snapshot was changed
+    # or removed while the command ran (new files are allowed); see `modified_paths`.
+    snapshot_unchanged: bool | None = None
+    modified_paths: tuple[str, ...] = ()
+    # None: the runner did not report. True: the per-run copy of the workspace could not be
+    # fully removed afterwards. False: it was removed.
+    cleanup_failed: bool | None = None
 
 
 class SandboxRunner(Protocol):
     async def run(self, command: SandboxCommand) -> SandboxResult: ...
+
+
+@dataclass(frozen=True, slots=True)
+class CommandExecution:
+    """A completed trusted execution, as seen by host-owned observers."""
+
+    context: AgentContext
+    preset: CommandPreset
+    parameters: Mapping[str, str]
+    result: SandboxResult
+    # The runner object the host configured on the catalog, never taken from the result.
+    runner: object
+
+
+class CommandExecutionObserver(Protocol):
+    """Host port notified after the runner returns; it cannot alter the result."""
+
+    async def observe(self, execution: CommandExecution) -> tuple[str, ...]:
+        """Return artifact references to attach to the result (may be empty)."""
+        ...
 
 
 class UnsupportedSandboxRunner:
@@ -158,6 +194,7 @@ class CommandCatalog:
         runner: SandboxRunner,
         presets: Iterable[CommandPreset] = (),
         redactor: SecretRedactor | None = None,
+        observers: Iterable[CommandExecutionObserver] = (),
     ) -> None:
         if root not in filesystem.roots:
             raise WorkspacePathError("Command root is not allowlisted by the workspace")
@@ -165,6 +202,7 @@ class CommandCatalog:
         self.root = root
         self.runner = runner
         self.redactor = redactor or SecretRedactor()
+        self.observers = tuple(observers)
         self._presets: dict[str, CommandPreset] = {}
         for preset in presets:
             self.register(preset)
@@ -225,12 +263,29 @@ class CommandCatalog:
         )
         if len(result.stdout.encode()) + len(result.stderr.encode()) > preset.max_output_bytes:
             raise ValueError("Sandbox result exceeds the configured output limit")
-        return result.model_copy(
+        redacted = result.model_copy(
             update={
                 "stdout": self.redactor.redact(result.stdout),
                 "stderr": self.redactor.redact(result.stderr),
             }
         )
+        references = list(redacted.artifact_refs)
+        for observer in self.observers:
+            try:
+                references.extend(
+                    await observer.observe(
+                        CommandExecution(
+                            context=context,
+                            preset=preset,
+                            parameters=dict(values),
+                            result=redacted,
+                            runner=self.runner,
+                        )
+                    )
+                )
+            except Exception:  # noqa: BLE001 - missing evidence blocks completion instead
+                logger.warning("Command execution observer failed", exc_info=True)
+        return redacted.model_copy(update={"artifact_refs": tuple(references)})
 
 
 def command_tool(catalog: CommandCatalog) -> ToolDefinition:
