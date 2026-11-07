@@ -56,14 +56,26 @@ Implementation boundaries:
   A model reply is reported as `verified: false`; only the completion gate verifies.
 - A run is bound to a workspace by `WorkspaceBinding` (workspace id, root, policy checksum)
   stored in the durable run record, set once while the run is created, immutable afterwards,
-  and checked by the controller and by coding workers. The field is optional, so existing
+  and checked by the controller and by coding workers. An optional `identity_digest` binds the
+  run to a host-assigned, opaque project identity (`AuthorizedCodingWorkspace(identity=...)`).
+  Without it, two different directories with the same workspace id, root alias and policy
+  produce the same binding; with it they do not, and relocating the same project keeps the
+  binding because no path is stored. A worker that can produce evidence requires an identity. The field is optional, so existing
   records and non-coding workflows are unchanged. No parallel run database is created.
 - A coding worker that can produce execution evidence must be given an
   `AuthorizedCodingWorkspace` whose fingerprint provider, command catalog, runner, recorder
   and signed verifiers all refer to that one workspace and to the controller that gates
-  the run; any inconsistency fails at configuration.
-- A handoff reference counts as verified only when the host can read it in the run's owner
-  scope and it carries the trusted evidence origin. Other references are dropped.
+  the run; any inconsistency fails at configuration. Such a worker is also refused without a
+  controller, so the controller-specific checks cannot be skipped.
+- A handoff artifact reference is kept only when it is readable in the run's owner scope and
+  was created by the same run; an artifact of another run of the same user is dropped.
+  Sharing across runs is not offered; it would need an explicit, authorized policy.
+- A handoff evidence reference is kept as authenticated only when its HMAC verifies with the
+  existing M6.2 `EvidenceSigner` (owner, run, content and labels), its origin label and
+  payload name the trusted origin, and the payload names this run. A label alone proves
+  nothing. Authentication is not requirement satisfaction: evidence from an older workspace
+  state is authentic but does not satisfy the gate. The completion gate stays authoritative.
+  Without a signer nothing authenticates.
 - Writes to a shared workspace stay serialized through resource keys; independent read tasks
   may run concurrently. No worktree merging or isolated writers are added.
 

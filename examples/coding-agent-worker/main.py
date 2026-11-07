@@ -136,6 +136,7 @@ async def main() -> None:
             catalog=catalog,
             runner=runner,
             pipeline=pipeline,
+            identity="project-1",
         )
         store = SQLitePersistence(base / "state.sqlite3")
         runs = DurableRunManager(store)

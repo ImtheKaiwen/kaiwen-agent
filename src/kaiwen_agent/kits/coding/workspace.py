@@ -29,6 +29,11 @@ class AuthorizedCodingWorkspace:
     catalog: CommandCatalog
     runner: object
     pipeline: TrustedEvidencePipeline
+    # Host-assigned opaque identity of the project (for example its record id). It is not a
+    # path, so moving the project to another directory or machine keeps the binding valid;
+    # two different projects must be given different identities. It is part of the binding
+    # as a keyed-by-scope digest and is required for workers that produce evidence.
+    identity: str | None = None
 
     @property
     def binding(self) -> WorkspaceBinding:
@@ -42,8 +47,25 @@ class AuthorizedCodingWorkspace:
             "user_id": self.filesystem.user_id,
         }
         checksum = sha256(json.dumps(policy, sort_keys=True).encode()).hexdigest()
+        identity_digest: str | None = None
+        if self.identity is not None:
+            if not self.identity.strip():
+                raise ValueError("Workspace identity cannot be blank")
+            material = "".join(
+                (
+                    "kaiwen.workspace.identity.v1",
+                    self.filesystem.tenant_id or "",
+                    self.filesystem.user_id or "",
+                    self.filesystem.workspace_id,
+                    self.identity,
+                )
+            )
+            identity_digest = sha256(material.encode()).hexdigest()
         return WorkspaceBinding(
-            workspace_id=self.filesystem.workspace_id, root=self.root, policy_checksum=checksum
+            workspace_id=self.filesystem.workspace_id,
+            root=self.root,
+            policy_checksum=checksum,
+            identity_digest=identity_digest,
         )
 
     def issues(self, *, controller: Any = None) -> list[str]:

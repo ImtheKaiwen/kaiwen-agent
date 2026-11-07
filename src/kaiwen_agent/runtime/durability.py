@@ -37,7 +37,10 @@ class WorkspaceBinding(BaseModel):
     It is written by the host when the run is created, stored in the durable run record,
     and never changes afterwards. Tenant and owner are already part of the record. The
     policy checksum ties the binding to the exact read/write policy of the workspace, so a
-    different policy under the same id does not match.
+    different policy under the same id does not match. The optional identity digest ties
+    it to a host-assigned, opaque and relocatable workspace identity, so two different
+    projects that share an id, an alias and a policy do not match. Records written before
+    the field existed load with `None` and keep matching a workspace that has no identity.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -45,6 +48,7 @@ class WorkspaceBinding(BaseModel):
     workspace_id: str = Field(min_length=1, max_length=200)
     root: str = Field(min_length=1, max_length=200)
     policy_checksum: str = Field(min_length=1, max_length=200)
+    identity_digest: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 class RuntimeRunRecord(BaseModel):

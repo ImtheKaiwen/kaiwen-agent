@@ -740,6 +740,7 @@ def test_real_container_agent_runtime_worker_produces_gate_verified_evidence(
         catalog=catalog,
         runner=runner,
         pipeline=pipeline,
+        identity="project-1",
     )
     store = SQLitePersistence(tmp_path / "agent-worker.sqlite3")
     runs = DurableRunManager(store)

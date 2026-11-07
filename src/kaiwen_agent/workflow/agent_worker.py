@@ -70,6 +70,9 @@ class WorkspaceAuthorization(Protocol):
     @property
     def binding(self) -> WorkspaceBinding: ...
 
+    @property
+    def pipeline(self) -> Any: ...
+
     def issues(self, *, controller: Any = None) -> list[str]: ...
 
 
@@ -115,10 +118,22 @@ class AgentRuntimeWorker:
             raise WorkerConfigurationError(
                 f"Runtime metadata may not set reserved keys: {sorted(reserved)}"
             )
-        if evidence_tool_names and workspace is None:
-            raise WorkerConfigurationError(
-                "A worker that can produce execution evidence needs an authorized workspace"
-            )
+        if evidence_tool_names:
+            # Checked before any model or tool call. A missing controller would skip the
+            # fingerprint, signer, artifact and quality-gate agreement checks entirely.
+            if workspace is None:
+                raise WorkerConfigurationError(
+                    "A worker that can produce execution evidence needs an authorized workspace"
+                )
+            if controller is None:
+                raise WorkerConfigurationError(
+                    "A worker that can produce execution evidence needs the workflow "
+                    "controller whose gate verifies it"
+                )
+            if workspace.binding.identity_digest is None:
+                raise WorkerConfigurationError(
+                    "A worker that can produce execution evidence needs a workspace identity"
+                )
         if workspace is not None:
             problems = workspace.issues(controller=controller)
             if problems:
@@ -143,7 +158,14 @@ class AgentRuntimeWorker:
         self.context_budget = context_budget or ContextBudget()
         self.max_summary_chars = max_summary_chars
         self.assembler = TaskContextAssembler(
-            store=task_store, artifacts=artifacts, fingerprints=fingerprints
+            store=task_store,
+            artifacts=artifacts,
+            fingerprints=fingerprints,
+            evidence_signer=(
+                getattr(getattr(workspace, "pipeline", None), "signer", None)
+                if workspace is not None
+                else None
+            ),
         )
 
     async def execute(self, task: AgentTask, context: TaskExecutionContext) -> dict[str, Any]:

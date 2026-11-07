@@ -9,19 +9,28 @@ host's worker configuration and the durable run, never from here.
 Shared project state is not copied into a new store. Handoffs are read from the completed
 dependency `AgentTask` records of the same run in the existing `TaskStore`, and every
 artifact reference is checked against the artifact store in the run's owner scope before it
-is shown as verified.
+is shown at all. Evidence references are additionally authenticated with the existing
+M6.2 `EvidenceSigner`. Authentication says the host's trusted execution path produced the
+artifact for this owner and run; it does not say the evidence satisfies any requirement
+for the current workspace state. Only the completion gate decides that.
 """
 
 from __future__ import annotations
 
+import json
 import logging
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from hashlib import sha256
 from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from kaiwen_agent.artifacts import ArtifactContext, ArtifactManager, ArtifactNotFoundError
+from kaiwen_agent.artifacts import (
+    ArtifactContext,
+    ArtifactIntegrityError,
+    ArtifactManager,
+    ArtifactNotFoundError,
+)
 from kaiwen_agent.context_engine import ContextBuildRequest, ContextItem, ContextKind
 from kaiwen_agent.runtime import RuntimeIdentity, RuntimeRunRecord
 from kaiwen_agent.tasks import AgentTask, TaskStatus, TaskStore
@@ -31,6 +40,20 @@ logger = logging.getLogger(__name__)
 TRUSTED_EVIDENCE_ORIGINS = frozenset({"trusted_sandbox"})
 _MAX_TEXT = 2_000
 _MAX_REFS = 50
+
+
+class EvidenceAuthenticator(Protocol):
+    """The M6.2 `EvidenceSigner` contract: verifies the HMAC over owner, run, content, labels."""
+
+    def verify(
+        self,
+        *,
+        tenant_id: str,
+        owner_user_id: str,
+        run_id: str | None,
+        content: bytes,
+        labels: Mapping[str, str],
+    ) -> bool: ...
 
 
 class FingerprintSource(Protocol):
@@ -67,8 +90,9 @@ class TaskHandoff(BaseModel):
     status: Literal["completed"] = "completed"
     summary: str = Field(default="", max_length=_MAX_TEXT)
     artifact_refs: tuple[str, ...] = Field(default=(), max_length=_MAX_REFS)
-    # Only references the host verified: readable in the run's owner scope and carrying a
-    # trusted evidence origin. Everything else a task claimed is dropped and counted.
+    # Only references the host authenticated with the evidence signer, in this run and the
+    # run's owner scope. Authentication is not requirement satisfaction. Everything else a
+    # task claimed is dropped and counted.
     evidence_refs: tuple[str, ...] = Field(default=(), max_length=_MAX_REFS)
     unverified_reference_count: int = Field(default=0, ge=0)
     blockers: tuple[str, ...] = Field(default=(), max_length=20)
@@ -93,7 +117,7 @@ class TaskContextPackage(BaseModel):
     workspace_id: str | None = None
     source_fingerprint: str | None = None
     informational_capabilities: tuple[str, ...] = ()
-    verified_evidence_refs: tuple[str, ...] = ()
+    authenticated_evidence_refs: tuple[str, ...] = ()
 
     # Untrusted: written by a plan or a model.
     objective: str = Field(default="", max_length=_MAX_TEXT)
@@ -174,6 +198,7 @@ class TaskContextAssembler:
         store: TaskStore,
         artifacts: ArtifactManager | None = None,
         fingerprints: FingerprintSource | None = None,
+        evidence_signer: EvidenceAuthenticator | None = None,
         trusted_evidence_origins: frozenset[str] = TRUSTED_EVIDENCE_ORIGINS,
         max_handoffs: int = 10,
     ) -> None:
@@ -182,6 +207,7 @@ class TaskContextAssembler:
         self.store = store
         self.artifacts = artifacts
         self.fingerprints = fingerprints
+        self.evidence_signer = evidence_signer
         self.trusted_evidence_origins = trusted_evidence_origins
         self.max_handoffs = max_handoffs
 
@@ -215,7 +241,7 @@ class TaskContextAssembler:
             workspace_id=workspace_id,
             source_fingerprint=fingerprint,
             informational_capabilities=tuple(sorted(task.capabilities)),
-            verified_evidence_refs=verified[:_MAX_REFS],
+            authenticated_evidence_refs=verified[:_MAX_REFS],
             objective=_clip(objective),
             task_name=_clip(task.name, 300),
             task_description=_clip(task.description),
@@ -255,8 +281,8 @@ class TaskContextAssembler:
         output: dict[str, Any] = dependency.output or {}
         claimed_artifacts = _strings(output.get("artifact_refs"))
         claimed_evidence = _strings(output.get("evidence_refs"))
-        artifacts = await self._owned(claimed_artifacts, run, require_run=False)
-        evidence = await self._owned(claimed_evidence, run, require_run=True, require_origin=True)
+        artifacts = await self._owned(claimed_artifacts, run)
+        evidence = await self._owned(claimed_evidence, run, authenticate=True)
         dropped = (len(claimed_artifacts) - len(artifacts)) + (
             len(claimed_evidence) - len(evidence)
         )
@@ -279,10 +305,18 @@ class TaskContextAssembler:
         references: Iterable[str],
         run: RuntimeRunRecord,
         *,
-        require_run: bool,
-        require_origin: bool = False,
+        authenticate: bool = False,
     ) -> list[str]:
-        if self.artifacts is None:
+        """References readable in the run's owner scope and created by this run.
+
+        Readable by the same user is not membership of this workflow: an artifact of an
+        unrelated run is dropped. With `authenticate`, the artifact must also carry a valid
+        evidence signature over its owner, run, content and labels, and its recorded payload
+        must name the trusted origin and this run. Without a configured signer nothing
+        authenticates.
+        """
+
+        if self.artifacts is None or (authenticate and self.evidence_signer is None):
             return []
         context = ArtifactContext(
             tenant_id=run.tenant_id,
@@ -295,17 +329,42 @@ class TaskContextAssembler:
         for reference in references:
             try:
                 artifact = await self.artifacts.read(context, reference)
-            except ArtifactNotFoundError:
+            except (ArtifactNotFoundError, ArtifactIntegrityError):
                 continue
             metadata = artifact.metadata
-            if require_run and metadata.run_id != run.id:
-                continue
-            if require_origin and (
-                metadata.labels.get("evidence_origin") not in self.trusted_evidence_origins
+            if (
+                metadata.run_id != run.id
+                or metadata.tenant_id != run.tenant_id
+                or metadata.owner_user_id != run.user_id
             ):
+                continue
+            if authenticate and not self._authentic(artifact.content, metadata, run):
                 continue
             accepted.append(reference)
         return accepted
+
+    def _authentic(self, content: bytes, metadata: Any, run: RuntimeRunRecord) -> bool:
+        assert self.evidence_signer is not None
+        labels = metadata.labels
+        if labels.get("evidence_origin") not in self.trusted_evidence_origins:
+            return False
+        if not self.evidence_signer.verify(
+            tenant_id=metadata.tenant_id,
+            owner_user_id=metadata.owner_user_id,
+            run_id=metadata.run_id,
+            content=content,
+            labels=labels,
+        ):
+            return False
+        try:
+            payload = json.loads(content)
+        except (ValueError, UnicodeDecodeError):
+            return False
+        return (
+            isinstance(payload, dict)
+            and payload.get("origin") in self.trusted_evidence_origins
+            and payload.get("run_id") == run.id
+        )
 
 
 def _task_text(package: TaskContextPackage) -> str:
@@ -328,7 +387,9 @@ def _state_text(package: TaskContextPackage) -> str:
         f"workspace: {package.workspace_id or '-'}",
         f"source fingerprint at assignment: {package.source_fingerprint or '-'}",
         f"capability labels: {', '.join(package.informational_capabilities) or '-'}",
-        f"host-verified evidence references: {', '.join(package.verified_evidence_refs) or '-'}",
+        "host-authenticated evidence references: "
+        f"{', '.join(package.authenticated_evidence_refs) or '-'}",
+        "Authentication does not satisfy a requirement for the current workspace state.",
         "Model-reported results are not verification; only the completion gate verifies.",
     ]
     return "\n".join(lines)
@@ -343,7 +404,10 @@ def _handoff_text(handoff: TaskHandoff) -> str:
     if handoff.artifact_refs:
         lines.append("artifact references: " + ", ".join(handoff.artifact_refs))
     if handoff.evidence_refs:
-        lines.append("host-verified evidence: " + ", ".join(handoff.evidence_refs))
+        lines.append(
+            "host-authenticated evidence (authentic, but it does not satisfy any requirement; "
+            "only the completion gate does): " + ", ".join(handoff.evidence_refs)
+        )
     if handoff.unverified_reference_count:
         lines.append(f"{handoff.unverified_reference_count} claimed reference(s) were dropped.")
     if handoff.blockers:

@@ -9,7 +9,9 @@ external LLM is not exercised. Real container execution through the same worker 
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +24,7 @@ from kaiwen_agent.context_engine import ContextBuilder
 from kaiwen_agent.context_engine.sources import RecentConversationSource
 from kaiwen_agent.control import RunControl
 from kaiwen_agent.kits.coding import AuthorizedCodingWorkspace
+from kaiwen_agent.kits.coding.verification.evidence import EvidenceSigner
 from kaiwen_agent.persistence import SQLitePersistence
 from kaiwen_agent.realtime import (
     ConversationMessage,
@@ -60,6 +63,7 @@ from kaiwen_agent.workflow import (
 )
 from tests.test_workflow_fresh_evidence import (
     BROKEN,
+    SIGNER,
     STATE_A,
     STATE_B,
     Env,
@@ -598,6 +602,7 @@ def coding_workspace(env: Env) -> AuthorizedCodingWorkspace:
         catalog=env.catalog,
         runner=env.runner,
         pipeline=env.pipeline,
+        identity="project-1",
     )
 
 
@@ -791,6 +796,7 @@ def test_coding_worker_configuration_fails_closed_on_every_inconsistency(
         catalog=env.catalog,
         runner=env.runner,
         pipeline=env.pipeline,
+        identity="project-1",
     )
     assert "fingerprint_provider_bound_to_another_workspace" in wrong_provider.issues()
     with pytest.raises(WorkerConfigurationError, match="another_workspace"):
@@ -811,6 +817,7 @@ def test_coding_worker_configuration_fails_closed_on_every_inconsistency(
         catalog=env.catalog,
         runner=StrangerRunner(),
         pipeline=env.pipeline,
+        identity="project-1",
     )
     issues = stranger.issues()
     assert "recorder_does_not_trust_the_runner" in issues
@@ -848,10 +855,97 @@ def test_a_missing_fingerprint_provider_cannot_be_used_for_a_coding_worker(
         catalog=flow.env.catalog,
         runner=flow.env.runner,
         pipeline=flow.env.pipeline,
+        identity="project-1",
     )
     assert "fingerprint_provider_bound_to_another_workspace" in no_provider.issues()
     with pytest.raises(WorkerConfigurationError):
         flow.tester(workspace=no_provider)
+
+
+def test_an_evidence_worker_without_a_controller_is_refused_before_any_call(
+    tmp_path: Path,
+) -> None:
+    flow = CodingFlow(tmp_path)
+    with pytest.raises(WorkerConfigurationError, match="needs the workflow controller"):
+        flow.tester(controller=None)
+    assert flow.tester_provider.calls == 0 and flow.env.runner.calls == 0
+    # A controller that is not bound to this workspace is still rejected, as before.
+    other = flow.env.controller(workspace_binding=None)
+    with pytest.raises(WorkerConfigurationError, match="controller_not_bound"):
+        flow.tester(controller=other)
+    # Legacy workers that produce no evidence need neither a workspace nor a controller.
+    plain = Flow(tmp_path / "plain")
+    plain.worker("writer", plain.runtime(Provider()))
+
+
+def test_an_evidence_worker_needs_a_workspace_identity(tmp_path: Path) -> None:
+    flow = CodingFlow(tmp_path)
+    anonymous = AuthorizedCodingWorkspace(
+        filesystem=flow.env.filesystem,
+        root="main",
+        fingerprints=flow.env.provider,
+        catalog=flow.env.catalog,
+        runner=flow.env.runner,
+        pipeline=flow.env.pipeline,
+    )
+    assert anonymous.binding.identity_digest is None
+    with pytest.raises(WorkerConfigurationError, match="workspace identity"):
+        flow.tester(workspace=anonymous, controller=flow.controller)
+
+
+def test_two_projects_with_the_same_id_alias_and_policy_get_different_bindings(
+    tmp_path: Path,
+) -> None:
+    """Regression: the binding used to ignore which project the id and alias pointed at."""
+
+    from kaiwen_agent.integrations import WorkspaceFilesystem
+
+    flow = CodingFlow(tmp_path)
+    twin_root = tmp_path / "twin"
+    twin_root.mkdir()
+
+    def workspace(root: Path, identity: str | None) -> AuthorizedCodingWorkspace:
+        filesystem = WorkspaceFilesystem(workspace_id="workspace-1", roots={"main": root})
+        return AuthorizedCodingWorkspace(
+            filesystem=filesystem,
+            root="main",
+            fingerprints=flow.env.provider,
+            catalog=flow.env.catalog,
+            runner=flow.env.runner,
+            pipeline=flow.env.pipeline,
+            identity=identity,
+        )
+
+    # Without an identity the two distinct directories are indistinguishable (legacy).
+    assert workspace(flow.env.root, None).binding == workspace(twin_root, None).binding
+    # A host-assigned identity separates them, and it is not a path: a relocated copy of the
+    # same project keeps its binding, a different project does not get it.
+    project_a = workspace(flow.env.root, "project-a").binding
+    assert project_a != workspace(twin_root, "project-b").binding
+    assert project_a == workspace(twin_root, "project-a").binding
+    assert str(flow.env.root) not in project_a.model_dump_json()
+    with pytest.raises(ValueError, match="identity"):
+        _ = workspace(twin_root, "  ").binding
+
+
+def test_a_run_bound_to_another_project_is_not_executed_by_this_worker(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        flow = CodingFlow(tmp_path)
+        flow.env.workers.register("tester", flow.tester())
+        other_project = flow.workspace.binding.model_copy(update={"identity_digest": "0" * 64})
+        run = await flow.run(other_project)
+        outcome = await flow.controller.execute(
+            run=run,
+            identity=owner(),
+            plan=plan(verify_task("verify")),
+            standards=flow.env.standards,
+            protected_input_fingerprint="objective",
+        )
+        assert outcome.status == WorkflowOutcomeStatus.BLOCKED
+        assert outcome.reason == "workspace_binding_mismatch"
+        assert flow.tester_provider.calls == 0 and flow.env.runner.calls == 0
+
+    run_async(scenario)
 
 
 # ----------------------------------------------------------------- private context and handoffs
@@ -942,94 +1036,277 @@ def test_private_conversation_ids_depend_on_run_role_and_task() -> None:
     assert role_scoped != first and first.startswith("wc_") and len(first) <= 200
 
 
+def _evidence_content(run_id: str | None) -> bytes:
+    return json.dumps({"origin": "trusted_sandbox", "run_id": run_id, "exit_code": 0}).encode()
+
+
+async def _evidence(
+    env: Env,
+    context: ArtifactContext,
+    *,
+    signed: bool = True,
+    origin: str | None = "trusted_sandbox",
+    content: bytes | None = None,
+    sign_for: ArtifactContext | None = None,
+    sign_content: bytes | None = None,
+    signer: EvidenceSigner = SIGNER,
+    expires_at: datetime | None = None,
+) -> str:
+    """Create one evidence-shaped artifact; `sign_*` lets a test sign other material."""
+
+    body = content if content is not None else _evidence_content(context.run_id)
+    labels: dict[str, str] = {"evidence_origin": origin} if origin else {}
+    if signed:
+        basis = sign_for or context
+        labels["evidence_mac"] = signer.sign(
+            tenant_id=basis.tenant_id,
+            owner_user_id=basis.user_id,
+            run_id=basis.run_id,
+            content=sign_content if sign_content is not None else body,
+            labels=labels,
+        )
+    metadata = await env.artifacts.create(
+        context,
+        ArtifactCreate(
+            type=ArtifactType.REPORT,
+            mime_type="application/json",
+            content=body,
+            labels=labels,
+            expires_at=expires_at,
+        ),
+    )
+    return metadata.id
+
+
+def _completed_task(task_id: str, run_id: str, *, user: str = "user-1", output=None):  # type: ignore[no-untyped-def]
+    return AgentTask(
+        id=task_id,
+        name=task_id,
+        agent_id="coder",
+        session_id="session-1",
+        tenant_id="tenant-1",
+        user_id=user,
+        trace_id="trace-1",
+        status=TaskStatus.COMPLETED,
+        output=output,
+        metadata={"runtime_run_id": run_id, "logical_task_id": task_id},
+    )
+
+
+def _consumer(run_id: str, *dependencies: str) -> AgentTask:
+    return AgentTask(
+        id="consumer",
+        name="consumer",
+        agent_id="tester",
+        session_id="session-1",
+        tenant_id="tenant-1",
+        user_id="user-1",
+        trace_id="trace-1",
+        dependencies=list(dependencies),
+        metadata={"runtime_run_id": run_id, "logical_task_id": "consumer"},
+    )
+
+
+def _artifact_context(run_id: str, *, user: str = "user-1") -> ArtifactContext:
+    return ArtifactContext(
+        tenant_id="tenant-1", user_id=user, session_id="session-1", trace_id="t", run_id=run_id
+    )
+
+
 def test_handoffs_keep_only_references_the_host_can_verify(tmp_path: Path) -> None:
     async def scenario() -> None:
         env = Env(tmp_path)
         run = await env.new_run()
         record = await env.runs.start(run_id=run.id, identity=owner())
         other_run = await env.new_run()
-        trusted = ArtifactContext(
-            tenant_id="tenant-1",
-            user_id="user-1",
-            session_id="session-1",
-            trace_id="t",
-            run_id=run.id,
-        )
-        elsewhere = trusted.model_copy(update={"run_id": other_run.id})
-        stranger = trusted.model_copy(update={"user_id": "user-2"})
+        trusted = _artifact_context(run.id)
+        elsewhere = _artifact_context(other_run.id)
+        stranger = _artifact_context(run.id, user="user-2")
 
-        async def artifact(context: ArtifactContext, origin: str | None) -> str:
-            labels = {"evidence_origin": origin} if origin else {}
-            metadata = await env.artifacts.create(
-                context,
-                ArtifactCreate(
-                    type=ArtifactType.REPORT,
-                    mime_type="text/plain",
-                    content=b"x",
-                    labels=labels,
-                ),
-            )
-            return metadata.id
-
-        good = await artifact(trusted, "trusted_sandbox")
-        unsigned = await artifact(trusted, None)
-        other_run_evidence = await artifact(elsewhere, "trusted_sandbox")
-        foreign = await artifact(stranger, "trusted_sandbox")
-
-        def completed(task_id: str, *, user: str = "user-1", run_id: str = run.id, output=None):  # type: ignore[no-untyped-def]
-            return AgentTask(
-                id=task_id,
-                name=task_id,
-                agent_id="coder",
-                session_id="session-1",
-                tenant_id="tenant-1",
-                user_id=user,
-                trace_id="trace-1",
-                status=TaskStatus.COMPLETED,
-                output=output,
-                metadata={"runtime_run_id": run_id, "logical_task_id": task_id},
-            )
+        good = await _evidence(env, trusted)
+        unsigned = await _evidence(env, trusted, signed=False)
+        other_run_evidence = await _evidence(env, elsewhere)
+        foreign = await _evidence(env, stranger)
+        plain = await _evidence(env, trusted, origin=None, signed=False, content=b"x")
 
         claims = {
             "role": "coder",
             "summary": "s" * 9_000,
-            "artifact_refs": [good, "artifact_forged", foreign],
+            "artifact_refs": [good, plain, "artifact_forged", foreign, other_run_evidence],
             "evidence_refs": [good, unsigned, other_run_evidence, foreign, "artifact_forged"],
             "blockers": ["b" * 5_000],
             "follow_up_suggestions": ["fix lint"],
         }
-        await env.store.save_task(completed("dep-ok", output=claims))
-        await env.store.save_task(completed("dep-foreign", user="user-2", output=claims))
-        await env.store.save_task(completed("dep-other-run", run_id=other_run.id, output=claims))
-        unfinished = completed("dep-open", output=None).model_copy(
+        await env.store.save_task(_completed_task("dep-ok", run.id, output=claims))
+        await env.store.save_task(
+            _completed_task("dep-foreign", run.id, user="user-2", output=claims)
+        )
+        await env.store.save_task(_completed_task("dep-other-run", other_run.id, output=claims))
+        unfinished = _completed_task("dep-open", run.id).model_copy(
             update={"status": TaskStatus.RUNNING}
         )
         await env.store.save_task(unfinished)
 
-        consumer = AgentTask(
-            id="consumer",
-            name="consumer",
-            agent_id="tester",
-            session_id="session-1",
-            tenant_id="tenant-1",
-            user_id="user-1",
-            trace_id="trace-1",
-            dependencies=["dep-ok", "dep-foreign", "dep-other-run", "dep-open", "missing"],
-            metadata={"runtime_run_id": run.id, "logical_task_id": "consumer"},
+        consumer = _consumer(
+            run.id, "dep-ok", "dep-foreign", "dep-other-run", "dep-open", "missing"
         )
-        package = await TaskContextAssembler(store=env.store, artifacts=env.artifacts).assemble(
-            consumer, run=record, identity=owner(), role="tester"
-        )
+        package = await TaskContextAssembler(
+            store=env.store, artifacts=env.artifacts, evidence_signer=SIGNER
+        ).assemble(consumer, run=record, identity=owner(), role="tester")
         assert [item.logical_task_id for item in package.handoffs] == ["dep-ok"]
         handoff = package.handoffs[0]
         assert handoff.evidence_refs == (good,)
-        assert handoff.artifact_refs == (good,)
-        assert handoff.unverified_reference_count == (3 - 1) + (5 - 1)
+        assert handoff.artifact_refs == (good, plain)
+        assert handoff.unverified_reference_count == (5 - 2) + (5 - 1)
         assert len(handoff.summary) <= 2_000 and len(handoff.blockers[0]) <= 500
-        assert package.verified_evidence_refs == (good,)
+        assert package.authenticated_evidence_refs == (good,)
         assert package.grants_authority is False
         assert any("not completed" in item for item in package.blockers)
         assert sum("unavailable" in item for item in package.blockers) == 3
+
+    run_async(scenario)
+
+
+def test_an_unsigned_label_is_never_authenticated_evidence(tmp_path: Path) -> None:
+    """Regression: the label alone used to make a readable artifact 'host-verified'."""
+
+    async def scenario() -> None:
+        env = Env(tmp_path)
+        run = await env.new_run()
+        record = await env.runs.start(run_id=run.id, identity=owner())
+        forged = await _evidence(env, _artifact_context(run.id), signed=False)
+        await env.store.save_task(
+            _completed_task("dep", run.id, output={"evidence_refs": [forged]})
+        )
+        consumer = _consumer(run.id, "dep")
+        for signer in (SIGNER, None):
+            package = await TaskContextAssembler(
+                store=env.store, artifacts=env.artifacts, evidence_signer=signer
+            ).assemble(consumer, run=record, identity=owner(), role="tester")
+            assert package.authenticated_evidence_refs == ()
+            assert package.handoffs[0].evidence_refs == ()
+            assert package.handoffs[0].unverified_reference_count == 1
+
+    run_async(scenario)
+
+
+def test_evidence_that_fails_authentication_is_dropped(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        env = Env(tmp_path)
+        run = await env.new_run()
+        other_run = await env.new_run()
+        record = await env.runs.start(run_id=run.id, identity=owner())
+        mine = _artifact_context(run.id)
+        wrong_key = EvidenceSigner(key=b"another-host-secret-key-0123456789")
+        good = await _evidence(env, mine)
+        refs = {
+            "wrong_key": await _evidence(env, mine, signer=wrong_key),
+            # MAC computed over different content than what is stored: tampered content.
+            "tampered": await _evidence(env, mine, sign_content=b'{"exit_code": 1}'),
+            # Signed for another owner or another run, then stored under this one.
+            "cross_owner": await _evidence(
+                env, mine, sign_for=_artifact_context(run.id, user="u2")
+            ),
+            "cross_run": await _evidence(env, mine, sign_for=_artifact_context(other_run.id)),
+            # Authentic and well-formed, but the payload names a different run.
+            "payload_other_run": await _evidence(
+                env, mine, content=_evidence_content(other_run.id)
+            ),
+            "payload_not_json": await _evidence(env, mine, content=b"not json"),
+            "payload_wrong_origin": await _evidence(
+                env, mine, content=json.dumps({"origin": "model", "run_id": run.id}).encode()
+            ),
+            "label_not_signed_over": await _evidence(env, mine, origin="model_authored"),
+            "expired": await _evidence(
+                env, mine, expires_at=datetime.now(UTC) + timedelta(milliseconds=50)
+            ),
+        }
+        await asyncio.sleep(0.2)
+        await env.store.save_task(
+            _completed_task("dep", run.id, output={"evidence_refs": [good, *refs.values()]})
+        )
+        package = await TaskContextAssembler(
+            store=env.store, artifacts=env.artifacts, evidence_signer=SIGNER
+        ).assemble(_consumer(run.id, "dep"), run=record, identity=owner(), role="tester")
+        assert package.authenticated_evidence_refs == (good,), refs
+        assert package.handoffs[0].unverified_reference_count == len(refs)
+
+    run_async(scenario)
+
+
+def test_a_corrupted_artifact_in_the_store_does_not_break_context_assembly(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        env = Env(tmp_path)
+        run = await env.new_run()
+        record = await env.runs.start(run_id=run.id, identity=owner())
+        mine = _artifact_context(run.id)
+        good = await _evidence(env, mine)
+        corrupted = await _evidence(env, mine)
+        stored = await env.artifacts.store.get(corrupted)
+        assert stored is not None
+        # Corrupt the stored bytes behind the manager's back (a tampering store).
+        env.artifacts.store._artifacts[corrupted] = stored.model_copy(  # type: ignore[attr-defined]
+            update={"content": b'{"origin":"trusted_sandbox"}'}
+        )
+        await env.store.save_task(
+            _completed_task("dep", run.id, output={"evidence_refs": [corrupted, good]})
+        )
+        package = await TaskContextAssembler(
+            store=env.store, artifacts=env.artifacts, evidence_signer=SIGNER
+        ).assemble(_consumer(run.id, "dep"), run=record, identity=owner(), role="tester")
+        assert package.authenticated_evidence_refs == (good,)
+
+    run_async(scenario)
+
+
+def test_artifact_handoffs_are_scoped_to_the_current_run(tmp_path: Path) -> None:
+    """Readable by the same user is not the same as part of this workflow run."""
+
+    async def scenario() -> None:
+        env = Env(tmp_path)
+        run = await env.new_run()
+        other_run = await env.new_run()
+        record = await env.runs.start(run_id=run.id, identity=owner())
+        mine = await _evidence(env, _artifact_context(run.id), signed=False, content=b"x")
+        unrelated = await _evidence(env, _artifact_context(other_run.id), content=b"y")
+        no_run = await env.artifacts.create(
+            ArtifactContext(
+                tenant_id="tenant-1", user_id="user-1", session_id="session-1", trace_id="t"
+            ),
+            ArtifactCreate(type=ArtifactType.REPORT, mime_type="text/plain", content=b"z"),
+        )
+        await env.store.save_task(
+            _completed_task("dep", run.id, output={"artifact_refs": [mine, unrelated, no_run.id]})
+        )
+        package = await TaskContextAssembler(store=env.store, artifacts=env.artifacts).assemble(
+            _consumer(run.id, "dep"), run=record, identity=owner(), role="tester"
+        )
+        assert package.handoffs[0].artifact_refs == (mine,)
+        assert package.handoffs[0].unverified_reference_count == 2
+
+    run_async(scenario)
+
+
+def test_authenticated_evidence_is_labelled_as_authentication_not_satisfaction(
+    tmp_path: Path,
+) -> None:
+    """Authentic evidence is shown as such; only the completion gate decides requirements."""
+
+    async def scenario() -> None:
+        env = Env(tmp_path)
+        run = await env.new_run()
+        record = await env.runs.start(run_id=run.id, identity=owner())
+        old = await _evidence(env, _artifact_context(run.id))
+        await env.store.save_task(_completed_task("dep", run.id, output={"evidence_refs": [old]}))
+        package = await TaskContextAssembler(
+            store=env.store, artifacts=env.artifacts, evidence_signer=SIGNER
+        ).assemble(_consumer(run.id, "dep"), run=record, identity=owner(), role="tester")
+        assert package.authenticated_evidence_refs == (old,)
+        text = "\n".join(item.content for item in package.context_items())
+        assert "authenticated" in text and "host-verified" not in text
+        assert "does not satisfy" in text and "completion gate" in text
 
     run_async(scenario)
 
