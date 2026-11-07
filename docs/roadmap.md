@@ -180,44 +180,51 @@ small, independently reviewable changes with their own acceptance criteria.
   2026-11-07 by link check, diff inspection, and hash comparison; no tests were run
   because no code changed.
 
-### M2: Root-level Python restructuring (in review)
+### M2: Root-level Python restructuring (completed)
 
 - [x] `backend/src`, `backend/tests`, and `backend/pyproject.toml` moved to the
       repository root with Git-aware renames; `backend/README.md` consolidated into
       the root README (links are absolute so the PyPI long description renders);
-      the `backend/` directory removed.
-- [x] CI and release workflows, `AGENTS.md`, `docs/releasing.md`, and example
-      READMEs updated; `tests/test_protocol_contract.py` fixture path adjusted.
-- [x] sdist constrained to `src/kaiwen_agent`, `tests`, `README.md`, `LICENSE`, and
-      `pyproject.toml`. Distribution name and version are unchanged (`0.7.0a1`).
-- [~] Not complete until the pull request is reviewed, exact-head CI passes, and the
-      owner merges it.
-- Verified locally on 2026-11-07 (Python 3.13.5, Node 22.16.0): clean editable
-  install; `ruff format --check` and `ruff check` on `src tests examples`; mypy on
-  `src/kaiwen_agent` and the 13 CI-typed examples; pytest `282 passed, 1 skipped`,
-  identical to the pre-move baseline; the 10 CI-executed examples; wheel and sdist
-  builds; `twine check`; `npm ci`, build, protocol check, tests, typecheck, and
-  `pack:check`.
-- Wheel comparison against a pre-move build: the package file list and file contents
-  are identical. The only differences are the long description in `METADATA` and an
-  added `licenses/LICENSE` entry, because `LICENSE` now sits next to `pyproject.toml`.
-- Not verified locally: Python 3.11 and 3.12, Linux, and the release workflow
-  (`workflow_dispatch` only, not exercised).
+      the `backend/` directory removed. Distribution name and version are unchanged
+      (`0.7.0a1`); the sdist is limited to `src/kaiwen_agent`, `tests`, `README.md`,
+      `LICENSE`, and `pyproject.toml`.
+- Merged as pull request 2 (squash commit `4441515`) after exact-head CI passed
+  (Python 3.12 on Linux and Node 22). Local verification before merge: pytest
+  `282 passed, 1 skipped`, identical to the pre-move baseline; Ruff, mypy, examples,
+  wheel and sdist builds, `twine check`, and the npm scripts passed. The wheel's
+  package files and contents are identical to a pre-move build; `METADATA` differs
+  only in the long description and a `licenses/LICENSE` entry was added.
 
-### M3: CI/CD and packaging hardening (planned)
+### M3: CI/CD and packaging hardening (in review)
 
-- [ ] Python version and operating-system matrix matching declared support; build,
-      `twine check`, and `npm pack` checks on pull requests; release verification
-      aligned with CI; publish the verified artifact; version-consistency check;
-      release restricted to the default branch; least-privilege workflow
-      permissions; pinned actions.
-- [!] Branch protection and required reviewers on the `npm` and `pypi` environments
-      are remote repository settings and require the owner. A read-only query on
-      2026-11-07 reported no protection on `main`, no rulesets, and no environment
-      protection rules.
-- [ ] Reconcile repository URLs (`kaiwen-agent-platform` in package manifests versus
-      `kaiwen-agent` as the current remote) after confirming trusted-publisher
-      configuration on PyPI and npm.
+- [x] Reusable `verify.yml` shared by `ci.yml` and `release.yml`: Ruff, mypy, pytest
+      on Python 3.11, 3.12, and 3.13 (Linux) and 3.11 and 3.13 (Windows), executable
+      examples, Node 20 and 22, wheel and sdist build, `twine check --strict`,
+      content checks (`py.typed`, coding-kit prompts, sdist limited to intended
+      paths), clean-environment install of both artifacts, `npm run pack:check`.
+      A single `CI gate` status is provided for branch protection.
+- [x] Release: runs only from `main`, publishes the exact artifacts produced by the
+      verification run (no rebuild), `id-token: write` only on the two publish jobs,
+      every third-party Action pinned to a full commit SHA, npm pinned to 11.5.1.
+- [x] `scripts/check_release.py` checks version relationships, the changelog heading,
+      and distribution contents. Python and npm versions remain independent.
+- [x] Repository URLs in `pyproject.toml` and both `package.json` files corrected to
+      `ImtheKaiwen/kaiwen-agent`.
+- [~] Not complete until pull request CI passes on the exact head and the owner
+      merges it.
+- [!] Owner actions (remote settings, not changed by this work): ruleset on `main`
+      requiring a pull request and the `CI gate` check; required reviewers and a
+      `main`-only deployment branch policy on the `npm` and `pypi` environments;
+      "Require actions to be pinned to a full-length commit SHA"; confirm PyPI and npm
+      trusted-publisher entries use repository `kaiwen-agent`. See
+      `docs/releasing.md`. A read-only query on 2026-11-07 found none of these in
+      place and no ability to read the trusted-publisher configuration.
+- Observed release inconsistencies, not changed: no Git tags for 0.4.0a1 or 0.6.0a1
+  although PyPI has them; GitHub releases stop at 0.5.0a1 and mark 0.3.0a1 as
+  "Latest"; no tags for npm releases.
+- Not verified: the publish jobs (npm tarball publishing with provenance and the
+  PyPI artifact upload have not been exercised, by design), Python 3.11 and 3.13
+  locally.
 
 ### M4: Security and behavioural validation (planned)
 

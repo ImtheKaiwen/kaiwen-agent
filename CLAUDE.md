@@ -15,6 +15,10 @@ commands live in `AGENTS.md` and are not repeated here.
 
 - Work only on the approved milestone. Ask for explicit approval before starting a
   new milestone or expanding scope.
+- Execute approved milestones end-to-end, including implementation, verification,
+  documentation, commit, and review preparation. Avoid unnecessary approval requests
+  for routine steps; stop for genuine blockers, destructive operations,
+  security-sensitive changes, or scope expansion.
 - Never publish packages, push tags, or merge pull requests without explicit
   authorization. Do not commit or push unless asked.
 

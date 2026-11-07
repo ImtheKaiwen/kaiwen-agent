@@ -25,10 +25,10 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/ImtheKaiwen/kaiwen-agent-platform"
-Documentation = "https://github.com/ImtheKaiwen/kaiwen-agent-platform/tree/main/docs"
-Repository = "https://github.com/ImtheKaiwen/kaiwen-agent-platform.git"
-Issues = "https://github.com/ImtheKaiwen/kaiwen-agent-platform/issues"
+Homepage = "https://github.com/ImtheKaiwen/kaiwen-agent"
+Documentation = "https://github.com/ImtheKaiwen/kaiwen-agent/tree/main/docs"
+Repository = "https://github.com/ImtheKaiwen/kaiwen-agent.git"
+Issues = "https://github.com/ImtheKaiwen/kaiwen-agent/issues"
 
 [project.optional-dependencies]
 openai = [
