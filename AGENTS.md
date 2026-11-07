@@ -32,8 +32,9 @@ npm.cmd run build
 npm.cmd run typecheck
 npm.cmd test
 .\.venv\Scripts\python.exe -m pytest tests
-.\.venv\Scripts\python.exe -m ruff check src tests examples
-.\.venv\Scripts\python.exe -m mypy src
+.\.venv\Scripts\python.exe -m ruff check src tests examples scripts
+.\.venv\Scripts\python.exe -m mypy src scripts/check_release.py
+.\.venv\Scripts\python.exe scripts/check_release.py metadata
 ```
 
 Prefer deterministic fakes and contract tests for repeatable automated testing, while

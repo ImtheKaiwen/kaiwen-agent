@@ -1,5 +1,8 @@
 name: Release packages
 
+# Manual release. Packages are built and verified once by the shared verification
+# workflow; the publish jobs upload exactly those artifacts and never rebuild.
+
 on:
   workflow_dispatch:
     inputs:
@@ -16,84 +19,69 @@ on:
 
 permissions:
   contents: read
-  id-token: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
-  verify:
+  guard:
+    name: Require the default branch
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: npm ci
-      - run: npm run build
-      - run: npm run check:protocol
-      - run: npm test
-      - run: npm run typecheck
-      - run: python -m pip install -e ".[dev,release]"
-      - run: python -m ruff format --config pyproject.toml --check src tests examples
-      - run: python -m ruff check --config pyproject.toml src tests examples
-      - run: python -m mypy --no-incremental src/kaiwen_agent
-      - run: python -m mypy --no-incremental examples/simple-runtime/main.py
-      - run: python -m mypy --no-incremental examples/autonomous-single-agent/main.py
-      - run: python -m mypy --no-incremental examples/software-agent-team/main.py
-      - run: python -m mypy --no-incremental examples/speech-pipeline/main.py
-      - run: python -m mypy --no-incremental examples/validation-consumer/main.py
-      - run: python -m mypy --no-incremental examples/legal-domain-validation/main.py
-      - run: python -m mypy --no-incremental examples/coding-kit-fake/main.py
-      - run: python -m mypy --no-incremental examples/coding-kit-openai/main.py
-      - run: python -m mypy --no-incremental examples/coding-simple-chat/main.py
-      - run: python -m mypy --no-incremental examples/coding-simple-agent/main.py
-      - run: python -m mypy --no-incremental examples/coding-simple-team/main.py
-      - run: python -m mypy --no-incremental examples/coding-simple-ollama/main.py
-      - run: python -m mypy --no-incremental examples/coding-simple-custom-host/main.py
-      - run: python -m pytest
-      - run: python examples/validation-consumer/main.py "$RUNNER_TEMP/todo-consumer"
-      - run: python examples/legal-domain-validation/main.py "$RUNNER_TEMP/legal-consumer"
-      - run: python examples/coding-simple-chat/main.py
-      - run: python examples/coding-simple-agent/main.py
-      - run: python examples/coding-simple-team/main.py
-      - run: python examples/coding-simple-custom-host/main.py
-      - run: python -m build
-      - run: python -m twine check dist/*
+      - run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "Releases may only run from refs/heads/main, got $GITHUB_REF" >&2
+            exit 1
+          fi
 
-  npm:
-    if: inputs.publish_npm
+  verify:
+    needs: guard
+    uses: ./.github/workflows/verify.yml
+
+  publish-npm:
+    name: Publish npm packages
+    if: inputs.publish_npm && github.ref == 'refs/heads/main'
     needs: verify
     runs-on: ubuntu-latest
     environment: npm
+    permissions:
+      contents: read
+      id-token: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
-          cache: npm
-      - run: npm install --global npm@latest
-      - run: npm ci
-      - run: npm run build
-      - run: npm publish --workspace @imthekaiwen/agent-protocol --provenance --access public --tag alpha
-      - run: npm publish --workspace @imthekaiwen/agent-ui --provenance --access public --tag alpha
+      # npm trusted publishing requires npm 11.5.1 or newer; Node 22 bundles an older npm.
+      - run: npm install --global npm@11.5.1
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: npm-packages
+          path: npm-dist
+      # Alphabetical order publishes agent-protocol before agent-ui, which depends on it.
+      - name: Publish the verified tarballs
+        run: |
+          for tarball in npm-dist/*.tgz; do
+            npm publish "$tarball" --provenance --access public --tag alpha
+          done
 
-  pypi:
-    if: inputs.publish_pypi
+  publish-pypi:
+    name: Publish PyPI package
+    if: inputs.publish_pypi && github.ref == 'refs/heads/main'
     needs: verify
     runs-on: ubuntu-latest
     environment:
       name: pypi
       url: https://pypi.org/project/kaiwen-agent/
+    permissions:
+      contents: read
+      id-token: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          python-version: "3.12"
-      - run: python -m pip install build
-      - run: python -m build
-      - uses: pypa/gh-action-pypi-publish@release/v1
+          name: python-dist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
         with:
           packages-dir: dist/

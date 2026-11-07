@@ -6,7 +6,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ImtheKaiwen/kaiwen-agent-platform.git",
+    "url": "git+https://github.com/ImtheKaiwen/kaiwen-agent.git",
     "directory": "packages/protocol"
   },
   "keywords": ["agent", "ai", "protocol", "typescript", "json-schema"],
