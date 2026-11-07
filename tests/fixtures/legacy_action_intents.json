@@ -1,0 +1,103 @@
+{
+  "approvals": [
+    {
+      "action_intent_id": "intent_515aa140de2ecc3154a588e61f9f8cd4fcbe69deff601868286d39bae8e294c8",
+      "arguments_checksum": "3f5e2fc00aa466f0983fe194e1a11594358bc888f4609c7ac82e3409c7cb750b",
+      "call_id": "call-legacy-prep",
+      "consumed_at": null,
+      "conversation_id": "conversation-1",
+      "created_at": "2026-11-07T15:29:11.857696Z",
+      "decided_at": null,
+      "decided_by": null,
+      "id": "approval_cb780cc8ddca482ba03911400c4ce05e",
+      "runtime_run_id": "run-legacy",
+      "status": "pending",
+      "tenant_id": "tenant-1",
+      "tool_name": "pay",
+      "updated_at": "2026-11-07T15:29:11.857699Z",
+      "user_id": "user-1"
+    }
+  ],
+  "generated_with": "kaiwen-agent pre-M5 ToolExecutor, commit 4c5ff65",
+  "intents": [
+    {
+      "arguments_checksum": "c2b11e657e12fd177359627ca89412018e2274d0873cfbfcf1fc50f685582e9e",
+      "call_id": "call-legacy-ok",
+      "conversation_id": "conversation-1",
+      "created_at": "2026-11-07T15:29:11.533300Z",
+      "error_code": null,
+      "external_receipt": {},
+      "id": "intent_56fc9753cbf9c968bb876b9db7d96e257cd9022b5510cb3b8803b65342c8efcd",
+      "idempotency_key": "legacy-ok",
+      "result": {
+        "call_id": "call-legacy-ok",
+        "is_error": false,
+        "name": "pay",
+        "output": {
+          "paid": 1
+        }
+      },
+      "runtime_run_id": "run-legacy",
+      "side_effect": "reversible",
+      "status": "succeeded",
+      "tenant_id": "tenant-1",
+      "tool_name": "pay",
+      "updated_at": "2026-11-07T15:29:11.733870Z",
+      "user_id": "user-1"
+    },
+    {
+      "arguments_checksum": "a2879a37ea1e0b8938f44d782c2ff3887f30554da489efc8634d658a95a1094d",
+      "call_id": "call-legacy-uncertain",
+      "conversation_id": "conversation-1",
+      "created_at": "2026-11-07T15:29:11.747224Z",
+      "error_code": "RuntimeError",
+      "external_receipt": {},
+      "id": "intent_2c0d7987230985f5d1053be3551e13254298ace905a5699bd713bacd0885c0e3",
+      "idempotency_key": "legacy-uncertain",
+      "result": null,
+      "runtime_run_id": "run-legacy",
+      "side_effect": "reversible",
+      "status": "uncertain",
+      "tenant_id": "tenant-1",
+      "tool_name": "pay",
+      "updated_at": "2026-11-07T15:29:11.786853Z",
+      "user_id": "user-1"
+    },
+    {
+      "arguments_checksum": "6d47010e407ddba47d8460e9c3984e515309fd15eaf15d2505e76cbd213df915",
+      "call_id": "call-legacy-exec",
+      "conversation_id": "conversation-1",
+      "created_at": "2026-11-07T15:29:11.799663Z",
+      "error_code": null,
+      "external_receipt": {},
+      "id": "intent_9660f11f51c372b402e7d1447d88d6ecbbaa09038aa43069ea74bdcee9b6634c",
+      "idempotency_key": "legacy-exec",
+      "result": null,
+      "runtime_run_id": "run-legacy",
+      "side_effect": "reversible",
+      "status": "executing",
+      "tenant_id": "tenant-1",
+      "tool_name": "pay",
+      "updated_at": "2026-11-07T15:29:11.821340Z",
+      "user_id": "user-1"
+    },
+    {
+      "arguments_checksum": "3f5e2fc00aa466f0983fe194e1a11594358bc888f4609c7ac82e3409c7cb750b",
+      "call_id": "call-legacy-prep",
+      "conversation_id": "conversation-1",
+      "created_at": "2026-11-07T15:29:11.835490Z",
+      "error_code": null,
+      "external_receipt": {},
+      "id": "intent_515aa140de2ecc3154a588e61f9f8cd4fcbe69deff601868286d39bae8e294c8",
+      "idempotency_key": "legacy-prep",
+      "result": null,
+      "runtime_run_id": "run-legacy",
+      "side_effect": "reversible",
+      "status": "prepared",
+      "tenant_id": "tenant-1",
+      "tool_name": "pay",
+      "updated_at": "2026-11-07T15:29:11.835493Z",
+      "user_id": "user-1"
+    }
+  ]
+}

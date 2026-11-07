@@ -75,6 +75,43 @@ provider reconciliation or human review. Recovery must hold an injected `LeaseSt
 multi-host deployments must use a distributed implementation and enforce fencing at
 the protected write boundary. This is at-least-once execution, not exactly-once.
 
+## Run ownership and recovery
+
+`WorkflowController` accepts an optional `LeaseStore`. While it executes a run it
+heartbeats a lease named `runtime-run:<run id>`, records the key on the run, and stops
+without writing state if the lease is lost or if another executor already holds it
+(`RunOwnershipError`). `RuntimeRecoveryManager.reconcile` blocks `RUNNING` runs whose
+recorded lease nobody holds (`owner_lost`). Runs with no recorded lease are left alone
+because age alone does not prove the process died, and recovery never resumes a run
+automatically. The in-memory lease store protects a single process; use a shared store,
+such as the Redis adapter, across nodes.
+
+Run-state writes are conditional. `RuntimeRunStore.save_runtime_run` accepts
+`expected_status` and `expected_owner_fence`, and the SQLite store compares them with
+the stored run inside the same transaction that writes (`RuntimeRunConflictError`
+otherwise). The controller passes its lease's fencing token on every transition, so a
+paused or stalled executor whose lease was taken over cannot complete, fail, or block a
+run the new owner is executing, and a recovery pass cannot overwrite a state the owner
+wrote after recovery listed the runs.
+
+## Upgrading action intents persisted by 0.7.0a1 and earlier
+
+Action-intent ids no longer include the arguments checksum. No migration is required
+for the SQLite store: when an intent is not found under its new id, the executor looks
+it up by owner, run, and idempotency key (`get_action_intent_by_key`) and continues
+with the stored record, so receipts, uncertainty, and pending approvals survive.
+Replays of a legacy succeeded action return its receipt, an executing or uncertain one
+raises `ActionOutcomeUncertainError`, and the same key with different arguments raises
+`IdempotencyConflictError`. Recommended procedure:
+
+1. Stop the old process, then start the upgraded one and run
+   `RuntimeRecoveryManager.reconcile` once so intents left `EXECUTING` become
+   `UNCERTAIN` and their runs are blocked for review.
+2. Review uncertain actions in the owning system before any manual retry.
+3. A custom durable store should implement `get_action_intent_by_key` (and, for complete
+   cancellation checks, `list_run_action_intents`). Without them no legacy action is
+   executed again, but a replay can require approval again or fail with a conflict.
+
 ## SSE
 
 `SSEEventBroker` can persist an event to another sink and fan it out to active

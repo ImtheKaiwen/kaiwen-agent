@@ -18,6 +18,10 @@ class ToolValidationError(AgentError):
     """Raised when tool arguments fail schema validation."""
 
 
+class ToolArgumentsError(ToolValidationError):
+    """Raised when model-supplied arguments fail the tool input schema."""
+
+
 class ApprovalRequiredError(AgentError):
     """Raised when an approval-protected tool has no approval gate."""
 
@@ -48,3 +52,26 @@ class ActionOutcomeUncertainError(ToolExecutionError):
     def __init__(self, message: str, *, action_intent_id: str) -> None:
         super().__init__(message)
         self.action_intent_id = action_intent_id
+
+
+class IdempotencyConflictError(AgentError, ValueError):
+    """Raised when an idempotency key is reused with different canonical arguments.
+
+    It is also a ValueError so callers that caught the store's earlier binding error keep working.
+    """
+
+
+class RunOwnershipError(AgentError):
+    """Raised when a workflow run is owned by another executor or ownership was lost."""
+
+
+class ActionLookupIncompleteError(AgentError):
+    """Raised when in-flight action intents cannot be listed completely."""
+
+
+class DurableSideEffectsRequiredError(AgentError):
+    """Raised when autonomous side effects are requested without durable coordination."""
+
+
+class ModelResponseError(AgentError):
+    """Raised when a provider returns a malformed response, such as invalid tool arguments."""

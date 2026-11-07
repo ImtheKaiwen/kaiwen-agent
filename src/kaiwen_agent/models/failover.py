@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -9,6 +9,7 @@ from kaiwen_agent.model_routing.models import ModelSelection
 from kaiwen_agent.model_routing.router import locality_satisfies
 from kaiwen_agent.models.base import ModelProvider
 from kaiwen_agent.models.capabilities import DataLocality
+from kaiwen_agent.models.errors import is_transient_provider_error
 from kaiwen_agent.tools.definition import ToolDefinition
 from kaiwen_agent.types import AgentInput, ModelResponse, ToolResult
 
@@ -57,6 +58,7 @@ class FailoverModelProvider:
         required_locality: DataLocality = DataLocality.CLOUD_ALLOWED,
         required_region: str | None = None,
         retryable_exceptions: tuple[type[Exception], ...] = (RetryableModelProviderError,),
+        transient_classifier: Callable[[Exception], bool] | None = is_transient_provider_error,
     ) -> None:
         if not candidates:
             raise ModelFailoverConfigurationError("At least one failover candidate is required")
@@ -86,6 +88,7 @@ class FailoverModelProvider:
             candidate.selection.route_id: candidate for candidate in self._candidates
         }
         self._retryable_exceptions = retryable_exceptions
+        self._transient_classifier = transient_classifier
 
     async def respond(
         self,
@@ -114,8 +117,11 @@ class FailoverModelProvider:
                     tool_results=(),
                     provider_state=None,
                 )
-            except self._retryable_exceptions:
-                if candidate is self._candidates[-1]:
+            except Exception as error:
+                transient = isinstance(error, self._retryable_exceptions) or (
+                    self._transient_classifier is not None and self._transient_classifier(error)
+                )
+                if not transient or candidate is self._candidates[-1]:
                     raise
                 continue
             return self._pin_response(candidate, response)

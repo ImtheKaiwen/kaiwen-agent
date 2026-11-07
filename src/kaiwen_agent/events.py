@@ -19,6 +19,7 @@ EventType = Literal[
     "run.status",
     "run.completed",
     "run.failed",
+    "run.cancelled",
     "tool.started",
     "tool.completed",
     "tool.failed",

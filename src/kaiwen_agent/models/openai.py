@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from kaiwen_agent.context import AgentContext
+from kaiwen_agent.exceptions import ModelResponseError
 from kaiwen_agent.models.openai_tools import (
     openai_tool_name,
     serialize_openai_tool,
@@ -41,7 +42,14 @@ class OpenAIResponsesProvider:
         parallel_tool_calls: bool = True,
         output_schema: Mapping[str, Any] | None = None,
         output_name: str = "agent_output",
+        timeout: float | None = None,
+        max_retries: int | None = None,
     ) -> None:
+        if client is not None and (timeout is not None or max_retries is not None):
+            raise ValueError(
+                "timeout and max_retries configure the default SDK client; "
+                "configure an injected client directly"
+            )
         if client is None:
             try:
                 from openai import AsyncOpenAI
@@ -49,7 +57,12 @@ class OpenAIResponsesProvider:
                 raise RuntimeError(
                     "Install the OpenAI adapter with `pip install kaiwen-agent[openai]`."
                 ) from error
-            client = AsyncOpenAI()
+            options: dict[str, Any] = {}
+            if timeout is not None:
+                options["timeout"] = timeout
+            if max_retries is not None:
+                options["max_retries"] = max_retries
+            client = AsyncOpenAI(**options)
 
         self._client = client
         self.model = model
@@ -106,7 +119,9 @@ class OpenAIResponsesProvider:
         output_text = getattr(response, "output_text", None)
         structured_output: Any | None = None
         if self.output_schema is not None and output_text:
-            structured_output = json.loads(output_text)
+            structured_output = _parse_json(
+                output_text, "Provider returned structured output that is not valid JSON"
+            )
 
         calls: list[ToolCall] = []
         for item in getattr(response, "output", []):
@@ -116,7 +131,7 @@ class OpenAIResponsesProvider:
                 ToolCall(
                     id=item.call_id,
                     name=provider_names.get(item.name, item.name),
-                    arguments=json.loads(getattr(item, "arguments", "{}")),
+                    arguments=_parse_tool_arguments(getattr(item, "arguments", "{}")),
                 )
             )
 
@@ -209,3 +224,21 @@ class OpenAIResponsesProvider:
             output_tokens=getattr(raw_usage, "output_tokens", 0),
             total_tokens=getattr(raw_usage, "total_tokens", 0),
         )
+
+
+def _parse_json(raw: Any, message: str) -> Any:
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError):
+        # Do not chain: the decode error would carry the raw provider text.
+        raise ModelResponseError(message) from None
+
+
+def _parse_tool_arguments(raw: Any) -> dict[str, Any]:
+    parsed = _parse_json(raw if raw not in (None, "") else "{}", _MALFORMED_ARGUMENTS)
+    if not isinstance(parsed, dict):
+        raise ModelResponseError(_MALFORMED_ARGUMENTS)
+    return parsed
+
+
+_MALFORMED_ARGUMENTS = "Provider returned malformed tool-call arguments"

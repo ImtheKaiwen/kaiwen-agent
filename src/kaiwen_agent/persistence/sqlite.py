@@ -11,6 +11,7 @@ from typing import TypeVar
 from kaiwen_agent.audit import AuditRecord
 from kaiwen_agent.control.checkpoints import TaskCheckpoint
 from kaiwen_agent.events import AgentEvent, EventScope, redact_agent_event
+from kaiwen_agent.exceptions import ActionLookupIncompleteError
 from kaiwen_agent.jobs.models import TERMINAL_JOB_STATUSES, AgentJob, JobStatus
 from kaiwen_agent.lifecycle.models import (
     LifecycleCycle,
@@ -20,7 +21,11 @@ from kaiwen_agent.lifecycle.models import (
 )
 from kaiwen_agent.memory.models import SessionSummary
 from kaiwen_agent.realtime.conversation import ConversationMessage
-from kaiwen_agent.runtime.durability import RuntimeRunRecord, RuntimeRunStatus
+from kaiwen_agent.runtime.durability import (
+    RuntimeRunConflictError,
+    RuntimeRunRecord,
+    RuntimeRunStatus,
+)
 from kaiwen_agent.sessions import SessionRecord
 from kaiwen_agent.tasks.models import AgentTask, TaskStatus
 from kaiwen_agent.tools.durability import (
@@ -1026,7 +1031,13 @@ class SQLitePersistence:
 
         return await self._run(operation)
 
-    async def save_runtime_run(self, run: RuntimeRunRecord) -> None:
+    async def save_runtime_run(
+        self,
+        run: RuntimeRunRecord,
+        *,
+        expected_status: RuntimeRunStatus | None = None,
+        expected_owner_fence: int | None = None,
+    ) -> None:
         await self.initialize()
 
         def operation(connection: sqlite3.Connection) -> None:
@@ -1034,8 +1045,19 @@ class SQLitePersistence:
             row = connection.execute(
                 "SELECT run_json FROM runtime_runs WHERE id = ?", (run.id,)
             ).fetchone()
+            if row is None and (expected_status is not None or expected_owner_fence is not None):
+                raise RuntimeRunConflictError("Runtime run does not exist")
             if row is not None:
                 current = RuntimeRunRecord.model_validate_json(row["run_json"])
+                # The comparison and the write share one IMMEDIATE transaction, so a
+                # stale reader cannot overwrite a state or owner written after its read.
+                if expected_status is not None and current.status != expected_status:
+                    raise RuntimeRunConflictError("Runtime run status changed since it was read")
+                if (
+                    expected_owner_fence is not None
+                    and current.owner_fencing_token != expected_owner_fence
+                ):
+                    raise RuntimeRunConflictError("Runtime run is owned by another executor")
                 if (
                     current.tenant_id,
                     current.user_id,
@@ -1163,6 +1185,58 @@ class SQLitePersistence:
                 """SELECT intent_json FROM action_intents
                 WHERE id = ? AND tenant_id = ? AND user_id = ?""",
                 (intent_id, tenant_id, user_id),
+            ).fetchone()
+            return ActionIntentRecord.model_validate_json(row["intent_json"]) if row else None
+
+        return await self._run(operation)
+
+    async def list_run_action_intents(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        runtime_run_id: str,
+        statuses: frozenset[ActionIntentStatus],
+        limit: int = 10_000,
+    ) -> list[ActionIntentRecord]:
+        """Complete owner- and run-scoped listing; never silently truncated."""
+
+        if not statuses:
+            return []
+        await self.initialize()
+
+        def operation(connection: sqlite3.Connection) -> list[ActionIntentRecord]:
+            placeholders = ",".join("?" for _ in statuses)
+            rows = connection.execute(
+                f"""SELECT intent_json FROM action_intents
+                WHERE tenant_id = ? AND user_id = ? AND runtime_run_id = ?
+                    AND status IN ({placeholders}) ORDER BY updated_at ASC LIMIT ?""",
+                [tenant_id, user_id, runtime_run_id, *(str(s) for s in statuses), limit + 1],
+            ).fetchall()
+            if len(rows) > limit:
+                raise ActionLookupIncompleteError("Run has more in-flight actions than the limit")
+            return [ActionIntentRecord.model_validate_json(row["intent_json"]) for row in rows]
+
+        return await self._run(operation)
+
+    async def get_action_intent_by_key(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        runtime_run_id: str,
+        idempotency_key: str,
+    ) -> ActionIntentRecord | None:
+        """Return the single intent stored for an owner, run, and idempotency key."""
+
+        await self.initialize()
+
+        def operation(connection: sqlite3.Connection) -> ActionIntentRecord | None:
+            row = connection.execute(
+                """SELECT intent_json FROM action_intents
+                WHERE tenant_id = ? AND user_id = ? AND runtime_run_id = ?
+                    AND idempotency_key = ?""",
+                (tenant_id, user_id, runtime_run_id, idempotency_key),
             ).fetchone()
             return ActionIntentRecord.model_validate_json(row["intent_json"]) if row else None
 

@@ -17,7 +17,8 @@ def test_legacy_root_imports_remain_available() -> None:
 
 
 def test_agent_and_provider_call_signatures_remain_compatible() -> None:
-    assert tuple(inspect.signature(Agent.__init__).parameters) == (
+    agent_parameters = inspect.signature(Agent.__init__).parameters
+    legacy = (
         "self",
         "name",
         "model",
@@ -28,6 +29,12 @@ def test_agent_and_provider_call_signatures_remain_compatible() -> None:
         "tool_executor",
         "max_steps",
     )
+    assert tuple(agent_parameters)[: len(legacy)] == legacy
+    # Later additions must stay optional so existing callers keep working.
+    assert tuple(agent_parameters)[len(legacy) :] == ("tool_errors", "max_tool_errors")
+    for added in ("tool_errors", "max_tool_errors"):
+        assert agent_parameters[added].kind == inspect.Parameter.KEYWORD_ONLY
+        assert agent_parameters[added].default is not inspect.Parameter.empty
     run_parameters = inspect.signature(Agent.run).parameters
     assert tuple(run_parameters) == ("self", "agent_input", "context")
     assert run_parameters["context"].kind == inspect.Parameter.KEYWORD_ONLY

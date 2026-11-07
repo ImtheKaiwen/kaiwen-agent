@@ -35,6 +35,8 @@ projected back into the job record and emitted using canonical job events.
 
 Cancellation is cooperative. Running workers must call `checkpoint()` at safe
 boundaries. Parent cancellation cascades to active children by default.
+`JobManager.wait()` returns when the job finishes or is cancelled; cancelling the
+coroutine that waits propagates normally and never cancels the job.
 
 Call `JobManager.recover()` once while an application instance has exclusive startup
 ownership. It atomically requeues non-terminal jobs and resolves persisted

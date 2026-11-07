@@ -18,6 +18,9 @@ class SchedulerStalledError(RuntimeError):
     pass
 
 
+_RESOURCE_POLL_SECONDS = 0.02
+
+
 class TaskScheduler:
     def __init__(
         self,
@@ -48,6 +51,30 @@ class TaskScheduler:
         self._not_before: dict[str, float] = {}
 
     async def run(self) -> tuple[AgentTask, ...]:
+        try:
+            return await self._run()
+        except (asyncio.CancelledError, Exception):
+            # Cancellation or an internal error must never leave workers running or
+            # resource locks held; unfinished tasks end as cancelled, not failed.
+            await asyncio.shield(self._abort_active())
+            raise
+
+    async def _abort_active(self) -> None:
+        active = list(self._active.values())
+        for future in active:
+            future.cancel()
+        if active:
+            await asyncio.gather(*active, return_exceptions=True)
+        self._active.clear()
+        for task in self.graph.tasks():
+            if task.terminal:
+                continue
+            transition_task(task, TaskStatus.CANCELLED)
+            task.error_code = task.error_code or "cancelled"
+            await self.store.save_task(task)
+            await self._emit(task, "task.cancelled", {"reason": "scheduler_stopped"})
+
+    async def _run(self) -> tuple[AgentTask, ...]:
         self.graph.validate()
         for task in self.graph.tasks():
             await self.store.save_task(task)
@@ -79,6 +106,11 @@ class TaskScheduler:
                 await asyncio.sleep(max(0, min(delayed) - asyncio.get_running_loop().time()))
                 continue
             if not scheduled and not self.graph.complete:
+                if any(task.status == TaskStatus.WAITING_RESOURCE for task in self.graph.tasks()):
+                    # This scheduler holds nothing, so the lock belongs to another scheduler
+                    # sharing the ResourceManager. Wait for it instead of failing the task.
+                    await asyncio.sleep(_RESOURCE_POLL_SECONDS)
+                    continue
                 raise SchedulerStalledError("No runnable tasks and no active workers")
 
         return self.graph.tasks()

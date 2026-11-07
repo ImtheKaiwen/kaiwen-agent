@@ -98,6 +98,42 @@ class ActionIntentStore(Protocol):
     ) -> list[ActionIntentRecord]: ...
 
 
+class ActionIntentRunQuery(Protocol):
+    """Optional capability: a complete, owner- and run-scoped listing of intents.
+
+    Stores without it are queried through the global paged listing, which cannot prove
+    that no action exists once a page is full, so callers must then fail closed.
+    """
+
+    async def list_run_action_intents(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        runtime_run_id: str,
+        statuses: frozenset[ActionIntentStatus],
+    ) -> list[ActionIntentRecord]: ...
+
+
+class ActionIntentKeyLookup(Protocol):
+    """Optional capability that lets the executor adopt intents with a different id.
+
+    Intents written before the arguments checksum left the intent id are stored under a
+    different id than the same operation gets now. A store that offers this lookup lets
+    the executor find them by their owner, run, and idempotency key, keep their state,
+    receipts, and approvals, and never execute their side effect a second time.
+    """
+
+    async def get_action_intent_by_key(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        runtime_run_id: str,
+        idempotency_key: str,
+    ) -> ActionIntentRecord | None: ...
+
+
 class DurableApprovalStore(Protocol):
     is_durable: bool
 

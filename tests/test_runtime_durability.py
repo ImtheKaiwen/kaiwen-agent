@@ -13,6 +13,7 @@ from kaiwen_agent.exceptions import (
     ActionOutcomeUncertainError,
     ApprovalDeniedError,
     DurableApprovalRequiredError,
+    IdempotencyConflictError,
 )
 from kaiwen_agent.persistence import SQLiteIdempotencyStore, SQLitePersistence
 from kaiwen_agent.runtime import (
@@ -339,7 +340,9 @@ def test_approval_cannot_cross_conversation_or_changed_arguments(tmp_path) -> No
                 execution_scope="runtime-1",
             )
         changed = first_call.model_copy(update={"arguments": {"value": "changed"}})
-        with pytest.raises(ValueError, match="different binding"):
+        # The same idempotency key with different arguments is rejected as a conflict
+        # before an approval lookup, which is stricter than the earlier binding check.
+        with pytest.raises(IdempotencyConflictError):
             await executor.execute(write_record, changed, base_context, execution_scope="runtime-1")
 
     asyncio.run(scenario())

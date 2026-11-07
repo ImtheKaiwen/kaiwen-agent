@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from kaiwen_agent.agent import Agent
@@ -15,6 +15,7 @@ from kaiwen_agent.context_engine import (
     ContextWindow,
 )
 from kaiwen_agent.events import EventSink, InMemoryEventSink
+from kaiwen_agent.exceptions import DurableSideEffectsRequiredError
 from kaiwen_agent.models.base import ModelProvider
 from kaiwen_agent.runtime.models import AutonomyLevel, RunMode, RuntimeIdentity
 from kaiwen_agent.sessions import InMemoryRunStore, RunStore
@@ -56,6 +57,8 @@ class AgentRuntime:
         context_renderer: ContextRenderer | None = None,
         compaction_manager: ContextCompactionManager | None = None,
         max_steps: int = 8,
+        tool_errors: Literal["fail", "return"] = "fail",
+        max_tool_errors: int = 3,
     ) -> None:
         if not name:
             raise ValueError("name must not be empty")
@@ -78,6 +81,8 @@ class AgentRuntime:
         self.context_renderer = context_renderer or ContextRenderer()
         self.compaction_manager = compaction_manager
         self.max_steps = max_steps
+        self.tool_errors = tool_errors
+        self.max_tool_errors = max_tool_errors
 
     async def run(
         self,
@@ -100,6 +105,7 @@ class AgentRuntime:
             agent_input if isinstance(agent_input, AgentInput) else AgentInput(text=agent_input)
         )
         effective_autonomy = autonomy or self.default_autonomy
+        self._require_durable_side_effects(selected_tools, effective_autonomy)
         effective_services = {**self.services, **dict(services or {})}
         effective_identity = identity.model_copy(
             update={
@@ -135,6 +141,8 @@ class AgentRuntime:
                 else self.tool_executor
             ),
             max_steps=self.max_steps,
+            tool_errors=self.tool_errors,
+            max_tool_errors=self.max_tool_errors,
         )
         return await agent.run(normalized_input, context=context)
 
@@ -171,6 +179,21 @@ class AgentRuntime:
             tool_names=tool_names,
             services=services,
         )
+
+    def _require_durable_side_effects(
+        self, tools: tuple[ToolDefinition, ...], autonomy: AutonomyLevel
+    ) -> None:
+        """Autonomous side effects need atomic, durable coordination before any model call."""
+
+        if autonomy != AutonomyLevel.AUTONOMOUS:
+            return
+        side_effecting = sorted(tool.name for tool in tools if tool.side_effect != "none")
+        store = self.tool_executor.action_intent_store
+        if side_effecting and not getattr(store, "is_durable", False):
+            raise DurableSideEffectsRequiredError(
+                "Autonomous side-effecting tools require a ToolExecutor with a durable "
+                f"action_intent_store: {', '.join(side_effecting)}"
+            )
 
     def _select_tools(self, tool_names: Sequence[str]) -> tuple[ToolDefinition, ...]:
         if len(tool_names) != len(set(tool_names)):

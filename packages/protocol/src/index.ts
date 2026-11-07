@@ -8,6 +8,7 @@ export const AGENT_EVENT_TYPES = [
   "run.status",
   "run.completed",
   "run.failed",
+  "run.cancelled",
   "tool.started",
   "tool.completed",
   "tool.failed",
@@ -80,6 +81,7 @@ export type AgentEventType =
   | "run.status"
   | "run.completed"
   | "run.failed"
+  | "run.cancelled"
   | "tool.started"
   | "tool.completed"
   | "tool.failed"

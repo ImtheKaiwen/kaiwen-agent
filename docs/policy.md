@@ -28,6 +28,26 @@ allowing additional product policy to make the result stricter.
 A deny decision always wins. A custom policy cannot use allow or modify to bypass a
 missing permission or required approval.
 
+## Idempotency and autonomous side effects
+
+Identical scoped operations (same owner, tool, and key) execute once per process: a
+concurrent duplicate waits for and shares the first result. Reusing a key with different
+canonical arguments raises `IdempotencyConflictError`, in flight, after completion, and
+with the durable action-intent store. The durable store's atomic claim provides
+exclusion across processes, and an uncertain outcome is never replayed.
+`AgentRuntime` raises `DurableSideEffectsRequiredError` before any model call when
+`AutonomyLevel.AUTONOMOUS` exposes a side-effecting tool and the `ToolExecutor` has no
+durable `action_intent_store`.
+
+## Recoverable tool errors
+
+By default any tool error ends the run. `Agent(tool_errors="return")` and
+`AgentRuntime(tool_errors="return")` instead return a sanitized
+`ToolResult(is_error=True)` for invalid arguments (location, type, and message only,
+never input values), unknown tools, and failures of read-only tools, up to
+`max_tool_errors` per run (default 3). Permission, policy, approval, path-policy,
+idempotency-conflict, and side-effecting tool failures always stay fatal.
+
 ## Product composition
 
 Consumers create a PolicyRegistry, register product-neutral policy instances or
