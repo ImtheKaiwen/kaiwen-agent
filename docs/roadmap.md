@@ -324,11 +324,27 @@ Each item was reproduced with a failing test before its fix (see ADR 0011).
   Gemini or Ollama transient classification against real SDK exceptions (the classifier
   is covered with stand-in error shapes only); real PostgreSQL, Redis, and multi-process
   verification of leases and single-flight; Windows 3.12 and 3.13 beyond CI.
+- Review corrections (reproduced with failing tests first):
+  - Legacy action intents: real records produced by the pre-M5 executor (fixture
+    `tests/fixtures/legacy_action_intents.json`) showed no duplicate execution, because
+    the store's owner, run, and key uniqueness blocked it, but succeeded replays asked
+    for approval again, different call ids and changed arguments raised raw
+    `ValueError`, and a pending legacy approval was stranded. Legacy intents are now
+    adopted by key and keep their receipt, uncertainty, and approval.
+  - Uncertain-action lookup: cancellation checked only the first 1,000 intents, so a run
+    with an in-flight action beyond them was recorded as `CANCELLED`. It now uses a
+    complete run-scoped query and blocks when a lookup is incomplete or fails.
+  - Run-state races: a recovery pass overwrote a state the owner wrote after the
+    snapshot, and a stale executor completed a run another owner was executing. Run
+    writes are now conditional on status and the owner's fencing token inside the store
+    transaction.
 - Compatibility: `AgentRun.status` gains `cancelled`; `ToolResult` gains `is_error`;
-  `Agent` and `AgentRuntime` gain keyword-only options; `RuntimeRunRecord` gains an
-  optional `owner_lease_key`; action-intent ids no longer include the arguments
-  checksum; one durability test now expects `IdempotencyConflictError` for a
-  changed-argument replay.
+  `Agent` and `AgentRuntime` gain keyword-only options; `RuntimeRunRecord` gains
+  optional `owner_lease_key` and `owner_fencing_token`; `save_runtime_run` gains
+  optional conditional arguments; `IdempotencyConflictError` is also a `ValueError`;
+  action-intent ids no longer include the arguments checksum (legacy intents are
+  adopted, see `docs/persistence.md`); one durability test now expects
+  `IdempotencyConflictError` for a changed-argument replay.
 - [~] Not complete until the pull request CI passes on the exact head and the owner
       merges it.
 

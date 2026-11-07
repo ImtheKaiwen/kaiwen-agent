@@ -10,7 +10,9 @@
   of waiting when they share a resource with another job.
 - Reject reuse of an idempotency key with different arguments and run identical
   concurrent side-effecting calls once. The action-intent id no longer includes the
-  arguments checksum, so intents prepared before this change are not matched by replays.
+  arguments checksum; intents persisted by earlier versions are adopted by owner, run,
+  and idempotency key, so their receipts, uncertainty, and approvals are preserved and
+  they are never executed again. See the upgrade procedure in `docs/persistence.md`.
 - `AgentRuntime` requires a durable action-intent store for autonomous side-effecting
   tools (`DurableSideEffectsRequiredError`).
 - Add opt-in `tool_errors="return"` with bounded sanitized tool results
@@ -21,6 +23,13 @@
 - Add optional run ownership leases to `WorkflowController`, and make
   `RuntimeRecoveryManager` block runs whose lease owner is gone (`owner_lost`).
 - `CodingKit` retains its background run tasks and logs their failures.
+- Make run-state writes conditional on the stored status and the owner's fencing
+  token, so a stale recovery snapshot or a stale executor cannot overwrite a newer
+  state. `RuntimeRunStore.save_runtime_run` gains optional `expected_status` and
+  `expected_owner_fence` arguments; custom stores that lack them are not used for
+  owner-lost blocking and cannot enforce ownership.
+- Cancellation uses a complete run-scoped intent query and blocks the run when the
+  lookup is incomplete or fails, instead of recording a possibly unsafe `CANCELLED`.
 
 - Security: workspace `read_text`, `write_text`, and `apply_patch` now enforce the
   ignore and sensitive-path policy (`.env*`, private keys, `.git`, ignored
