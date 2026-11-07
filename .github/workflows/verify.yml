@@ -66,6 +66,9 @@ jobs:
       - run: python -m pytest
       - name: Run executable examples
         shell: bash
+        env:
+          # Examples print non-ASCII text; Windows redirected stdout defaults to cp1252.
+          PYTHONUTF8: "1"
         run: |
           for example in simple-runtime autonomous-single-agent software-agent-team \
             speech-pipeline coding-simple-chat coding-simple-agent coding-simple-team \

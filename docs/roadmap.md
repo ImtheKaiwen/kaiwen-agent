@@ -219,6 +219,10 @@ small, independently reviewable changes with their own acceptance criteria.
       trusted-publisher entries use repository `kaiwen-agent`. See
       `docs/releasing.md`. A read-only query on 2026-11-07 found none of these in
       place and no ability to read the trusted-publisher configuration.
+- Observed on Windows CI: examples that print non-ASCII text fail under the default
+  cp1252 stdout encoding when output is redirected (for example
+  `examples/coding-simple-chat`). CI sets `PYTHONUTF8=1` for the example step; the
+  examples are unchanged.
 - Observed release inconsistencies, not changed: no Git tags for 0.4.0a1 or 0.6.0a1
   although PyPI has them; GitHub releases stop at 0.5.0a1 and mark 0.3.0a1 as
   "Latest"; no tags for npm releases.
