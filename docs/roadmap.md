@@ -432,7 +432,7 @@ Each defect was reproduced with a failing test before its fix.
 - [x] Merged as pull request 8 (squash commit `79c31ef`) after all 10 CI jobs passed on the
       exact head, including the real Docker tests and examples on Linux.
 
-### M6.3.2: AgentRuntime worker integration and team context foundation (in review)
+### M6.3.2: AgentRuntime worker integration and team context foundation (closed)
 
 - [x] ADR 0014: Private Agent Context + Shared Durable Project State + Bounded Task Handoffs +
       Lead Coordination View, with project, team, agent and lead scopes and the line between
@@ -453,7 +453,22 @@ Each defect was reproduced with a failing test before its fix.
 - Not done: Lead coordination view and delegation tools (M6.3.3), reviewer approval and team
   acceptance (M6.3.4), isolated parallel writers, worktree merging, real external LLM verification,
   atomic workspace verification.
-- [~] Not complete until the pull request CI passes on the exact head and the owner merges it.
+- [x] Merged as pull request 9 (squash commit `1950851`) after all 10 CI jobs passed on the exact
+      head. The closing security review corrected four trust-boundary findings, each with a
+      regression test: handoff evidence is authenticated with the existing `EvidenceSigner`
+      instead of trusting a label; evidence-producing workers require a controller; the binding
+      gained a host-assigned `identity_digest`; artifact handoffs are same-run scoped.
+- Still open after closure: a real external model has not yet run through this stack (see the
+  live provider validation checkpoint below).
+
+### Live provider validation (opt-in, manual)
+
+- [x] `scripts/live_validation.py`: a small harness that runs a real OpenAI or Ollama model as
+      Tester through `AgentRuntimeWorker`, `TaskScheduler`, the Docker sandbox, signed evidence
+      and the completion gate, with request, step, tool-call, token, time and budget limits and a
+      redacted report. Nothing external runs without `--live`; CI exercises it only with scripted
+      fakes. See `docs/live-validation.md`.
+- Not verified by CI: any real provider result. Live runs are manual and recorded separately.
 
 ### M7 design items (not started)
 
