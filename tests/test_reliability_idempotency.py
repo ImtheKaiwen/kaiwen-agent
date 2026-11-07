@@ -285,3 +285,25 @@ def test_local_supervised_and_read_only_usage_needs_no_durable_store() -> None:
         assert result.text == "done"
 
     asyncio.run(scenario())
+
+
+def test_cancelled_first_call_resolves_waiting_duplicates_without_hanging() -> None:
+    async def scenario() -> None:
+        handler = _Counter(delay=30)
+        executor = ToolExecutor()
+        first = asyncio.create_task(
+            executor.execute(_tool(handler), _call(), _context(), execution_scope="r")
+        )
+        await asyncio.sleep(0.02)
+        second = asyncio.create_task(
+            executor.execute(_tool(handler), _call(), _context(), execution_scope="r")
+        )
+        await asyncio.sleep(0.02)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        with pytest.raises(ToolExecutionError):
+            await asyncio.wait_for(second, timeout=5)
+        assert handler.calls == 1
+
+    asyncio.run(scenario())

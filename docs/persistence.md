@@ -75,6 +75,17 @@ provider reconciliation or human review. Recovery must hold an injected `LeaseSt
 multi-host deployments must use a distributed implementation and enforce fencing at
 the protected write boundary. This is at-least-once execution, not exactly-once.
 
+## Run ownership and recovery
+
+`WorkflowController` accepts an optional `LeaseStore`. While it executes a run it
+heartbeats a lease named `runtime-run:<run id>`, records the key on the run, and stops
+without writing state if the lease is lost or if another executor already holds it
+(`RunOwnershipError`). `RuntimeRecoveryManager.reconcile` blocks `RUNNING` runs whose
+recorded lease nobody holds (`owner_lost`). Runs with no recorded lease are left alone
+because age alone does not prove the process died, and recovery never resumes a run
+automatically. The in-memory lease store protects a single process; use a shared store,
+such as the Redis adapter, across nodes.
+
 ## SSE
 
 `SSEEventBroker` can persist an event to another sink and fan it out to active

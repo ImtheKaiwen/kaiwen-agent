@@ -11,6 +11,8 @@ import asyncio
 import contextlib
 from typing import Any
 
+import pytest
+
 from kaiwen_agent.resources import ResourceManager
 from kaiwen_agent.tasks import AgentTask, TaskGraph, TaskScheduler, TaskStatus
 from kaiwen_agent.workers import FunctionWorker, WorkerRegistry
@@ -63,5 +65,51 @@ def test_cancelling_a_scheduler_that_waits_for_a_resource_does_not_hang() -> Non
             await asyncio.wait_for(run, timeout=5)
         assert waiting.graph.get("w1").status == TaskStatus.CANCELLED
         await resources.release("external-holder")
+
+    asyncio.run(scenario())
+
+
+def test_internal_scheduler_error_stops_the_other_running_workers() -> None:
+    from kaiwen_agent.tasks import InMemoryTaskStore
+
+    class _FailingStore(InMemoryTaskStore):
+        async def save_task(self, task: AgentTask) -> None:
+            if task.id == "fast" and task.status in {TaskStatus.COMPLETED, TaskStatus.FAILED}:
+                raise RuntimeError("task store unavailable")
+            await super().save_task(task)
+
+    async def scenario() -> None:
+        slow_cancelled = asyncio.Event()
+        slow_started = asyncio.Event()
+
+        async def fast(task: AgentTask, context: Any) -> dict[str, Any]:
+            await slow_started.wait()
+            return {}
+
+        async def slow(task: AgentTask, context: Any) -> dict[str, Any]:
+            slow_started.set()
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                slow_cancelled.set()
+                raise
+            return {}
+
+        workers = WorkerRegistry()
+        workers.register("fast", FunctionWorker(fast))
+        workers.register("slow", FunctionWorker(slow))
+        graph = TaskGraph(
+            [
+                AgentTask(id="fast", name="fast", agent_id="fast"),
+                AgentTask(id="slow", name="slow", agent_id="slow"),
+            ]
+        )
+        scheduler = TaskScheduler(graph=graph, workers=workers, store=_FailingStore())
+        with pytest.raises(Exception):  # noqa: B017 - any internal error must clean up
+            await asyncio.wait_for(scheduler.run(), timeout=10)
+
+        assert slow_cancelled.is_set(), "a worker was orphaned by the scheduler error"
+        assert graph.get("slow").status == TaskStatus.CANCELLED
+        assert asyncio.all_tasks() == {asyncio.current_task()}
 
     asyncio.run(scenario())

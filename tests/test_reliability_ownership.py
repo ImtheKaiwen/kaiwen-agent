@@ -228,3 +228,32 @@ def test_recovery_never_resumes_a_blocked_run_and_is_idempotent(tmp_path) -> Non
         assert record is not None and record.status == RuntimeRunStatus.BLOCKED
 
     asyncio.run(scenario())
+
+
+def test_transient_lease_renewal_errors_are_retried_until_expiry(tmp_path) -> None:
+    class _FlakyLeases(InMemoryLeaseStore):
+        failures = 1
+
+        async def renew(
+            self, lease: DistributedLease, *, ttl_seconds: float, now: datetime | None = None
+        ) -> DistributedLease | None:
+            if self.failures:
+                self.failures -= 1
+                raise RuntimeError("lease store unavailable")
+            return await super().renew(lease, ttl_seconds=ttl_seconds, now=now)
+
+    async def scenario() -> None:
+        store = SQLitePersistence(tmp_path / "owner.sqlite3")
+
+        async def work(task: Any, context: Any) -> dict[str, Any]:
+            await asyncio.sleep(0.6)
+            return {}
+
+        _, run = await _runtime_run(store)
+        leases = _FlakyLeases()
+        outcome = await _execute(_controller(store, work, leases=leases, ttl=1.2), run)
+
+        assert outcome.status == WorkflowOutcomeStatus.COMPLETED
+        assert leases.failures == 0, "the failing renewal was never attempted"
+
+    asyncio.run(scenario())

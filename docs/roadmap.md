@@ -231,7 +231,7 @@ small, independently reviewable changes with their own acceptance criteria.
   PyPI artifact upload have not been exercised, by design), Python 3.11 and 3.13
   locally.
 
-### M4: Security hardening (in review)
+### M4: Security hardening (completed)
 
 Scope: reproduce concrete defects with failing tests, then fix them in the existing
 implementation. No second policy engine or tool pipeline was added.
@@ -280,31 +280,70 @@ implementation. No second policy engine or tool pipeline was added.
   filtered by current path only (a renamed protected file appears under its ordinary
   name), `git.log` shows commit metadata, and secrets inside ordinary files are not
   detected. Hosts must still isolate untrusted local processes.
-- [~] Not complete until pull request CI passes on the exact head and the owner
+- [x] Merged as pull request 4 (squash commit `4c5ff65`) after exact-head CI passed
+      (10 checks).
+
+### M5: Runtime and multi-agent reliability (in review)
+
+Each item was reproduced with a failing test before its fix (see ADR 0011).
+
+- [x] Cancellation: `Agent.run` ended `running`, `TaskScheduler.run()` left the worker
+      running and its resource locked, `WorkflowController` left the durable run
+      `running`, and `JobManager.wait()` swallowed its caller's cancellation. All
+      observed and fixed; cancelled is distinct from failed (`run.cancelled`, updated
+      JSON Schema, TypeScript, UI state, and a Python/schema/TypeScript consistency
+      test). Interrupted durable side effects become `UNCERTAIN`; a workflow with an
+      executing or uncertain action is `BLOCKED`, not `CANCELLED`.
+- [x] Idempotency: concurrent identical side-effecting calls ran twice and a key could
+      be reused with different arguments. Both observed and fixed on the in-memory and
+      durable paths; uncertain outcomes are never replayed (tested across restart).
+      Autonomous side-effecting tools now require a durable action-intent store.
+- [x] Tool and provider errors: opt-in sanitized, bounded `tool_errors="return"`;
+      fatal classes unchanged; malformed OpenAI arguments raise `ModelResponseError`;
+      transient failures are classified by default in `FailoverModelProvider` (locality
+      and state affinity unchanged); OpenAI `timeout` and `max_retries`, Ollama
+      `timeout`; contract tests built on the real `openai` response models and
+      exception classes.
+- [x] Recovery: unobserved `CodingKit` background exceptions observed and fixed; loss
+      of a still-running discarded task was suspected but not reproducible, so strong
+      references were added as hardening. Stale `RUNNING` runs are handled with a
+      heartbeat ownership lease and `owner_lost` blocking in recovery; runs without a
+      lease are never guessed at and nothing resumes automatically.
+- [x] Multi-agent: deterministic integration tests over `TeamRuntime`,
+      `SubagentDelegator`, `JobManager`, and the scheduler (delegation chain, failure
+      propagation, cancellation cascade, capability and depth bounds, serialized
+      writers). They exposed one more observed defect, fixed: jobs sharing a resource
+      key failed with `SchedulerStalledError` instead of waiting.
+- Coverage of the reliability paths (branch coverage, local run of the full suite):
+  `agent.py` 96%, `tools/execution.py` 92%, `models/openai.py` 94%,
+  `models/failover.py` 90%, `models/errors.py` 94%, `runtime/durability.py` 94%,
+  `runtime/agent_runtime.py` 90%, `workflow/controller.py` 83%, `tasks/scheduler.py`
+  81%, `jobs/manager.py` 77%, `kits/coding/facade.py` 73%.
+- Not done or not verified: run-level wall-clock or token bound; first-party
+  `CodingRunControl` and `CodingTeamLauncher` presets (M6); a Gemini timeout option and
+  Gemini or Ollama transient classification against real SDK exceptions (the classifier
+  is covered with stand-in error shapes only); real PostgreSQL, Redis, and multi-process
+  verification of leases and single-flight; Windows 3.12 and 3.13 beyond CI.
+- Compatibility: `AgentRun.status` gains `cancelled`; `ToolResult` gains `is_error`;
+  `Agent` and `AgentRuntime` gain keyword-only options; `RuntimeRunRecord` gains an
+  optional `owner_lease_key`; action-intent ids no longer include the arguments
+  checksum; one durability test now expects `IdempotencyConflictError` for a
+  changed-argument replay.
+- [~] Not complete until the pull request CI passes on the exact head and the owner
       merges it.
-
-### M5: Runtime and multi-agent reliability (planned)
-
-- [ ] Explicit cancellation handling and terminal-state persistence in `Agent`,
-      `TaskScheduler`, and `JobManager`.
-- [ ] Decide the policy for tool and malformed-model-output errors during a run.
-- [ ] Provider error classification so failover is reachable with shipped adapters.
-- [ ] Run-level wall-clock or budget bound.
-- [ ] Durable action store requirement for side-effecting tools.
 
 ### Open risks from the initial audit
 
 These come from a read-only code review on 2026-11-07. Items are reproduced by a
 failing test before a fix is attempted; those not yet reproduced remain unverified.
 
-- `WorkspaceFilesystem.read_text` and `write_text` did not apply the ignore and
-  sensitive-path policy. Reproduced and fixed in M4 (pull request in review).
-- `Agent.run` and `TaskScheduler` handle `Exception` but not `CancelledError`,
-  which may leave run or task state non-terminal. Targeted by M5.
-- No first-party shipped provider adapter raises `RetryableModelProviderError`, so
-  initial-call failover depends on host-side classification.
-- The default idempotency store is in-memory and its lookup and write are not atomic.
-- Release verification omits four example runs that CI performs, and build checks
-  run only during release.
+- Filesystem and Git read policy bypasses: reproduced and fixed in M4.
+- `CancelledError` handling in `Agent` and `TaskScheduler`: reproduced and fixed in M5.
+- Failover reachability with shipped adapters: fixed in M5 by default transient
+  classification; Gemini and Ollama are covered with stand-in error shapes only.
+- Non-atomic idempotency: reproduced and fixed in M5.
+- Release verification gaps: addressed in M3 (shared verification workflow).
+- Still open: no run-level wall-clock or token bound; no first-party isolated command
+  runner; the M3 owner configuration items above.
 
 Publishing, deployment, and GitHub pushes remain separate explicit release steps.

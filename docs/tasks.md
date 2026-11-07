@@ -28,12 +28,22 @@ for message in messages:
 Checkpoints are written before pending control messages are applied. If cancellation
 arrives, the latest resumable state therefore remains available.
 
+## Stopping the scheduler
+
+Cancelling `TaskScheduler.run()` cancels and awaits every running worker, releases their
+resource locks, and ends unfinished tasks as `CANCELLED` with `task.cancelled` events;
+an internal scheduler error cleans up the same way. Cancellation is never recorded as
+failure. A worker interrupted in the middle of an external side effect has an unknown
+outcome, which the tool layer records as `UNCERTAIN` (see ADR 0011).
+
 ## Resource and concurrency rules
 
 Dependencies must be completed before a task becomes ready. Independent ready tasks
 may execute concurrently up to the global and per-agent limits. Resource keys are
 acquired as one atomic set, preventing partial-lock deadlocks. Capacity defaults to
-one unless configured otherwise.
+one unless configured otherwise. Schedulers that share a `ResourceManager`, such as
+the per-job schedulers of the job runtime, wait for a resource held by another
+scheduler instead of failing; the wait is cancellable and has no timeout.
 
 ## Retry rules
 
