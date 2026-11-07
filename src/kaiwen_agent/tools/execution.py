@@ -16,6 +16,7 @@ from kaiwen_agent.exceptions import (
     ActionOutcomeUncertainError,
     ApprovalDeniedError,
     ApprovalRequiredError,
+    IdempotencyConflictError,
     PermissionDeniedError,
     ToolExecutionError,
     ToolTimeoutError,
@@ -23,6 +24,7 @@ from kaiwen_agent.exceptions import (
 )
 from kaiwen_agent.policy import (
     PolicyContext,
+    PolicyDecision,
     PolicyDecisionType,
     PolicyEngine,
     ToolApprovalPolicy,
@@ -63,6 +65,9 @@ class ToolExecutor:
         )
         self.policy_engine = policy_engine or PolicyEngine(audit_store=audit_store)
         self.action_intent_store = action_intent_store
+        # Process-local single-flight for identical scoped operations. Cross-process
+        # exclusion is the durable action-intent store's atomic claim.
+        self._inflight: dict[str, tuple[str, asyncio.Future[ToolResult]]] = {}
 
     async def execute(
         self,
@@ -151,6 +156,118 @@ class ToolExecutor:
             arguments_checksum=arguments_checksum,
             idempotency_identity=idempotency_identity,
         )
+        flight_key = self._flight_key(
+            context,
+            definition,
+            call,
+            execution_scope=execution_scope,
+            action_intent=action_intent,
+        )
+
+        def run() -> Awaitable[ToolResult]:
+            return self._execute_guarded(
+                definition,
+                call,
+                context,
+                arguments,
+                decision,
+                execution_scope=execution_scope,
+                emit=emit,
+                arguments_checksum=arguments_checksum,
+                idempotency_identity=idempotency_identity,
+                action_intent=action_intent,
+            )
+
+        if flight_key is None:
+            return await run()
+        return await self._single_flight(
+            flight_key,
+            arguments_checksum,
+            call,
+            definition,
+            emit,
+            action_intent_id=action_intent.id if action_intent is not None else None,
+            run=run,
+        )
+
+    def _flight_key(
+        self,
+        context: AgentContext,
+        definition: ToolDefinition,
+        call: ToolCall,
+        *,
+        execution_scope: str,
+        action_intent: ActionIntentRecord | None,
+    ) -> str | None:
+        if action_intent is not None:
+            return action_intent.id
+        key = call.idempotency_key
+        if definition.side_effect != "none" and key is None:
+            key = f"{execution_scope}:{call.id}"
+        return _scoped_idempotency_key(context, definition.name, key) if key is not None else None
+
+    async def _single_flight(
+        self,
+        flight_key: str,
+        arguments_checksum: str,
+        call: ToolCall,
+        definition: ToolDefinition,
+        emit: ToolEventCallback,
+        *,
+        action_intent_id: str | None,
+        run: Callable[[], Awaitable[ToolResult]],
+    ) -> ToolResult:
+        current = self._inflight.get(flight_key)
+        if current is not None:
+            in_flight_checksum, in_flight = current
+            if in_flight_checksum != arguments_checksum:
+                raise IdempotencyConflictError(
+                    f"Idempotency key for {definition.name} is in use with different arguments"
+                )
+            result = await asyncio.shield(in_flight)
+            await emit(
+                "tool.completed",
+                {"tool": definition.name, "call_id": call.id, "cached": True},
+            )
+            return result.model_copy(update={"call_id": call.id})
+        future: asyncio.Future[ToolResult] = asyncio.get_running_loop().create_future()
+        self._inflight[flight_key] = (arguments_checksum, future)
+        try:
+            result = await run()
+        except BaseException as error:
+            waiter_error: BaseException = error
+            if isinstance(error, asyncio.CancelledError):
+                waiter_error = (
+                    ActionOutcomeUncertainError(
+                        "The in-flight duplicate action was interrupted",
+                        action_intent_id=action_intent_id,
+                    )
+                    if action_intent_id is not None
+                    else ToolExecutionError("The in-flight duplicate operation was cancelled")
+                )
+            future.set_exception(waiter_error)
+            future.exception()  # mark retrieved when no duplicate is waiting
+            raise
+        else:
+            future.set_result(result)
+            return result
+        finally:
+            self._inflight.pop(flight_key, None)
+
+    async def _execute_guarded(
+        self,
+        definition: ToolDefinition,
+        call: ToolCall,
+        context: AgentContext,
+        arguments: Any,
+        decision: PolicyDecision,
+        *,
+        execution_scope: str,
+        emit: ToolEventCallback,
+        arguments_checksum: str,
+        idempotency_identity: str,
+        action_intent: ActionIntentRecord | None,
+    ) -> ToolResult:
         action_store = self.action_intent_store
         if action_intent is not None:
             assert action_store is not None
@@ -159,6 +276,13 @@ class ToolExecutor:
                 tenant_id=action_intent.tenant_id,
                 user_id=action_intent.user_id,
             )
+            if (
+                existing_intent is not None
+                and existing_intent.arguments_checksum != arguments_checksum
+            ):
+                raise IdempotencyConflictError(
+                    f"Idempotency key for {definition.name} was used with different arguments"
+                )
             if (
                 existing_intent is not None
                 and existing_intent.status == ActionIntentStatus.SUCCEEDED
@@ -232,6 +356,11 @@ class ToolExecutor:
         if idempotency_key is not None and action_intent is None:
             cached = await self.idempotency_store.get(idempotency_key)
             if cached is not None:
+                recorded = await self.idempotency_store.get(_checksum_key(idempotency_key))
+                if recorded is not None and recorded.output != arguments_checksum:
+                    raise IdempotencyConflictError(
+                        f"Idempotency key for {definition.name} was used with different arguments"
+                    )
                 await self._audit(context, definition, call, "succeeded", {"cached": True})
                 await emit(
                     "tool.completed",
@@ -242,6 +371,10 @@ class ToolExecutor:
         if action_intent is not None:
             assert action_store is not None
             prepared = await action_store.prepare_action_intent(action_intent)
+            if prepared.arguments_checksum != arguments_checksum:
+                raise IdempotencyConflictError(
+                    f"Idempotency key for {definition.name} was used with different arguments"
+                )
             if prepared.status == ActionIntentStatus.SUCCEEDED and prepared.result is not None:
                 return prepared.result.model_copy(update={"call_id": call.id})
             claimed = await action_store.transition_action_intent(
@@ -291,6 +424,12 @@ class ToolExecutor:
                         )
                 if idempotency_key is not None:
                     await self.idempotency_store.put(idempotency_key, result)
+                    await self.idempotency_store.put(
+                        _checksum_key(idempotency_key),
+                        ToolResult(
+                            call_id=call.id, name=definition.name, output=arguments_checksum
+                        ),
+                    )
                 await self._audit(
                     context,
                     definition,
@@ -403,7 +542,6 @@ class ToolExecutor:
                 context.conversation_id or context.session_id,
                 definition.name,
                 idempotency_identity,
-                arguments_checksum,
             )
         )
         intent_id = f"intent_{sha256(stable_material.encode()).hexdigest()}"
@@ -464,6 +602,10 @@ async def execute_tool(
 def _arguments_checksum(arguments: dict[str, Any]) -> str:
     encoded = json.dumps(arguments, sort_keys=True, separators=(",", ":"), default=str)
     return sha256(encoded.encode()).hexdigest()
+
+
+def _checksum_key(idempotency_key: str) -> str:
+    return f"{idempotency_key}\x1fargs"
 
 
 def _scoped_idempotency_key(context: AgentContext, tool_name: str, key: str) -> str:

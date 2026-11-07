@@ -15,6 +15,7 @@ from kaiwen_agent.context_engine import (
     ContextWindow,
 )
 from kaiwen_agent.events import EventSink, InMemoryEventSink
+from kaiwen_agent.exceptions import DurableSideEffectsRequiredError
 from kaiwen_agent.models.base import ModelProvider
 from kaiwen_agent.runtime.models import AutonomyLevel, RunMode, RuntimeIdentity
 from kaiwen_agent.sessions import InMemoryRunStore, RunStore
@@ -100,6 +101,7 @@ class AgentRuntime:
             agent_input if isinstance(agent_input, AgentInput) else AgentInput(text=agent_input)
         )
         effective_autonomy = autonomy or self.default_autonomy
+        self._require_durable_side_effects(selected_tools, effective_autonomy)
         effective_services = {**self.services, **dict(services or {})}
         effective_identity = identity.model_copy(
             update={
@@ -171,6 +173,21 @@ class AgentRuntime:
             tool_names=tool_names,
             services=services,
         )
+
+    def _require_durable_side_effects(
+        self, tools: tuple[ToolDefinition, ...], autonomy: AutonomyLevel
+    ) -> None:
+        """Autonomous side effects need atomic, durable coordination before any model call."""
+
+        if autonomy != AutonomyLevel.AUTONOMOUS:
+            return
+        side_effecting = sorted(tool.name for tool in tools if tool.side_effect != "none")
+        store = self.tool_executor.action_intent_store
+        if side_effecting and not getattr(store, "is_durable", False):
+            raise DurableSideEffectsRequiredError(
+                "Autonomous side-effecting tools require a ToolExecutor with a durable "
+                f"action_intent_store: {', '.join(side_effecting)}"
+            )
 
     def _select_tools(self, tool_names: Sequence[str]) -> tuple[ToolDefinition, ...]:
         if len(tool_names) != len(set(tool_names)):

@@ -48,3 +48,11 @@ class ActionOutcomeUncertainError(ToolExecutionError):
     def __init__(self, message: str, *, action_intent_id: str) -> None:
         super().__init__(message)
         self.action_intent_id = action_intent_id
+
+
+class IdempotencyConflictError(AgentError):
+    """Raised when an idempotency key is reused with different canonical arguments."""
+
+
+class DurableSideEffectsRequiredError(AgentError):
+    """Raised when autonomous side effects are requested without durable coordination."""
