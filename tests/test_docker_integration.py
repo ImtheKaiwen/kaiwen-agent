@@ -667,3 +667,212 @@ def test_real_container_workflow_invalidates_evidence_when_the_coder_changes_sou
 
     asyncio.run(scenario())
     assert leftover_containers() == []
+
+
+def test_real_container_agent_runtime_worker_produces_gate_verified_evidence(
+    tmp_path: Path,
+) -> None:
+    """An AgentRuntime worker (deterministic scripted model) runs real tests in a container.
+
+    The model is scripted, so this proves the worker, binding, sandbox and evidence path, not
+    model quality. A false claim of success from the model changes nothing.
+    """
+
+    from kaiwen_agent.control import RunControl
+    from kaiwen_agent.kits.coding import (
+        AuthorizedCodingWorkspace,
+        TrustedEvidencePipeline,
+        WorkspaceFingerprintProvider,
+    )
+    from kaiwen_agent.models.fake import FakeModelProvider
+    from kaiwen_agent.persistence import SQLitePersistence
+    from kaiwen_agent.runtime import (
+        AgentRuntime,
+        AutonomyLevel,
+        DurableRunManager,
+        RuntimeIdentity,
+        RuntimeVersionPins,
+    )
+    from kaiwen_agent.tasks import TaskScheduler
+    from kaiwen_agent.toolkits import SnapshotBuilder, testing_tools
+    from kaiwen_agent.tools import ToolExecutor
+    from kaiwen_agent.types import ModelResponse, ToolCall
+    from kaiwen_agent.workers import FunctionWorker, WorkerRegistry
+    from kaiwen_agent.workflow import (
+        AgentRuntimeWorker,
+        WorkflowCompiler,
+        WorkflowController,
+        WorkflowOutcomeStatus,
+        WorkflowPlan,
+        WorkflowTaskSpec,
+    )
+
+    root, runner, _artifacts, _catalog_for, _gate = build_stack(tmp_path, (UNIT_TESTS,))
+    filesystem = runner.filesystem
+    artifacts = ArtifactManager()
+    pipeline = TrustedEvidencePipeline.build(
+        artifacts=artifacts,
+        signer=EvidenceSigner(key=b"agent-worker-integration-key-01"),
+        bindings=[
+            EvidenceBinding(
+                command_id="unit.tests",
+                requirement_id="coding.tests.run",
+                evidence_type="test_run",
+            )
+        ],
+        trusted_runners=[runner],
+    )
+    registry = VerifierRegistry()
+    pipeline.install_verifiers(registry)
+    gate = CompletionGate(verifiers=registry, artifacts=artifacts)
+    catalog = CommandCatalog(
+        filesystem=filesystem,
+        root="main",
+        runner=runner,
+        presets=(UNIT_TESTS,),
+        observers=(pipeline.recorder,),
+    )
+    provider = WorkspaceFingerprintProvider(SnapshotBuilder(filesystem, "main"))
+    workspace = AuthorizedCodingWorkspace(
+        filesystem=filesystem,
+        root="main",
+        fingerprints=provider,
+        catalog=catalog,
+        runner=runner,
+        pipeline=pipeline,
+    )
+    store = SQLitePersistence(tmp_path / "agent-worker.sqlite3")
+    runs = DurableRunManager(store)
+    workers = WorkerRegistry()
+
+    async def edit(task, task_context):  # type: ignore[no-untyped-def]
+        (root / "pkg" / "calc.py").write_text(str(task.input["content"]))
+        return {}
+
+    workers.register("editor", FunctionWorker(edit))
+
+    def scripted_runtime(*responses: ModelResponse) -> AgentRuntime:
+        return AgentRuntime(
+            name="tester",
+            model=FakeModelProvider(responses),
+            tools=testing_tools(catalog, unattended_categories=frozenset({"test"})),
+            permissions=frozenset({"tests.run"}),
+            tool_executor=ToolExecutor(action_intent_store=store),
+            max_steps=4,
+        )
+
+    run_tests = ToolCall(
+        id="call-1",
+        name="testing.run",
+        arguments={"command_id": "unit.tests", "parameters": {}},
+    )
+    controlled = WorkflowController(
+        runs=runs,
+        compiler=WorkflowCompiler(
+            workers=workers, worker_allowlist=frozenset({"tester", "editor"})
+        ),
+        scheduler_factory=lambda graph: TaskScheduler(
+            graph=graph,
+            workers=workers,
+            store=store,
+            control=RunControl(checkpoints=store),
+        ),
+        completion_gate=gate,
+        fingerprint_provider=provider,
+        workspace_binding=workspace.binding,
+    )
+    owner = RuntimeIdentity(
+        session_id="session-1", tenant_id="tenant-1", user_id="user-1", trace_id="trace-1"
+    )
+    pins = RuntimeVersionPins(
+        workspace_id="workspace",
+        workspace_version=1,
+        agent_id="agent",
+        agent_version=1,
+        prompt_id="prompt",
+        prompt_version=1,
+        prompt_checksum="prompt-checksum",
+        capability_manifest_id="agent",
+        capability_manifest_version=1,
+        provider_ref="fake",
+        tool_names=(),
+        toolset_checksum="toolset-checksum",
+    )
+
+    def tester_worker(runtime: AgentRuntime) -> AgentRuntimeWorker:
+        return AgentRuntimeWorker(
+            runtime=runtime,
+            runs=runs,
+            task_store=store,
+            role="tester",
+            permissions=frozenset({"tests.run"}),
+            tool_names=("testing.run",),
+            evidence_tool_names=frozenset({"testing.run"}),
+            workspace=workspace,
+            controller=controlled,
+            artifacts=artifacts,
+            fingerprints=provider,
+        )
+
+    async def start(workflow: WorkflowPlan):  # type: ignore[no-untyped-def]
+        run = await runs.create(
+            identity=owner,
+            autonomy=AutonomyLevel.AUTONOMOUS,
+            version_pins=pins,
+            workspace_binding=workspace.binding,
+        )
+        return await controlled.execute(
+            run=run,
+            identity=owner,
+            plan=workflow,
+            standards=resolution(),
+            protected_input_fingerprint="objective",
+        )
+
+    async def scenario() -> None:
+        passing = scripted_runtime(
+            ModelResponse(tool_calls=[run_tests]), ModelResponse(text="Tests executed.")
+        )
+        workers.register("tester", tester_worker(passing))
+        first = await start(
+            WorkflowPlan(
+                objective="Verify",
+                tasks=(WorkflowTaskSpec(id="verify", name="Run tests", worker_id="tester"),),
+            )
+        )
+        assert first.status == WorkflowOutcomeStatus.COMPLETED
+        output = first.tasks[0].output
+        assert output is not None
+        assert output["verified"] is False and len(output["evidence_refs"]) == 1
+        assert first.verified_input_fingerprint == provider.builder.fingerprint()
+
+        # The model claims success after the source was broken; the real container disagrees.
+        lying = scripted_runtime(
+            ModelResponse(tool_calls=[run_tests]), ModelResponse(text="All tests pass!")
+        )
+        workers._workers["tester"] = tester_worker(lying)  # type: ignore[attr-defined]
+        second = await start(
+            WorkflowPlan(
+                objective="Break and verify",
+                tasks=(
+                    WorkflowTaskSpec(
+                        id="break",
+                        name="Break",
+                        worker_id="editor",
+                        input={"content": "def add(a, b):\n    return a - b\n"},
+                    ),
+                    WorkflowTaskSpec(
+                        id="verify",
+                        name="Run tests",
+                        worker_id="tester",
+                        dependencies=("break",),
+                    ),
+                ),
+            )
+        )
+        assert second.status == WorkflowOutcomeStatus.BLOCKED
+        verify = [task for task in second.tasks if task.agent_id == "tester"][0]
+        assert verify.output is not None and "All tests pass" in verify.output["summary"]
+
+    asyncio.run(scenario())
+    assert leftover_containers() == []
