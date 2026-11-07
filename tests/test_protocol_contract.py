@@ -41,3 +41,30 @@ def test_agent_event_redacts_secrets_at_the_contract_boundary() -> None:
         "authorization": "[REDACTED]",
         "message": "Provider rejected [REDACTED]",
     }
+
+
+def test_python_schema_and_typescript_event_types_stay_identical() -> None:
+    import re
+    import typing
+
+    from kaiwen_agent.events import EventType
+
+    schema = json.loads(
+        (FIXTURES.parent / "schemas" / "event-envelope.schema.json").read_text(encoding="utf-8")
+    )
+    source = (FIXTURES.parent / "src" / "index.ts").read_text(encoding="utf-8")
+    constant = source[source.index("AGENT_EVENT_TYPES = [") :]
+    constant = constant[: constant.index("] as const")]
+    union = source[source.index("export type AgentEventType") :]
+    union = union[: union.index(";")]
+
+    python_types = set(typing.get_args(EventType))
+    assert python_types == set(schema["properties"]["type"]["enum"])
+    assert python_types == set(re.findall(r'"([^"]+)"', constant))
+    assert python_types == set(re.findall(r'"([^"]+)"', union))
+    assert "run.cancelled" in python_types
+
+
+def test_cancelled_run_event_validates_against_the_python_contract() -> None:
+    event = AgentEvent(type="run.cancelled", trace_id="trace_1", session_id="session_1")
+    assert event.type == "run.cancelled"

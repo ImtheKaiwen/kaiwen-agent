@@ -97,6 +97,14 @@ export function reduceAgentEvent(state: AgentUIState, event: AgentEvent): AgentU
       };
     case "task.completed":
       return { ...base, mode: "result", progress: 1 };
+    case "run.cancelled":
+      return {
+        ...base,
+        mode: "result",
+        activeTool: undefined,
+        progress: undefined,
+        error: stringValue(payload.message) || "Run cancelled",
+      };
     case "task.cancelled":
       return {
         ...base,

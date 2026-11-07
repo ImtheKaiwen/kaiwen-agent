@@ -308,6 +308,22 @@ class ToolExecutor:
                     },
                 )
                 return result
+            except asyncio.CancelledError:
+                if action_intent is not None:
+                    assert action_store is not None
+                    # The handler may have produced an external effect before it was
+                    # interrupted, so the outcome is unknown and must not be replayed.
+                    await asyncio.shield(
+                        action_store.transition_action_intent(
+                            intent_id=action_intent.id,
+                            tenant_id=action_intent.tenant_id,
+                            user_id=action_intent.user_id,
+                            expected=frozenset({ActionIntentStatus.EXECUTING}),
+                            status=ActionIntentStatus.UNCERTAIN,
+                            error_code="cancelled_in_flight",
+                        )
+                    )
+                raise
             except ActionOutcomeUncertainError as error:
                 last_error = error
                 retryable = False

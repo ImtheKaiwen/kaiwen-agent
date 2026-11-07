@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import suppress
 from functools import partial
 from uuid import uuid4
 
@@ -195,8 +194,9 @@ class JobManager:
         await self._owned(context, job_id)
         background = self._background.get(job_id)
         if background is not None:
-            with suppress(asyncio.CancelledError):
-                await background
+            # asyncio.wait returns when the job task finishes or is cancelled, but a
+            # cancellation of this caller still propagates and never cancels the job.
+            await asyncio.wait({background})
         return await self._owned(context, job_id)
 
     def _start(self, job: AgentJob) -> None:

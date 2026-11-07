@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -123,6 +124,10 @@ class Agent:
                     pending_tool_results.append(tool_result)
 
             raise RuntimeError(f"Agent exceeded max_steps={self.max_steps}")
+        except asyncio.CancelledError:
+            # Cancellation is a distinct terminal state, recorded even if cancelled again.
+            await asyncio.shield(self._record_cancellation(run, trace_id, effective_context))
+            raise
         except Exception as error:
             run.status = "failed"
             run.completed_at = datetime.now(UTC)
@@ -135,6 +140,14 @@ class Agent:
                 effective_context,
             )
             raise
+
+    async def _record_cancellation(
+        self, run: AgentRun, trace_id: str, context: AgentContext
+    ) -> None:
+        run.status = "cancelled"
+        run.completed_at = datetime.now(UTC)
+        await self.run_store.save(run)
+        await self._emit("run.cancelled", run, trace_id, {"agent": self.name}, context)
 
     async def _emit(
         self,

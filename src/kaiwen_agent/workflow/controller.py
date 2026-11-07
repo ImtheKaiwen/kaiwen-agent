@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable
 from hashlib import sha256
 from typing import Protocol
@@ -21,6 +22,7 @@ from kaiwen_agent.runtime import (
 )
 from kaiwen_agent.standards import StandardResolution
 from kaiwen_agent.tasks import AgentTask, TaskGraph, TaskScheduler, TaskStatus
+from kaiwen_agent.tools.durability import ActionIntentStatus, ActionIntentStore
 from kaiwen_agent.workflow.compiler import WorkflowCompiler, WorkflowPlanError
 from kaiwen_agent.workflow.models import (
     WorkflowLimits,
@@ -33,6 +35,8 @@ from kaiwen_agent.workflow.models import (
 )
 
 SchedulerFactory = Callable[[TaskGraph], TaskScheduler]
+
+logger = logging.getLogger(__name__)
 
 
 class WorkflowRevisionPlanner(Protocol):
@@ -52,6 +56,7 @@ class WorkflowController:
         repair_tracker: RepairTracker | None = None,
         revision_planner: WorkflowRevisionPlanner | None = None,
         limits: WorkflowLimits | None = None,
+        action_intents: ActionIntentStore | None = None,
     ) -> None:
         self.runs = runs
         self.compiler = compiler
@@ -60,8 +65,63 @@ class WorkflowController:
         self.repair_limits = (repair_tracker or RepairTracker()).limits
         self.revision_planner = revision_planner
         self.limits = limits or compiler.limits
+        # Optional: lets cancellation distinguish a safe stop from an unknown
+        # external outcome. Without it, cancellation is recorded as CANCELLED.
+        self.action_intents = action_intents
 
     async def execute(
+        self,
+        *,
+        run: RuntimeRunRecord,
+        identity: RuntimeIdentity,
+        plan: WorkflowPlan,
+        standards: StandardResolution,
+        protected_input_fingerprint: str,
+    ) -> WorkflowOutcome:
+        try:
+            return await self._execute(
+                run=run,
+                identity=identity,
+                plan=plan,
+                standards=standards,
+                protected_input_fingerprint=protected_input_fingerprint,
+            )
+        except asyncio.CancelledError:
+            await asyncio.shield(self._record_cancellation(run=run, identity=identity))
+            raise
+
+    async def _record_cancellation(
+        self, *, run: RuntimeRunRecord, identity: RuntimeIdentity
+    ) -> None:
+        try:
+            uncertain = await self._uncertain_actions(run)
+            if uncertain:
+                await self.runs.block(
+                    run_id=run.id,
+                    identity=identity,
+                    reason=f"uncertain_action:{uncertain[0]}",
+                )
+            else:
+                await self.runs.cancel(run_id=run.id, identity=identity)
+        except (KeyError, ValueError):
+            logger.warning("Could not record cancellation for run %s", run.id, exc_info=True)
+
+    async def _uncertain_actions(self, run: RuntimeRunRecord) -> list[str]:
+        if self.action_intents is None:
+            return []
+        intents = await self.action_intents.list_action_intents(
+            statuses=frozenset({ActionIntentStatus.EXECUTING, ActionIntentStatus.UNCERTAIN}),
+            limit=1_000,
+        )
+        return sorted(
+            intent.id
+            for intent in intents
+            if intent.runtime_run_id == run.id
+            and intent.tenant_id == run.tenant_id
+            and intent.user_id == run.user_id
+        )
+
+    async def _execute(
         self,
         *,
         run: RuntimeRunRecord,

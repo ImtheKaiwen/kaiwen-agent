@@ -72,6 +72,6 @@ class AgentRun(BaseModel):
 
     id: str = Field(default_factory=lambda: f"run_{uuid4().hex}")
     session_id: str
-    status: Literal["created", "running", "completed", "failed"] = "created"
+    status: Literal["created", "running", "completed", "failed", "cancelled"] = "created"
     created_at: datetime = Field(default_factory=utc_now)
     completed_at: datetime | None = None

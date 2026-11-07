@@ -131,3 +131,14 @@ test("runtime connects, advertises capabilities, and follows island states", asy
   assert.equal(transport.closed, true);
   assert.equal(runtime.getState().sessionId, null);
 });
+
+test("a cancelled run is a result state with its own message, distinct from failure", async () => {
+  const transport = new FakeTransport();
+  const runtime = new AgentUIRuntime(transport, new ActionRegistry(), []);
+  await runtime.connect("session-1");
+  await runtime.handleEvent(event("run.started", {}));
+  await runtime.handleEvent(event("run.cancelled", {}, "evt_cancelled"));
+  assert.equal(runtime.getState().mode, "result");
+  assert.equal(runtime.getState().error, "Run cancelled");
+  assert.equal(runtime.getState().activeTool, undefined);
+});
