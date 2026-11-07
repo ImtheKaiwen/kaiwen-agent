@@ -112,6 +112,10 @@ class SandboxResult(BaseModel):
     image_ref: str | None = None
     image_id: str | None = None
     output_truncated: bool = False
+    # None: the runner did not check. False: a file of the captured snapshot was changed
+    # or removed while the command ran (new files are allowed); see `modified_paths`.
+    snapshot_unchanged: bool | None = None
+    modified_paths: tuple[str, ...] = ()
 
 
 class SandboxRunner(Protocol):
@@ -126,6 +130,8 @@ class CommandExecution:
     preset: CommandPreset
     parameters: Mapping[str, str]
     result: SandboxResult
+    # The runner object the host configured on the catalog, never taken from the result.
+    runner: object
 
 
 class CommandExecutionObserver(Protocol):
@@ -270,6 +276,7 @@ class CommandCatalog:
                             preset=preset,
                             parameters=dict(values),
                             result=redacted,
+                            runner=self.runner,
                         )
                     )
                 )

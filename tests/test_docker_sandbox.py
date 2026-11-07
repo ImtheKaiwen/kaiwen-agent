@@ -9,7 +9,9 @@ That is covered by `tests/test_docker_integration.py`, which needs a real engine
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping, Sequence
+import os
+import stat
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 import pytest
@@ -93,7 +95,10 @@ class FakeDocker:
         image_known: bool = True,
         image_digests: str | None = None,
         run: FakeProcess | None = None,
+        on_run: Callable[[Path], None] | None = None,
     ) -> None:
+        self.on_run = on_run
+        self.mount_modes: list[int] = []
         self.server_os = server_os
         self.image_known = image_known
         self.image_digests = image_digests if image_digests is not None else f"python@{DIGEST}"
@@ -120,6 +125,9 @@ class FakeDocker:
                 if item.startswith("type=bind,source="):
                     source = Path(item.split("source=", 1)[1].split(",target=", 1)[0])
                     self.mounts.append(source)
+                    self.mount_modes.append(stat.S_IMODE(source.parent.stat().st_mode))
+                    if self.on_run is not None:
+                        self.on_run(source)
                     self.mount_snapshots.append(
                         {
                             path.relative_to(source).as_posix(): path.read_text()
@@ -470,3 +478,66 @@ def test_workspace_with_symlink_or_secret_is_not_executed_unsafely(tmp_path: Pat
     asyncio.run(runner.run(command(root)))
     assert all(".env" not in snapshot for snapshot in docker.mount_snapshots)
     assert all("secret-value" not in text for s in docker.mount_snapshots for text in s.values())
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
+def test_run_directory_is_unreachable_by_other_local_users(tmp_path: Path) -> None:
+    """The per-run copy is world-writable inside, so its parent must be owner-only."""
+
+    docker = FakeDocker()
+    runner, root, _ = make_runner(tmp_path, docker)
+    asyncio.run(runner.run(command(root)))
+    assert docker.mount_modes and all(mode & 0o077 == 0 for mode in docker.mount_modes)
+
+
+def test_unmodified_snapshot_is_reported_after_a_normal_run(tmp_path: Path) -> None:
+    def add_output(mount: Path) -> None:
+        (mount / "new-output.txt").write_text("test artifact")  # new files are legitimate
+
+    runner, root, _ = make_runner(tmp_path, FakeDocker(on_run=add_output))
+    result = asyncio.run(runner.run(command(root)))
+    assert result.snapshot_unchanged is True and result.modified_paths == ()
+
+
+@pytest.mark.parametrize("mutation", ["edit", "delete", "touch-content"])
+def test_modifying_snapshot_files_during_a_command_is_detected(
+    tmp_path: Path, mutation: str
+) -> None:
+    def mutate(mount: Path) -> None:
+        target = mount / "pkg" / "mod.py"
+        if mutation == "delete":
+            target.unlink()
+        elif mutation == "edit":
+            target.write_text("VALUE = 2\n")
+        else:
+            target.write_text("VALUE = 1\n ")  # same prefix, different bytes and size
+
+    runner, root, _ = make_runner(tmp_path, FakeDocker(on_run=mutate))
+    result = asyncio.run(runner.run(command(root)))
+    assert result.exit_code == 0
+    assert result.snapshot_unchanged is False
+    assert result.modified_paths == ("pkg/mod.py",)
+    assert (root / "pkg" / "mod.py").read_text() == "VALUE = 1\n"
+
+
+def test_replacing_a_snapshot_file_with_a_symlink_is_detected(tmp_path: Path) -> None:
+    def swap(mount: Path) -> None:
+        target = mount / "pkg" / "mod.py"
+        target.unlink()
+        try:
+            target.symlink_to(mount / "README.md")
+        except (OSError, NotImplementedError):
+            pytest.skip("Symbolic links cannot be created on this host")
+
+    runner, root, _ = make_runner(tmp_path, FakeDocker(on_run=swap))
+    result = asyncio.run(runner.run(command(root)))
+    assert result.snapshot_unchanged is False
+
+
+def test_modification_is_reported_after_a_timeout_too(tmp_path: Path) -> None:
+    docker = FakeDocker(
+        run=FakeProcess(hang=True), on_run=lambda m: (m / "README.md").write_text("x")
+    )
+    runner, root, _ = make_runner(tmp_path, docker)
+    result = asyncio.run(runner.run(command(root, timeout=0.2)))
+    assert result.timed_out and result.snapshot_unchanged is False

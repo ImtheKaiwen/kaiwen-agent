@@ -115,6 +115,27 @@ class ExecutionSnapshot:
                 mode &= 0o755 if item.executable else 0o644
             _chmod(target, mode)
 
+    def changed_paths(self, directory: Path, *, limit: int = 20) -> tuple[str, ...]:
+        """Snapshot files that are missing or differ in `directory` (new files are ignored).
+
+        A file replaced by a symbolic link or a special file counts as changed. This is a
+        post-hoc comparison against the recorded digests, not a guarantee that the bytes
+        stayed unchanged for the whole run.
+        """
+
+        self._require_open()
+        changed: list[str] = []
+        for item in self.files:
+            try:
+                data = _read_regular_file(directory / PurePosixPath(item.path), item.size)
+            except SnapshotError:
+                data = None
+            if data is None or sha256(data).hexdigest() != item.sha256:
+                changed.append(item.path)
+                if len(changed) >= limit:
+                    break
+        return tuple(changed)
+
     def close(self) -> None:
         if self._closed:
             return

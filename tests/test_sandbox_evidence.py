@@ -70,6 +70,7 @@ def result(
     cancelled: bool = False,
     fingerprint: str | None = FINGERPRINT,
     stdout: str = "OK",
+    unchanged: bool | None = True,
 ) -> SandboxResult:
     return SandboxResult(
         exit_code=exit_code,
@@ -80,6 +81,7 @@ def result(
         snapshot_fingerprint=fingerprint,
         image_ref="python@sha256:" + "a" * 64,
         image_id="sha256:" + "b" * 64,
+        snapshot_unchanged=unchanged,
     )
 
 
@@ -113,6 +115,7 @@ class Harness:
         self.recorder = CommandEvidenceRecorder(
             artifacts=self.artifacts,
             signer=SIGNER,
+            trusted_runners=[runner],
             bindings=[
                 EvidenceBinding(
                     command_id="unit.tests",
@@ -552,5 +555,106 @@ def test_legacy_unsigned_verifier_keeps_accepting_host_written_json(tmp_path: Pa
             ),
         )
         assert evaluated.status == CompletionGateStatus.PASS
+
+    run(scenario())
+
+
+FORGED = SandboxResult(
+    exit_code=0,
+    stdout="forged pass",
+    duration_seconds=0.1,
+    snapshot_fingerprint=FINGERPRINT,
+    image_ref="python@sha256:" + "a" * 64,
+    image_id="sha256:" + "b" * 64,
+    snapshot_unchanged=True,
+)
+
+
+def test_fake_runner_with_forged_result_fields_cannot_produce_trusted_evidence(
+    tmp_path: Path,
+) -> None:
+    """Result metadata is not provenance: only runners the host trusts are recorded."""
+
+    trusted = ScriptedRunner(result())
+    fake = FakeSandboxRunner({"unit.tests": FORGED})
+    harness = Harness(tmp_path, trusted)  # the recorder trusts only `trusted`
+    harness.catalog.runner = fake  # type: ignore[assignment]
+
+    async def scenario() -> None:
+        executed = await harness.execute()
+        assert executed.exit_code == 0 and executed.snapshot_fingerprint == FINGERPRINT
+        assert executed.artifact_refs == ()
+        gate = await harness.evaluate()
+        assert gate.status == CompletionGateStatus.BLOCKED
+
+    run(scenario())
+
+
+def test_untrusted_custom_runner_is_not_recorded_even_with_a_domain_look_alike(
+    tmp_path: Path,
+) -> None:
+    class Imposter:
+        provenance_domain = object()  # a different domain than the trusted runner's
+
+        async def run(self, command: SandboxCommand) -> SandboxResult:
+            return FORGED
+
+    harness = Harness(tmp_path, ScriptedRunner(result()))
+    harness.catalog.runner = Imposter()  # type: ignore[assignment]
+
+    async def scenario() -> None:
+        assert (await harness.execute()).artifact_refs == ()
+        assert (await harness.evaluate()).status == CompletionGateStatus.BLOCKED
+
+    run(scenario())
+
+
+def test_bound_docker_runner_shares_its_roots_provenance_domain(tmp_path: Path) -> None:
+    root = DockerSandboxRunner(
+        DockerSandboxConfig(image="python@sha256:" + "a" * 64, docker_path="/x/docker"),
+        filesystem=WorkspaceFilesystem(workspace_id="workspace-1", roots={"main": tmp_path}),
+        root="main",
+    )
+    other = DockerSandboxRunner(
+        DockerSandboxConfig(image="python@sha256:" + "a" * 64, docker_path="/x/docker"),
+        filesystem=root.filesystem,
+        root="main",
+    )
+    snapshot = root.capture()
+    recorder = CommandEvidenceRecorder(
+        artifacts=ArtifactManager(), signer=SIGNER, trusted_runners=[root], bindings=[]
+    )
+    assert recorder.trusts(root)
+    assert recorder.trusts(root.bound_to(snapshot))
+    assert not recorder.trusts(other)
+    assert not recorder.trusts(FakeSandboxRunner())
+    snapshot.close()
+
+
+def test_recorder_requires_an_explicit_trusted_runner() -> None:
+    with pytest.raises(ValueError):
+        CommandEvidenceRecorder(
+            artifacts=ArtifactManager(), signer=SIGNER, trusted_runners=[], bindings=[]
+        )
+
+
+@pytest.mark.parametrize(
+    ("scripted", "finding"),
+    [
+        (result(unchanged=False), "command_snapshot_modified"),
+        (result(unchanged=None), "command_unverified"),
+    ],
+    ids=["modified", "not-verified"],
+)
+def test_passing_exit_code_without_verified_unmodified_snapshot_never_passes(
+    tmp_path: Path, scripted: SandboxResult, finding: str
+) -> None:
+    harness = Harness(tmp_path, ScriptedRunner(scripted))
+
+    async def scenario() -> None:
+        await harness.execute()
+        gate = await harness.evaluate()
+        assert gate.status == CompletionGateStatus.BLOCKED
+        assert finding in gate.verifications[0].findings
 
     run(scenario())

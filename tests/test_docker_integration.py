@@ -96,11 +96,20 @@ TEST_CASE = (
 )
 
 
-def build_stack(tmp_path: Path, presets: tuple[CommandPreset, ...], **config: object):  # type: ignore[no-untyped-def]
+def build_stack(
+    tmp_path: Path,
+    presets: tuple[CommandPreset, ...],
+    files: dict[str, str] | None = None,
+    **config: object,
+):  # type: ignore[no-untyped-def]
     root = tmp_path / "project"
     (root / "pkg").mkdir(parents=True)
     (root / "tests").mkdir()
     (root / "pkg" / "__init__.py").write_text("")
+    # unittest discovery with a top-level directory needs an importable start package
+    (root / "tests" / "__init__.py").write_text("")
+    for name, content in (files or {}).items():
+        (root / name).write_text(content)
     (root / "pkg" / "calc.py").write_text(TEST_SOURCE)
     (root / "tests" / "test_calc.py").write_text(TEST_CASE)
     filesystem = WorkspaceFilesystem(workspace_id="workspace-1", roots={"main": root})
@@ -114,6 +123,7 @@ def build_stack(tmp_path: Path, presets: tuple[CommandPreset, ...], **config: ob
     recorder = CommandEvidenceRecorder(
         artifacts=artifacts,
         signer=signer,
+        trusted_runners=[runner],
         bindings=[
             EvidenceBinding(
                 command_id="unit.tests", requirement_id="coding.tests.run", evidence_type="test_run"
@@ -150,12 +160,18 @@ UNIT_TESTS = CommandPreset(
 )
 
 
-def probe(preset_id: str, code: str, *, timeout: float = 60) -> CommandPreset:
+def script(preset_id: str, filename: str, *, timeout: float = 60) -> CommandPreset:
+    """A preset that runs a script file shipped inside the execution snapshot.
+
+    Presets reject braces and other metacharacters in arguments on purpose, so probes
+    live in files that are part of the snapshot rather than in `-c` strings.
+    """
+
     return CommandPreset(
         id=preset_id,
         category="test",
         executable="python",
-        arguments=("-c", code),
+        arguments=(filename,),
         timeout_seconds=timeout,
     )
 
@@ -248,7 +264,7 @@ def test_real_container_run_produces_verifiable_evidence_and_detects_changes(
 
 
 def test_real_container_isolation_properties(tmp_path: Path) -> None:
-    code = (
+    probe_source = (
         "import json, os, socket\n"
         "info = {'uid': os.getuid(), 'gid': os.getgid()}\n"
         "status = dict(line.split(':', 1) for line in open('/proc/self/status').read().splitlines()"
@@ -269,7 +285,9 @@ def test_real_container_isolation_properties(tmp_path: Path) -> None:
         "info['docker_socket'] = os.path.exists('/var/run/docker.sock')\n"
         "print(json.dumps(info))\n"
     )
-    root, runner, _artifacts, catalog_for, _gate = build_stack(tmp_path, (probe("probe", code),))
+    root, runner, _artifacts, catalog_for, _gate = build_stack(
+        tmp_path, (script("probe", "probe.py"),), files={"probe.py": probe_source}
+    )
     (root / ".env").write_text("SECRET=host-secret")
     os.environ["KAIWEN_PROBE_SECRET"] = "must-not-be-forwarded"
 
@@ -300,10 +318,14 @@ def test_real_container_isolation_properties(tmp_path: Path) -> None:
 
 
 def test_real_container_timeout_memory_and_cleanup(tmp_path: Path) -> None:
-    sleeper = probe("sleeper", "import time; time.sleep(60)", timeout=3)
-    hog = probe("hog", "x = bytearray(600 * 1024 * 1024); print(len(x))", timeout=60)
     _root, runner, _artifacts, catalog_for, _gate = build_stack(
-        tmp_path, (sleeper, hog), memory_mb=128
+        tmp_path,
+        (script("sleeper", "sleeper.py", timeout=3), script("hog", "hog.py")),
+        files={
+            "sleeper.py": "import time\ntime.sleep(60)\n",
+            "hog.py": "x = bytearray(600 * 1024 * 1024)\nprint(len(x))\n",
+        },
+        memory_mb=128,
     )
 
     async def scenario() -> None:
@@ -336,7 +358,7 @@ def test_real_run_is_refused_for_a_missing_image_without_host_fallback(tmp_path:
         filesystem=runner.filesystem,
         root="main",
         runner=runner,
-        presets=(probe("p", "print(1)"),),
+        presets=(script("p", "a.py"),),
     )
 
     async def scenario() -> None:
@@ -344,3 +366,37 @@ def test_real_run_is_refused_for_a_missing_image_without_host_fallback(tmp_path:
             await catalog.execute(context(), CommandRunInput(command_id="p"), category="test")
 
     asyncio.run(scenario())
+
+
+def test_real_container_modifying_snapshot_sources_never_passes(tmp_path: Path) -> None:
+    """A command that rewrites tracked sources cannot earn evidence for the original state."""
+
+    mutate = CommandPreset(
+        id="unit.tests",
+        category="test",
+        executable="python",
+        arguments=("mutate.py",),
+        timeout_seconds=60,
+    )
+    root, runner, _artifacts, catalog_for, gate = build_stack(
+        tmp_path,
+        (mutate,),
+        files={"mutate.py": "open('pkg/calc.py', 'a').write('# tampered during the run\\n')\n"},
+    )
+
+    async def scenario() -> None:
+        snapshot = runner.capture()
+        executed = await catalog_for(runner.bound_to(snapshot)).execute(
+            context(), CommandRunInput(command_id="unit.tests"), category="test"
+        )
+        assert executed.exit_code == 0, executed.stderr
+        assert executed.snapshot_unchanged is False
+        assert executed.modified_paths == ("pkg/calc.py",)
+        verdict = await gate.evaluate(resolution(), context=gate_context(snapshot.fingerprint))
+        assert verdict.status == CompletionGateStatus.BLOCKED
+        assert "command_snapshot_modified" in verdict.verifications[0].findings
+        snapshot.close()
+
+    asyncio.run(scenario())
+    assert (root / "pkg" / "calc.py").read_text() == TEST_SOURCE  # the host copy is untouched
+    assert leftover_containers() == []

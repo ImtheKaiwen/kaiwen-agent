@@ -158,6 +158,16 @@ class DockerSandboxRunner:
 
     provides_isolation = True
 
+    @property
+    def provenance_domain(self) -> object:
+        """Opaque identity shared by this runner and runners bound from it.
+
+        Hosts name the runners they trust when composing evidence recording; this is how
+        a recorder recognizes a runner without believing anything inside a result.
+        """
+
+        return self._shared
+
     def __init__(
         self,
         config: DockerSandboxConfig,
@@ -313,8 +323,11 @@ class DockerSandboxRunner:
         name = f"kaiwen-sandbox-{uuid.uuid4().hex}"
         started = time.monotonic()
         try:
+            # mkdtemp creates the directory owner-only (0700). The copy inside is
+            # world-writable so the container user can write, which is safe only while no
+            # other local user can traverse into the parent; do not loosen this.
             if os.name == "posix":
-                os.chmod(run_directory, 0o711)
+                os.chmod(run_directory, 0o700)
             workspace_copy = run_directory / "workspace"
             try:
                 await asyncio.to_thread(
@@ -329,13 +342,22 @@ class DockerSandboxRunner:
                 command=command,
                 container_workdir=workdir,
             )
-            return await self._run_container(
+            result = await self._run_container(
                 argv,
                 name=name,
                 command=command,
                 started=started,
                 snapshot=snapshot,
                 identity=identity,
+            )
+            # The container is gone; compare the run copy with the captured digests.
+            try:
+                modified = await asyncio.to_thread(snapshot.changed_paths, workspace_copy)
+            except Exception:  # noqa: BLE001 - an unverifiable copy counts as modified
+                logger.warning("Snapshot comparison failed", exc_info=True)
+                return result.model_copy(update={"snapshot_unchanged": False})
+            return result.model_copy(
+                update={"snapshot_unchanged": not modified, "modified_paths": modified}
             )
         finally:
             await asyncio.shield(self._remove_container(name))

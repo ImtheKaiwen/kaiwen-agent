@@ -128,12 +128,18 @@ class JsonArtifactVerifier:
                 payload.get("exit_code") == 0
                 and payload.get("timed_out") is False
                 and payload.get("cancelled") is False
+                and payload.get("snapshot_unchanged") is True
             ):
                 return self._result(
                     requirement, VerificationStatus.PASS, evidence_refs=(metadata.id,)
                 )
             outcome = payload.get("outcome")
-            reason = outcome if outcome in {"failed", "timed_out", "cancelled"} else "failed"
+            reason = (
+                outcome
+                if outcome
+                in {"failed", "timed_out", "cancelled", "snapshot_modified", "unverified"}
+                else "failed"
+            )
             return self._result(
                 requirement,
                 VerificationStatus.FAIL,

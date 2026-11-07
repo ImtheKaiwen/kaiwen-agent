@@ -109,8 +109,12 @@ class CommandEvidenceRecorder:
         artifacts: ArtifactManager,
         signer: EvidenceSigner,
         bindings: Iterable[EvidenceBinding],
+        trusted_runners: Iterable[object],
         redactor: SecretRedactor | None = None,
     ) -> None:
+        self._trusted = tuple(trusted_runners)
+        if not self._trusted:
+            raise ValueError("At least one trusted runner must be named")
         self.artifacts = artifacts
         self.signer = signer
         self.redactor = redactor or SecretRedactor()
@@ -118,9 +122,24 @@ class CommandEvidenceRecorder:
         for binding in bindings:
             self._bindings.setdefault(binding.command_id, []).append(binding)
 
+    def trusts(self, runner: object) -> bool:
+        """Whether the host named this runner (or its provenance domain) as trusted.
+
+        Trust comes from the runner object the host configured on the catalog, never from
+        fields of a `SandboxResult`, which any runner (including a fake) can populate.
+        """
+
+        domain = getattr(runner, "provenance_domain", None)
+        for trusted in self._trusted:
+            if runner is trusted:
+                return True
+            if domain is not None and getattr(trusted, "provenance_domain", None) is domain:
+                return True
+        return False
+
     async def observe(self, execution: CommandExecution) -> tuple[str, ...]:
         bindings = self._bindings.get(execution.preset.id, [])
-        if not bindings:
+        if not bindings or not self.trusts(execution.runner):
             return ()
         result = execution.result
         context = execution.context
@@ -141,7 +160,9 @@ class CommandEvidenceRecorder:
             trace_id=context.trace_id or f"trace_{run_id}",
             run_id=run_id,
         )
-        outcome = _outcome(result.exit_code, result.timed_out, result.cancelled)
+        outcome = _outcome(
+            result.exit_code, result.timed_out, result.cancelled, result.snapshot_unchanged
+        )
         references: list[str] = []
         for binding in bindings:
             payload = {
@@ -162,6 +183,8 @@ class CommandEvidenceRecorder:
                 "cancelled": result.cancelled,
                 "duration_seconds": result.duration_seconds,
                 "output_truncated": result.output_truncated,
+                "snapshot_unchanged": result.snapshot_unchanged,
+                "modified_paths": list(result.modified_paths),
                 "stdout": self._stream(result.stdout),
                 "stderr": self._stream(result.stderr),
             }
@@ -204,9 +227,15 @@ class CommandEvidenceRecorder:
         }
 
 
-def _outcome(exit_code: int, timed_out: bool, cancelled: bool) -> str:
+def _outcome(
+    exit_code: int, timed_out: bool, cancelled: bool, snapshot_unchanged: bool | None
+) -> str:
     if cancelled:
         return "cancelled"
     if timed_out:
         return "timed_out"
-    return "passed" if exit_code == 0 else "failed"
+    if exit_code != 0:
+        return "failed"
+    if snapshot_unchanged is False:
+        return "snapshot_modified"
+    return "passed" if snapshot_unchanged is True else "unverified"

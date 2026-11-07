@@ -68,6 +68,7 @@ async def main() -> None:
         recorder = CommandEvidenceRecorder(
             artifacts=artifacts,
             signer=signer,
+            trusted_runners=[runner],
             bindings=[
                 EvidenceBinding(
                     command_id="unit.tests",

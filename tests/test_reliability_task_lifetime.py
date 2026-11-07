@@ -80,9 +80,14 @@ def test_a_discarded_handle_does_not_lose_the_running_workflow(tmp_path) -> None
         await asyncio.sleep(0.05)
         assert len(kit._background) == 1  # held by the kit, not only by the handle
         release.set()
-        await asyncio.sleep(0.3)
-        record = await execution.runs.get(run_id=run_id, identity=kit.identity)
+        record = None
+        for _ in range(200):  # bounded wait; a fixed sleep is flaky on slow runners
+            record = await execution.runs.get(run_id=run_id, identity=kit.identity)
+            if record is not None and record.status is RuntimeRunStatus.COMPLETED:
+                break
+            await asyncio.sleep(0.05)
         assert record is not None and record.status is RuntimeRunStatus.COMPLETED
+        await asyncio.sleep(0.05)
         assert not kit._background
 
     asyncio.run(scenario())
