@@ -112,6 +112,26 @@ raises `ActionOutcomeUncertainError`, and the same key with different arguments 
    cancellation checks, `list_run_action_intents`). Without them no legacy action is
    executed again, but a replay can require approval again or fail with a conflict.
 
+## Workflow worker actions belong to the durable run
+
+A side-effecting tool called by a workflow `AgentRuntimeWorker` runs inside a
+per-invocation `AgentRun`, but its action intent and durable approval are owned by the
+durable workflow run (`runtime_run_id` is the `runtime_...` id), so
+`WorkflowController` cancellation and `RuntimeRecoveryManager` find in-flight actions by the
+run they belong to and block that run when an outcome is uncertain. The host passes a
+`DurableActionScope` (run id and task id) built by `trusted_action_scope` from a run that
+`trusted_task_run` verified; it is never read from model output, tool arguments or context
+metadata, and the executor and `AgentRuntime` reject a scope that disagrees with the
+execution owner. Within a run, the idempotency identity of an action is the task plus the call
+id (or the call's idempotency key), so tasks that reuse a provider-generated call id do not
+share an intent or an approval, while a retried task cannot repeat a keyed action. Standalone
+`AgentRuntime` and `Agent` executions keep the per-invocation scope unchanged.
+
+Records written by earlier versions for workflow workers carry the per-invocation `run_...`
+id as their owning run. They are not rebound or replayed. `RuntimeRecoveryManager.reconcile`
+marks interrupted ones uncertain and lists those whose owning run cannot be found in
+`RecoveryReport.unassociated_action_ids`; reconcile them manually in the owning system.
+
 ## SSE
 
 `SSEEventBroker` can persist an event to another sink and fan it out to active

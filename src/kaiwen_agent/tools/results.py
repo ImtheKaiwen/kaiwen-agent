@@ -13,6 +13,7 @@ from kaiwen_agent.artifacts import (
 from kaiwen_agent.context import AgentContext
 from kaiwen_agent.events import EventType
 from kaiwen_agent.tools.definition import ToolDefinition
+from kaiwen_agent.tools.durability import DurableActionScope
 from kaiwen_agent.tools.execution import ToolExecutor
 from kaiwen_agent.types import ToolCall, ToolResult
 
@@ -133,6 +134,7 @@ class ToolResultProcessingExecutor(ToolExecutor):
         *,
         execution_scope: str,
         emit: ToolEventCallback = _no_events,
+        action_scope: DurableActionScope | None = None,
     ) -> ToolResult:
         result = await self.executor.execute(
             definition,
@@ -140,6 +142,7 @@ class ToolResultProcessingExecutor(ToolExecutor):
             context,
             execution_scope=execution_scope,
             emit=emit,
+            action_scope=action_scope,
         )
         return await self.processor.process(
             result,

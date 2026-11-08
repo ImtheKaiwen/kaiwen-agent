@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Fix durable action ownership for workflow workers: action intents and approvals of tools run
+  by `AgentRuntimeWorker` were stored under the per-invocation `AgentRun` id, so
+  `WorkflowController` cancellation and `RuntimeRecoveryManager` could not associate an in-flight
+  action with its durable run (a cancelled run could be recorded as safely cancelled while a side
+  effect was in flight). They are now owned by the durable workflow run through a host-verified
+  `DurableActionScope` (new optional `action_scope` on `Agent.run`, `AgentRuntime.run/action` and
+  `ToolExecutor.execute`), with the task as part of the idempotency identity. Standalone
+  executions are unchanged. Records written earlier are not rebound; `RecoveryReport` gains
+  `unassociated_action_ids` for them.
 - Fix the OpenAI function-tool serializer: strict mode is now chosen per tool. A tool whose input
   schema contains a free-form mapping (for example the Coding Kit command tools' `parameters:
   dict[str, str]`) is sent with `strict: false` and its original schema, because OpenAI strict

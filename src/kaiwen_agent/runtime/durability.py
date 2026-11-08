@@ -132,6 +132,10 @@ class RecoveryReport(BaseModel):
     uncertain_action_ids: tuple[str, ...] = ()
     blocked_run_ids: tuple[str, ...] = ()
     owner_lost_run_ids: tuple[str, ...] = ()
+    # Interrupted actions whose owning run could not be found for their owner (for example
+    # records written before actions were owned by the durable run). They are uncertain and
+    # never replayed, but no run was blocked for them: an operator must reconcile them.
+    unassociated_action_ids: tuple[str, ...] = ()
 
 
 class RuntimeRecoveryManager:
@@ -160,6 +164,7 @@ class RuntimeRecoveryManager:
         if lease is None:
             raise RuntimeRecoveryError("Runtime recovery lease is already held")
         uncertain: list[str] = []
+        unassociated: list[str] = []
         blocked: set[str] = set()
         try:
             intents = await self.stores.actions.list_action_intents(
@@ -183,6 +188,8 @@ class RuntimeRecoveryManager:
                     tenant_id=intent.tenant_id,
                     user_id=intent.user_id,
                 )
+                if run is None:
+                    unassociated.append(intent.id)
                 if run is not None and run.status in {
                     RuntimeRunStatus.CREATED,
                     RuntimeRunStatus.RUNNING,
@@ -196,6 +203,7 @@ class RuntimeRecoveryManager:
                 uncertain_action_ids=tuple(uncertain),
                 blocked_run_ids=tuple(sorted(blocked)),
                 owner_lost_run_ids=tuple(owner_lost),
+                unassociated_action_ids=tuple(unassociated),
             )
         finally:
             await self.leases.release(lease)

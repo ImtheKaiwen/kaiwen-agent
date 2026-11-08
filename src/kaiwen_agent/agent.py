@@ -20,6 +20,7 @@ from kaiwen_agent.exceptions import (
 from kaiwen_agent.models.base import ModelProvider
 from kaiwen_agent.sessions import InMemoryRunStore, RunStore
 from kaiwen_agent.tools.definition import ToolDefinition
+from kaiwen_agent.tools.durability import DurableActionScope
 from kaiwen_agent.tools.execution import ToolExecutor
 from kaiwen_agent.tools.registry import ToolRegistry
 from kaiwen_agent.types import (
@@ -64,7 +65,13 @@ class Agent:
         self.tool_errors = tool_errors
         self.max_tool_errors = max_tool_errors
 
-    async def run(self, agent_input: AgentInput, *, context: AgentContext) -> AgentResult:
+    async def run(
+        self,
+        agent_input: AgentInput,
+        *,
+        context: AgentContext,
+        action_scope: DurableActionScope | None = None,
+    ) -> AgentResult:
         trace_id = context.trace_id or f"trace_{uuid4().hex}"
         effective_context = AgentContext(
             session_id=context.session_id,
@@ -140,6 +147,11 @@ class Agent:
                     definition = None
                     try:
                         definition = self.registry.get(call.name)
+                        # Only a host-verified durable scope is forwarded, so executors that
+                        # predate it keep working for standalone runs.
+                        scope_args: dict[str, Any] = (
+                            {} if action_scope is None else {"action_scope": action_scope}
+                        )
                         tool_result = await self.tool_executor.execute(
                             definition,
                             call,
@@ -148,6 +160,7 @@ class Agent:
                             emit=lambda event_type, payload: self._emit(
                                 event_type, run, trace_id, payload, effective_context
                             ),
+                            **scope_args,
                         )
                     except Exception as error:
                         sanitized = _sanitized_tool_error(error, definition, call)

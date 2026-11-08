@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Protocol
@@ -24,6 +25,44 @@ class ApprovalStatus(StrEnum):
     APPROVED = "approved"
     DENIED = "denied"
     CONSUMED = "consumed"
+
+
+_SCOPE_FIELD_LIMIT = 200
+
+
+@dataclass(frozen=True, slots=True)
+class DurableActionScope:
+    """Which durable workflow run and task a tool action belongs to.
+
+    Action intents and approvals are owned by `runtime_run_id`, the durable workflow run, so
+    run-scoped cancellation and recovery can find them. `task_id` separates the idempotency
+    identity of tasks that share the run. Only a host that has verified an active run
+    (`workflow.trusted_action_scope`) builds one; it never comes from model output, tool
+    arguments, or context metadata, and the executor re-checks it against the call's owner.
+    """
+
+    runtime_run_id: str
+    task_id: str
+    tenant_id: str
+    user_id: str
+    session_id: str
+
+    def __post_init__(self) -> None:
+        for name in ("runtime_run_id", "task_id", "tenant_id", "user_id", "session_id"):
+            value = getattr(self, name)
+            if (
+                not isinstance(value, str)
+                or not value.strip()
+                or len(value) > _SCOPE_FIELD_LIMIT
+                or "\x1f" in value
+            ):
+                raise ValueError(f"Invalid durable action scope field: {name}")
+
+    @property
+    def execution_identity(self) -> str:
+        """Stable identity of the action namespace: one task of one durable run."""
+
+        return f"{self.runtime_run_id}:{self.task_id}"
 
 
 class ActionIntentRecord(BaseModel):

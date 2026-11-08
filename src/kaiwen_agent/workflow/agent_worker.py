@@ -37,10 +37,12 @@ from kaiwen_agent.runtime import (
     WorkspaceBinding,
 )
 from kaiwen_agent.tasks import AgentTask, TaskStore
+from kaiwen_agent.tools.durability import DurableActionScope
 from kaiwen_agent.types import AgentResult
 from kaiwen_agent.workers import TaskExecutionContext
 from kaiwen_agent.workflow.context import (
     _RESERVED_METADATA,
+    trusted_action_scope,
     trusted_task_context,
     trusted_task_run,
 )
@@ -214,7 +216,7 @@ class AgentRuntimeWorker:
         prompt = await self._render(package, identity)
         await context.report_progress(0.1, details={"phase": "started", "role": self.role})
         await context.checkpoint(state={"phase": "started", "role": self.role, "task": task.id})
-        result = await self._run(prompt, identity)
+        result = await self._run(prompt, identity, trusted_action_scope(task, record))
         await context.checkpoint(state={"phase": "finished", "role": self.role, "task": task.id})
         await context.report_progress(1.0, details={"phase": "finished", "role": self.role})
         await self._remember(task, identity, result)
@@ -237,7 +239,9 @@ class AgentRuntimeWorker:
         )
         return ContextRenderer().render(built)
 
-    async def _run(self, prompt: str, identity: RuntimeIdentity) -> AgentResult:
+    async def _run(
+        self, prompt: str, identity: RuntimeIdentity, scope: DurableActionScope
+    ) -> AgentResult:
         if self.tool_names:
             return await self.runtime.action(
                 prompt,
@@ -245,6 +249,7 @@ class AgentRuntimeWorker:
                 tool_names=self.tool_names,
                 autonomy=self.autonomy,
                 services=self.services,
+                action_scope=scope,
             )
         return await self.runtime.chat(
             prompt, identity=identity, autonomy=self.autonomy, services=self.services

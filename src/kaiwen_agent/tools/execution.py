@@ -37,6 +37,7 @@ from kaiwen_agent.tools.durability import (
     ActionIntentRecord,
     ActionIntentStatus,
     ActionIntentStore,
+    DurableActionScope,
 )
 from kaiwen_agent.tools.idempotency import IdempotencyStore, InMemoryIdempotencyStore
 from kaiwen_agent.types import ToolCall, ToolResult
@@ -78,7 +79,21 @@ class ToolExecutor:
         *,
         execution_scope: str,
         emit: ToolEventCallback = _no_events,
+        action_scope: DurableActionScope | None = None,
     ) -> ToolResult:
+        # `execution_scope` is the per-invocation scope. When a host-verified durable
+        # workflow scope is present it owns the action (cancellation and recovery look
+        # actions up by durable run) and names the idempotency namespace: one task of one
+        # run, so tasks that reuse a provider-generated call id never share an intent.
+        owner_run_id = execution_scope
+        if action_scope is not None:
+            _check_action_scope(action_scope, context)
+            owner_run_id = action_scope.runtime_run_id
+            execution_scope = action_scope.execution_identity
+            if call.idempotency_key is not None:
+                call = call.model_copy(
+                    update={"idempotency_key": f"{execution_scope}:{call.idempotency_key}"}
+                )
         try:
             arguments = definition.input_model.model_validate(call.arguments)
         except ValidationError as error:
@@ -97,7 +112,7 @@ class ToolExecutor:
             agent_id=context.agent_id or "unknown-agent",
             session_id=context.session_id,
             conversation_id=context.conversation_id,
-            run_id=execution_scope,
+            run_id=owner_run_id,
             trace_id=context.trace_id or "trace_unavailable",
             environment=context.environment,
             action=f"tool.execute:{definition.name}",
@@ -154,6 +169,7 @@ class ToolExecutor:
             call,
             context,
             execution_scope=execution_scope,
+            owner_run_id=owner_run_id,
             arguments_checksum=arguments_checksum,
             idempotency_identity=idempotency_identity,
         )
@@ -173,6 +189,7 @@ class ToolExecutor:
                 arguments,
                 decision,
                 execution_scope=execution_scope,
+                owner_run_id=owner_run_id,
                 emit=emit,
                 arguments_checksum=arguments_checksum,
                 idempotency_identity=idempotency_identity,
@@ -298,6 +315,7 @@ class ToolExecutor:
         decision: PolicyDecision,
         *,
         execution_scope: str,
+        owner_run_id: str,
         emit: ToolEventCallback,
         arguments_checksum: str,
         idempotency_identity: str,
@@ -363,7 +381,7 @@ class ToolExecutor:
                 call_id=call.id,
                 arguments=call.arguments,
                 side_effect=definition.side_effect,
-                execution_scope=execution_scope,
+                execution_scope=owner_run_id,
                 action_intent_id=action_intent.id if action_intent is not None else None,
                 arguments_checksum=arguments_checksum,
             )
@@ -571,6 +589,7 @@ class ToolExecutor:
         context: AgentContext,
         *,
         execution_scope: str,
+        owner_run_id: str,
         arguments_checksum: str,
         idempotency_identity: str,
     ) -> ActionIntentRecord | None:
@@ -593,7 +612,7 @@ class ToolExecutor:
         intent_id = f"intent_{sha256(stable_material.encode()).hexdigest()}"
         return ActionIntentRecord(
             id=intent_id,
-            runtime_run_id=execution_scope,
+            runtime_run_id=owner_run_id,
             tenant_id=context.tenant_id,
             user_id=context.user_id,
             conversation_id=context.conversation_id,
@@ -643,6 +662,20 @@ async def execute_tool(
         context,
         execution_scope="standalone",
     )
+
+
+def _check_action_scope(scope: DurableActionScope, context: AgentContext) -> None:
+    """Reject a workflow scope that does not belong to the caller's trusted owner."""
+
+    if (scope.tenant_id, scope.user_id, scope.session_id) != (
+        context.tenant_id,
+        context.user_id,
+        context.session_id,
+    ):
+        raise ValueError("Durable action scope does not match the execution owner")
+    claimed = context.metadata.get("runtime_run_id")
+    if claimed is not None and claimed != scope.runtime_run_id:
+        raise ValueError("Durable action scope does not match the context's workflow run")
 
 
 def _arguments_checksum(arguments: dict[str, Any]) -> str:
