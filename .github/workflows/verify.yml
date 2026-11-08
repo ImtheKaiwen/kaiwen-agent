@@ -25,7 +25,7 @@ jobs:
       - run: python -m pip install -e ".[dev]"
       - run: python -m ruff format --config pyproject.toml --check src tests examples scripts
       - run: python -m ruff check --config pyproject.toml src tests examples scripts
-      - run: python -m mypy --no-incremental src/kaiwen_agent scripts/check_release.py
+      - run: python -m mypy --no-incremental src/kaiwen_agent scripts/check_release.py scripts/live_validation.py
       - name: Type-check examples
         shell: bash
         run: |

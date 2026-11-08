@@ -432,7 +432,7 @@ Each defect was reproduced with a failing test before its fix.
 - [x] Merged as pull request 8 (squash commit `79c31ef`) after all 10 CI jobs passed on the
       exact head, including the real Docker tests and examples on Linux.
 
-### M6.3.2: AgentRuntime worker integration and team context foundation (in review)
+### M6.3.2: AgentRuntime worker integration and team context foundation (closed)
 
 - [x] ADR 0014: Private Agent Context + Shared Durable Project State + Bounded Task Handoffs +
       Lead Coordination View, with project, team, agent and lead scopes and the line between
@@ -453,7 +453,34 @@ Each defect was reproduced with a failing test before its fix.
 - Not done: Lead coordination view and delegation tools (M6.3.3), reviewer approval and team
   acceptance (M6.3.4), isolated parallel writers, worktree merging, real external LLM verification,
   atomic workspace verification.
-- [~] Not complete until the pull request CI passes on the exact head and the owner merges it.
+- [x] Merged as pull request 9 (squash commit `1950851`) after all 10 CI jobs passed on the exact
+      head. The closing security review corrected four trust-boundary findings, each with a
+      regression test: handoff evidence is authenticated with the existing `EvidenceSigner`
+      instead of trusting a label; evidence-producing workers require a controller; the binding
+      gained a host-assigned `identity_digest`; artifact handoffs are same-run scoped.
+- Still open after closure: a real external model has not yet run through this stack (see the
+  live provider validation checkpoint below).
+
+### Live provider validation (opt-in, manual)
+
+- [x] `scripts/live_validation.py`: a small harness that runs a real OpenAI or Ollama model as
+      Tester through `AgentRuntimeWorker`, `TaskScheduler`, the Docker sandbox, signed evidence
+      and the completion gate, with request, step, tool-call, token, time and budget limits,
+      sanitized provider diagnostics, separate usage and billing accounting, and a redacted
+      report. Nothing external runs without `--live`; CI exercises it only with scripted fakes.
+      See `docs/live-validation.md`.
+- [x] Strict tool schema fix: `serialize_openai_tool` chooses `strict` per tool and sends a tool
+      with a free-form mapping or an unsupported construct as `strict: false` with its original
+      schema (Coding Kit command tools). Host-side validation is unchanged.
+- Verified manually, not by CI: with `gpt-5.4-mini` one `pass` run (exit code 0, authenticated
+  signed evidence, gate completed) and one `negative` run (exit code 1, authenticated evidence,
+  gate blocked with `quality_blocked`), both with worker `verified: false`, about $0.0023 each.
+  These are single smoke runs on one machine, not reliability evidence.
+- Later than the M6.3.2 closure above: M6.3.2's "real external LLM verification" gap was
+  closed only by these manual runs; the closure statement itself is historical and unchanged.
+- Not done: any Ollama model passing (`qwen2.5-coder:7b` wrote the tool call as text,
+  `qwen3:4b` hit the output cap while reasoning); a live confident-false-claim test; repeated or
+  multi-model runs; automatic paid tests (deliberately never run in CI).
 
 ### M7 design items (not started)
 
