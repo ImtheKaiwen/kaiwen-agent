@@ -16,6 +16,14 @@ from kaiwen_agent.workflow.controller import (
     WorkflowController,
     WorkflowRevisionPlanner,
 )
+from kaiwen_agent.workflow.lead_view import (
+    LeadApprovalRef,
+    LeadTaskView,
+    LeadView,
+    LeadViewAssembler,
+    LeadViewError,
+    LeadViewSource,
+)
 from kaiwen_agent.workflow.models import (
     WorkflowLimits,
     WorkflowOutcome,
@@ -37,6 +45,12 @@ from kaiwen_agent.workflow.task_context import (
 
 __all__ = [
     "AgentRuntimeWorker",
+    "LeadApprovalRef",
+    "LeadTaskView",
+    "LeadView",
+    "LeadViewAssembler",
+    "LeadViewError",
+    "LeadViewSource",
     "TaskContextAssembler",
     "TaskContextPackage",
     "TaskContextSource",

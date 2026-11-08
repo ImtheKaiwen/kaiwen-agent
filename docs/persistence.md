@@ -52,6 +52,30 @@ API but fail closed and are invisible through scoped reads. New agent, task, job
 policy, artifact, objective, watch, trigger, and attention events propagate trusted
 owner identity when their source context has it.
 
+### Run-scoped task query and task ownership columns
+
+`SQLitePersistence` implements the optional `TaskRunQuery` capability,
+`list_run_tasks(tenant_id, user_id, runtime_run_id, limit, after_id)`. It filters by owner and
+run in SQL before any row is materialized, orders by task id, pages with a keyset cursor
+(`after_id`, `TaskRunPage.next_after_id`), and rejects a `limit` outside `1..200`. The base
+`TaskStore` protocol is unchanged, so custom and in-memory stores keep working; consumers that
+need the capability, such as the Lead view, fail closed without it.
+
+The `tasks` table gains nullable `tenant_id`, `user_id` and `runtime_run_id` columns and the
+index `idx_tasks_owner_run`. They hold an attested owner, not a copy of task metadata: a task is
+attested only if it names a run that exists in `runtime_runs` for the same tenant and user,
+the run's session matches, and the trace id differs from the run id. `save_task` re-checks this
+on every write, so saving a task again after its run exists attests it; anything else stores
+NULL and is invisible to the query (the task stays readable through `get_task`).
+
+On first start after upgrading, one transaction under the write lock adds the columns and
+attests existing rows with the same check, in batches. Rows that cannot be attested (malformed
+JSON, no run, a run of another owner or session, non-string metadata) keep NULL columns and are
+unavailable, never assigned a guessed owner. A crash leaves the old schema and the next start
+retries; a concurrent starter waits and finds the work done. Older code ignores the columns,
+so rolling back is safe. To make an unavailable historical task visible, re-save it once its
+run exists (the scheduler already does this when a task changes).
+
 `SQLitePersistence` also implements the durable workflow stores. The standalone
 `SQLiteIdempotencyStore` persists the existing tool receipt contract and may share
 the same database file. A durable tool execution supplies both stores explicitly:

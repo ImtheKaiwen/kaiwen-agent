@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from typing import Protocol
+from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
 
 from kaiwen_agent.tasks.models import AgentTask, TaskStatus
+
+MAX_TASK_RUN_PAGE = 200
 
 
 class TaskStore(Protocol):
@@ -11,6 +14,42 @@ class TaskStore(Protocol):
     async def get_task(self, task_id: str) -> AgentTask | None: ...
 
     async def list_tasks(self, *, status: TaskStatus | None = None) -> list[AgentTask]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class TaskRunPage:
+    """One bounded page of the tasks of a single durable run.
+
+    `next_after_id` is the keyset cursor for the following page, or `None` when this page was
+    the last one. `unreadable` counts rows that matched the scope but could not be
+    materialized as a task of that exact owner and run; they are never returned.
+    """
+
+    tasks: tuple[AgentTask, ...]
+    next_after_id: str | None = None
+    unreadable: int = 0
+
+
+@runtime_checkable
+class TaskRunQuery(Protocol):
+    """Optional capability: owner- and run-scoped, bounded, keyset-paginated task listing.
+
+    Implementations filter by tenant, user and durable run before materializing any row, order
+    by task id, and reject `limit` outside `1..MAX_TASK_RUN_PAGE` with `ValueError`. A task is
+    returned only if the store can attest that it belongs to that run for that owner; a task
+    whose ownership cannot be attested is not returned. A store without this capability is not
+    queried through `list_tasks`: consumers fail closed instead.
+    """
+
+    async def list_run_tasks(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        runtime_run_id: str,
+        limit: int = 100,
+        after_id: str | None = None,
+    ) -> TaskRunPage: ...
 
 
 class InMemoryTaskStore:

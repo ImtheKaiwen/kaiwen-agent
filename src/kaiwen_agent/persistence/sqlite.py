@@ -28,6 +28,7 @@ from kaiwen_agent.runtime.durability import (
 )
 from kaiwen_agent.sessions import SessionRecord
 from kaiwen_agent.tasks.models import AgentTask, TaskStatus
+from kaiwen_agent.tasks.store import MAX_TASK_RUN_PAGE, TaskRunPage
 from kaiwen_agent.tools.durability import (
     ActionIntentRecord,
     ActionIntentStatus,
@@ -279,16 +280,23 @@ class SQLitePersistence:
         await self.initialize()
 
         def operation(connection: sqlite3.Connection) -> None:
+            # Ownership columns hold only an attested owner and run (see
+            # `_verified_task_owner`); otherwise NULL, which keeps the task out of run queries.
+            owner = _verified_task_owner(connection, task) or (None, None, None)
             connection.execute(
                 """INSERT INTO tasks
-                    (id, status, agent_id, parent_id, task_json, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (id, status, agent_id, parent_id, task_json, updated_at,
+                     tenant_id, user_id, runtime_run_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     status = excluded.status,
                     agent_id = excluded.agent_id,
                     parent_id = excluded.parent_id,
                     task_json = excluded.task_json,
-                    updated_at = excluded.updated_at""",
+                    updated_at = excluded.updated_at,
+                    tenant_id = excluded.tenant_id,
+                    user_id = excluded.user_id,
+                    runtime_run_id = excluded.runtime_run_id""",
                 (
                     task.id,
                     task.status,
@@ -296,10 +304,57 @@ class SQLitePersistence:
                     task.parent_id,
                     task.model_dump_json(),
                     utc_now().isoformat(),
+                    *owner,
                 ),
             )
 
         await self._run(operation)
+
+    async def list_run_tasks(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        runtime_run_id: str,
+        limit: int = 100,
+        after_id: str | None = None,
+    ) -> TaskRunPage:
+        """Tasks of one durable run for one owner, filtered in SQL before materialization."""
+
+        if not 1 <= limit <= MAX_TASK_RUN_PAGE:
+            raise ValueError(f"limit must be between 1 and {MAX_TASK_RUN_PAGE}")
+        if not all(
+            isinstance(value, str) and value for value in (tenant_id, user_id, runtime_run_id)
+        ):
+            raise ValueError("tenant_id, user_id and runtime_run_id are required")
+        if after_id is not None and not isinstance(after_id, str):
+            raise ValueError("after_id must be a task id")
+        await self.initialize()
+
+        def operation(connection: sqlite3.Connection) -> TaskRunPage:
+            rows = connection.execute(
+                """SELECT id, task_json FROM tasks
+                WHERE tenant_id = ? AND user_id = ? AND runtime_run_id = ? AND id > ?
+                ORDER BY id ASC LIMIT ?""",
+                (tenant_id, user_id, runtime_run_id, after_id or "", limit + 1),
+            ).fetchall()
+            more = len(rows) > limit
+            rows = rows[:limit]
+            tasks: list[AgentTask] = []
+            unreadable = 0
+            for row in rows:
+                task = _materialize_run_task(row, tenant_id, user_id, runtime_run_id)
+                if task is None:
+                    unreadable += 1
+                else:
+                    tasks.append(task)
+            return TaskRunPage(
+                tasks=tuple(tasks),
+                next_after_id=rows[-1]["id"] if more and rows else None,
+                unreadable=unreadable,
+            )
+
+        return await self._run(operation)
 
     async def get_task(self, task_id: str) -> AgentTask | None:
         await self.initialize()
@@ -1681,6 +1736,119 @@ class SQLitePersistence:
             """CREATE INDEX IF NOT EXISTS idx_events_owner_session_sequence
             ON events(tenant_id, user_id, session_id, sequence)"""
         )
+        _migrate_task_ownership(connection)
+        connection.execute(
+            """CREATE INDEX IF NOT EXISTS idx_tasks_owner_run
+            ON tasks(tenant_id, user_id, runtime_run_id, id)"""
+        )
+
+
+def _verified_task_owner(
+    connection: sqlite3.Connection, task: AgentTask
+) -> tuple[str, str, str] | None:
+    """The (tenant, user, run) of a task, only if a durable run attests it.
+
+    The task's own fields and metadata are claims. They are accepted only when the task names
+    a run that exists in `runtime_runs` for the same tenant and user, whose session matches,
+    and the trace id differs from the run id. Anything else returns `None`: unverifiable
+    ownership is unavailable, never guessed.
+    """
+
+    run_id = task.metadata.get("runtime_run_id")
+    if (
+        not task.tenant_id
+        or not task.user_id
+        or not task.session_id
+        or not isinstance(run_id, str)
+        or not run_id
+        or task.trace_id == run_id
+    ):
+        return None
+    row = connection.execute(
+        "SELECT run_json FROM runtime_runs WHERE id = ? AND tenant_id = ? AND user_id = ?",
+        (run_id, task.tenant_id, task.user_id),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        session_id = json.loads(row["run_json"]).get("session_id")
+    except (ValueError, AttributeError):
+        return None
+    if session_id != task.session_id:
+        return None
+    return task.tenant_id, task.user_id, run_id
+
+
+def _materialize_run_task(
+    row: sqlite3.Row, tenant_id: str, user_id: str, runtime_run_id: str
+) -> AgentTask | None:
+    """A scoped row as a task, or `None` if it is not exactly a task of that owner and run."""
+
+    try:
+        task = AgentTask.model_validate_json(row["task_json"])
+    except ValueError:
+        return None
+    if (
+        task.id != row["id"]
+        or task.tenant_id != tenant_id
+        or task.user_id != user_id
+        or task.metadata.get("runtime_run_id") != runtime_run_id
+    ):
+        return None
+    return task
+
+
+_TASK_BACKFILL_BATCH = 500
+
+
+def _migrate_task_ownership(connection: sqlite3.Connection) -> None:
+    """Add the task ownership columns and attest existing rows once.
+
+    The change runs in one transaction under the write lock, so a crash leaves the old
+    schema and the next start retries, and a concurrent starter re-checks after waiting. Each
+    existing row is attested with `_verified_task_owner`; rows that fail it (malformed, no run,
+    run missing or owned by someone else) keep NULL columns and stay unavailable.
+    """
+
+    def has_columns() -> bool:
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(tasks)")}
+        return {"tenant_id", "user_id", "runtime_run_id"} <= columns
+
+    if has_columns():
+        return
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        if not has_columns():
+            existing = {row["name"] for row in connection.execute("PRAGMA table_info(tasks)")}
+            for column in ("tenant_id", "user_id", "runtime_run_id"):
+                if column not in existing:
+                    connection.execute(f"ALTER TABLE tasks ADD COLUMN {column} TEXT")
+            last_rowid = 0
+            while True:
+                batch = connection.execute(
+                    """SELECT rowid AS position, id, task_json FROM tasks
+                    WHERE rowid > ? ORDER BY rowid ASC LIMIT ?""",
+                    (last_rowid, _TASK_BACKFILL_BATCH),
+                ).fetchall()
+                if not batch:
+                    break
+                for row in batch:
+                    last_rowid = row["position"]
+                    try:
+                        task = AgentTask.model_validate_json(row["task_json"])
+                    except ValueError:
+                        continue
+                    owner = _verified_task_owner(connection, task)
+                    if owner is not None and task.id == row["id"]:
+                        connection.execute(
+                            """UPDATE tasks SET tenant_id = ?, user_id = ?, runtime_run_id = ?
+                            WHERE id = ?""",
+                            (*owner, row["id"]),
+                        )
+        connection.execute("COMMIT")
+    except BaseException:
+        connection.execute("ROLLBACK")
+        raise
 
 
 def _validate_runtime_limit(limit: int) -> None:

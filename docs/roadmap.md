@@ -482,6 +482,22 @@ Each defect was reproduced with a failing test before its fix.
   `qwen3:4b` hit the output cap while reasoning); a live confident-false-claim test; repeated or
   multi-model runs; automatic paid tests (deliberately never run in CI).
 
+### M6.3.3: Lead coordination view and delegation tools (in progress)
+
+- [x] PR #11 (squash commit `3f2d967`, merged): workflow worker actions are owned by the durable
+      run, a restarted run with an unresolved action of its own is blocked, and the legacy
+      inventory API exists. This is the prerequisite for the Lead work below.
+- [x] M6.3.3-A (draft pull request, not merged, pending independent review): ADR 0015 (status
+      Proposed), the optional `TaskRunQuery` capability (owner- and run-scoped, keyset-paged,
+      SQL-filtered; SQLite ownership columns attested against `runtime_runs`, with a one-time,
+      atomic backfill that leaves unverifiable historical rows unavailable), and the read-only
+      `LeadViewAssembler`/`LeadView`. Verified by deterministic tests including a real
+      workflow integration test and mutation checks of the key protections.
+- Not done: delegation proposals and admission, the Lead tools, cycle-boundary delegation
+  (later M6.3.3 work packages, blocked on acceptance of ADR 0015), reviewer approval and team
+  acceptance (M6.3.4). The Lead view needs a store with `TaskRunQuery`; custom and in-memory
+  task stores do not provide it yet.
+
 ### M7 design items (not started)
 
 - Lifecycle failure recovery: a failed cycle leaves `LifecycleRuntime` in `failed`, and

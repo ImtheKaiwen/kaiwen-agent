@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Add the read-only Lead coordination view foundation (M6.3.3-A, ADR 0015 proposed): the
+  optional `TaskRunQuery` store capability (`list_run_tasks`, owner- and run-scoped, SQL-filtered,
+  keyset-paged, with `SQLitePersistence` support), and `LeadViewAssembler`/`LeadView`, a bounded,
+  provenance-labelled projection of one durable run that writes nothing and fails closed without
+  the capability. `SQLitePersistence` adds nullable ownership columns and an index to `tasks`;
+  existing rows are attested once against `runtime_runs` and rows that cannot be attested stay
+  unavailable to run-scoped queries. `TaskContextAssembler.owned_references` is now public.
 - Fix durable action ownership for workflow workers: action intents and approvals of tools run
   by `AgentRuntimeWorker` were stored under the per-invocation `AgentRun` id, so
   `WorkflowController` cancellation and `RuntimeRecoveryManager` could not associate an in-flight

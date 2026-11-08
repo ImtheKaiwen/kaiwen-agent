@@ -37,8 +37,8 @@ existing `TaskScheduler`; it does not add a runtime, scheduler or store. See ADR
   capabilities or metadata. A task asking for capabilities the worker was not allowed is
   refused before any model call.
 - Four scopes. Project state is the durable run, objective and evidence; team state is the
-  run's `AgentTask` records; agent state is a private context; the Lead view (M6.3.3) will be
-  a bounded projection of team state, not a merged transcript.
+  run's `AgentTask` records; agent state is a private context; the Lead view is a bounded,
+  read-only projection of team state, not a merged transcript (see "Lead coordination view").
 - Private context. Each task gets a host-derived conversation id (`private_conversation_id`,
   from the run, role and logical task; `private_scope="role"` shares one thread per role), so
   a Coder's history is not a Tester's. A shared conversation id is never used.
@@ -51,5 +51,31 @@ existing `TaskScheduler`; it does not add a runtime, scheduler or store. See ADR
   the completion gate verifies anything; a model's claim of passing tests changes nothing.
 - Writes stay serialized through resource keys; independent reads can overlap.
 
-Not part of this layer yet: the Lead coordination view and delegation tools (M6.3.3), reviewer
-approval and team acceptance (M6.3.4), isolated parallel writers or worktree merging.
+## Lead coordination view (read-only)
+
+`LeadViewAssembler.assemble(run_id=, identity=)` returns a bounded `LeadView` of one durable run,
+or `None` if that owner has no such run. It reads existing state only (ADR 0015, proposed):
+
+- Host facts: run id and status, workspace binding id, task ids and logical ids, statuses,
+  dependencies inside the listing, attempts, progress, status-derived blocker categories,
+  pattern-checked error codes, the run's blocker category, and references the host verified
+  with the same ownership and evidence-authentication rules as handoffs
+  (`TaskContextAssembler.owned_references`).
+- Untrusted text: task names and summaries (`untrusted_name`, `untrusted_summary`), with control
+  characters removed and a length bound. They are rendered as data and grant nothing.
+- Never exposed: exception text, task input or description, metadata, transcripts, private
+  conversations, permissions or capabilities. The view reports no requirement verdict
+  (`requirement_status` is always `not_evaluated`); authenticated evidence is not proof that a
+  requirement passed, and the completion gate stays authoritative.
+- Explicit absence: pending approvals are `None` (unavailable) unless an action store with a
+  run-scoped query and an approval store were given; reference lists are empty and
+  `references_checked` is false without an artifact verifier; a truncated listing and dropped
+  records are reported (`tasks_truncated`, `unreadable_task_count`).
+- Read-only and fail-closed: building the view writes nothing, runs no tool and takes no
+  lease. The assembler requires a task store with the `TaskRunQuery` capability and refuses
+  to fall back to the global `list_tasks`. `expected_workspace` refuses a run bound to another
+  workspace. `LeadViewSource` feeds the view through the existing `ContextBuilder` budget.
+
+Not part of this layer yet: delegation tools and admission (later M6.3.3 work, pending ADR
+0015), reviewer approval and team acceptance (M6.3.4), isolated parallel writers or worktree
+merging.

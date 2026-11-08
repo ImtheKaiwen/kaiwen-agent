@@ -300,6 +300,21 @@ class TaskContextAssembler:
             ),
         )
 
+    async def owned_references(
+        self,
+        references: Iterable[str],
+        run: RuntimeRunRecord,
+        *,
+        authenticate: bool = False,
+    ) -> list[str]:
+        """The references of `references` acceptable for `run`; see the rules of `_owned`.
+
+        Public so other read-only projections apply the same ownership and authentication
+        rules instead of re-implementing them.
+        """
+
+        return await self._owned(references, run, authenticate=authenticate)
+
     async def _owned(
         self,
         references: Iterable[str],
