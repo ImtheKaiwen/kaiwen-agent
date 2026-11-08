@@ -410,3 +410,22 @@ def test_the_serialized_tools_are_consistent_with_their_strict_flag() -> None:
     report = asyncio.run(lv.run_validation(config(live=False), environ={}))
     assert report.request_compatibility_warnings == []
     assert report.openai_tool_strictness == strictness
+
+
+def test_authentic_evidence_for_another_workspace_or_snapshot_does_not_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = lv._assess
+
+    async def other_workspace(*args: Any, **kwargs: Any) -> None:
+        monkeypatch.setattr(lv, "WORKSPACE_ID", "another-workspace")
+        await original(*args, **kwargs)
+
+    monkeypatch.setattr(lv, "_assess", other_workspace)
+    client = FakeOpenAI([call_response(), text_response("done")])
+    report = run(config(scenario="pass"), client)
+    scenario = report.scenarios[0]
+    assert scenario.stages.evidence_authentication == "pass"  # the signature is genuine
+    assert scenario.evidence_scope == "mismatch" and scenario.stages.overall == "fail"
+    assert scenario.failure_category == "evidence_or_gate_failure"
+    assert "workspace snapshot" in (scenario.reason or "") and report.verdict == "FAIL"

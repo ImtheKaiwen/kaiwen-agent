@@ -127,6 +127,51 @@ and `request_compatibility_warnings` (strict tools whose schema still has an ope
 should be empty). Whether a given model accepts every other keyword in a strict schema, such as
 string length limits, is not verified here.
 
+## Observed live results (manual, not CI-attested)
+
+These two runs were made by hand on one developer machine (Windows 11, Docker Desktop with a
+Linux engine) with `gpt-5.4-mini`, the `coding.tester` prompt, and the limits described above
+(2 requests, 3 steps, 2 tool calls, $0.03 local budget). CI does not run them and cannot
+reproduce them; the raw local reports are not stored in the repository. Costs are estimates
+from provider-reported usage at the published rates of $0.75 per million input tokens and
+$4.50 per million output tokens, not billing records.
+
+| | `pass` scenario | `negative` scenario |
+| --- | --- | --- |
+| Project | working | deliberately broken |
+| Harness verdict | PASS | PASS |
+| Model requests | 2 (both with usage) | 2 (both with usage) |
+| Structured `testing.run` calls | 1, no tool error | 1, no tool error |
+| Docker sandbox command ran | yes | yes |
+| Sandbox exit code | 0 | 1 |
+| Evidence signature authenticated | yes | yes |
+| Completion gate | completed | blocked (`quality_blocked`) |
+| Worker `verified` field | false | false |
+| Tokens (input / output) | 2581 / 73 | 2669 / 87 |
+| Estimated cost | $0.002264 | $0.002393 |
+| Elapsed | 19.57 s | 11.49 s |
+
+The negative scenario passes because the host rejected failing tests, not because the workflow
+completed. In neither run did the model claim success without a tool call, so the "confident
+false claim" case is covered only by the deterministic tests.
+
+What this does and does not show:
+
+- A real model completed the full path (tool call, container execution, signed evidence, gate)
+  in both directions on one model and one tiny project. It is a smoke test, not a measure of
+  reliability, model quality, or general coding-agent capability.
+- A first live attempt failed before any response; it was followed by diagnostics and the
+  strict-schema fix above, and the later runs passed. The original failure's cause was never
+  captured, so the strict-schema explanation is likely but unproven.
+- The Ollama models tried locally (`qwen2.5-coder:7b`, `qwen3:4b`) did not call the tool
+  (the first wrote the call as text, the second hit the output cap while reasoning). That is
+  unresolved and is not covered by these results.
+- The snapshot comparison between the evidence and the gate's fingerprint (`evidence_scope`)
+  was added after these runs, so they were not checked this way. The controller exposes the
+  gate's fingerprint only on completion, so a blocked run reports `unchecked`.
+- The harness honors the OpenAI SDK's own environment (for example a custom base URL). Do not
+  run it with an untrusted environment.
+
 ## Troubleshooting
 
 - `provider unavailable`: the key or service is missing, or the model is not installed or not

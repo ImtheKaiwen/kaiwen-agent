@@ -89,6 +89,7 @@ DEFAULT_IMAGE = "python@sha256:e064671ca452259bab50e8e2c7bd896e39e9a343bb06ca252
 # not a statement of the provider's current price: override them with --price-* after
 # checking the pricing page. Local models cost nothing.
 ASSUMED_OPENAI_PRICE = (2.50, 20.00)
+WORKSPACE_ID = "live"
 WORKING = "def add(a, b):\n    return a + b\n"
 BROKEN = "def add(a, b):\n    return a - b\n"
 TASK_TEXT = (
@@ -486,6 +487,9 @@ class ScenarioReport:
     gate_status: str | None = None
     gate_reason: str | None = None
     worker_output: str = "unavailable"
+    # "match": the authentic evidence names this workspace and the snapshot the gate
+    # evaluated. "mismatch": it does not. "unchecked": the gate evaluated no fingerprint.
+    evidence_scope: str = "unchecked"
     worker_verified_field: bool | None = None
     model_claimed_success: bool | None = None
     task_status: str | None = None
@@ -870,7 +874,7 @@ async def _scenario(
     root = base / f"project-{name}"
     root.mkdir()
     make_project(root, WORKING if name == "pass" else BROKEN)
-    filesystem = WorkspaceFilesystem(workspace_id="live", roots={"main": root})
+    filesystem = WorkspaceFilesystem(workspace_id=WORKSPACE_ID, roots={"main": root})
     runner = runner_factory(filesystem)
     try:
         if hasattr(runner, "verify"):
@@ -1085,6 +1089,11 @@ async def _assess(
         result.sandbox_exit_code = latest.get("exit_code")
         fingerprint = latest.get("snapshot_fingerprint")
         result.snapshot_fingerprint = fingerprint[:16] if isinstance(fingerprint, str) else None
+        gate_fingerprint = outcome.verified_input_fingerprint
+        if latest.get("workspace_id") != WORKSPACE_ID:
+            result.evidence_scope = "mismatch"
+        elif gate_fingerprint is not None:
+            result.evidence_scope = "match" if fingerprint == gate_fingerprint else "mismatch"
     completed = outcome.status == WorkflowOutcomeStatus.COMPLETED
     if completed:
         result.stages.completion_gate = "pass"
@@ -1095,6 +1104,9 @@ async def _assess(
         result.stages.overall = "fail"
     elif not output:
         result.stages.overall = "fail"
+    elif result.evidence_scope == "mismatch":
+        result.stages.overall = "fail"
+        result.reason = "authentic evidence does not belong to this workspace snapshot"
     elif result.name == "pass":
         ok = asked and bool(authenticated) and completed and result.sandbox_exit_code == 0
         result.stages.overall = "pass" if ok else "fail"
@@ -1103,7 +1115,9 @@ async def _assess(
         failed_run = bool(authenticated) and result.sandbox_exit_code not in (0, None)
         ok = asked and failed_run and not completed
         result.stages.overall = "pass" if ok else "fail"
-    if result.stages.overall != "pass":
+    if result.stages.overall != "pass" and result.evidence_scope == "mismatch":
+        result.failure_category = result.failed_stage = "evidence_or_gate_failure"
+    elif result.stages.overall != "pass":
         _classify(result, ledger, completed, asked, bool(authenticated), has_output=bool(output))
 
 

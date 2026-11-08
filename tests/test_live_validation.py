@@ -220,6 +220,9 @@ def test_a_scripted_model_passes_both_scenarios_through_the_real_worker_stack() 
         assert item.sandbox_executed and item.worker_verified_field is False
         assert item.snapshot_fingerprint is not None and len(item.snapshot_fingerprint) == 16
     assert (good.sandbox_exit_code, good.stages.completion_gate) == (0, "pass")
+    # The controller exposes the gate's fingerprint only on completion, so a blocked run cannot
+    # have its snapshot compared; the workspace identity is still checked.
+    assert (good.evidence_scope, bad.evidence_scope) == ("match", "unchecked")
     assert (bad.sandbox_exit_code, bad.stages.completion_gate) == (1, "fail")
     assert bad.model_claimed_success is True and bad.stages.overall == "pass"
     assert good.worker_verified_field is False  # even when the gate passes
