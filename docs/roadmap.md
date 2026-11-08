@@ -487,22 +487,43 @@ Each defect was reproduced with a failing test before its fix.
 - [x] PR #11 (squash commit `3f2d967`, merged): workflow worker actions are owned by the durable
       run, a restarted run with an unresolved action of its own is blocked, and the legacy
       inventory API exists. This is the prerequisite for the Lead work below.
-- [x] M6.3.3-A (draft pull request, not merged, pending independent review): ADR 0015 (status
-      Proposed), the optional `TaskRunQuery` capability (owner- and run-scoped, keyset-paged,
+- [x] M6.3.3-A (pull request 12, squash commit `276e814`, merged after an independent review and
+      its R1 corrections; all 10 CI jobs passed on the exact head and the post-merge run on
+      `main` succeeded): ADR 0015 (Proposed when merged; accepted since, see below), the optional
+      `TaskRunQuery` capability (owner- and run-scoped, keyset-paged,
       SQL-filtered; SQLite ownership columns verified against `runtime_runs`, which establishes
       membership of a claim in an existing run of the owner and not who wrote the task, with a
       one-time atomic backfill that leaves unverifiable historical rows unavailable), and the
       read-only `LeadViewAssembler`/`LeadView`. Verified by deterministic tests including a real
       workflow integration test and mutation checks of the key protections.
-- [x] M6.3.3-A independent review R1 corrections (same draft pull request): the Lead view is
+- [x] M6.3.3-A independent review R1 corrections (merged within pull request 12): the Lead view is
       bounded and rejects contract-violating `TaskRunQuery` pages instead of looping, storage
       failures surface as stable `LeadViewError` codes or `unavailable_sources` with sanitized
       logs, reference availability is explicit (`checked` versus `unavailable`, failed versus
       unchecked claims), and the trusted-write boundary of `TaskStore` is documented accurately.
-- Not done: delegation proposals and admission, the Lead tools, cycle-boundary delegation
-  (later M6.3.3 work packages, blocked on acceptance of ADR 0015), reviewer approval and team
-  acceptance (M6.3.4). The Lead view needs a store with `TaskRunQuery`; custom and in-memory
-  task stores do not provide it yet.
+- [x] ADR 0015 accepted by the operator on 2026-11-09 with amendments A1 to A4: the central
+      `PolicyEngine` is authoritative and only an explicit allow admits; preliminary admission is
+      point-in-time and not a reservation, and `WorkflowCompiler` alone is not a final
+      authorization; a delegation-driven revision gets its own reason and the child depth is
+      derived from the trusted parent; job and workflow delegation share admission checks and no
+      execution path.
+- [x] M6.3.3-B shared delegation admission (draft pull request, not merged, pending independent
+      review): `DelegationAdmission` in `kaiwen_agent.policy`, `SubagentDelegator` rebuilt on it
+      with its public behavior kept (a raising policy and malformed facts now fail closed with a
+      sanitized message; opt-in `resource_allowlist` for the unrestricted job-path resource
+      keys), `WorkflowDelegationAdmission` for workflow proposals (authority to delegate and the
+      capability ceiling come from a host-owned `DelegationAuthority` mapping, not from the parent
+      task's recorded capabilities), and the Lead view's bounded
+      task scan extracted into `scan_run_tasks`. Admission only: nothing is submitted, created,
+      revised or run. Verified by deterministic tests (including honest characterizations of the
+      point-in-time and per-instance-lock limits) and mutation checks of the key protections.
+- Not done: the cycle-boundary integration, the explicit revision reason and the final
+  authorization with fresh policy and limit checks (PR-C1), model-facing proposal tools and
+  durable idempotent proposals (PR-C2), bounded cross-cycle handoff over existing stores
+  (PR-C3), reviewer approval and team acceptance (M6.3.4). There is no atomic reservation of
+  delegation quotas: the job path serializes within one delegator instance only, and the
+  workflow admission is preliminary. The Lead view and workflow admission need a store with
+  `TaskRunQuery`; custom and in-memory task stores do not provide it yet.
 
 ### M7 design items (not started)
 

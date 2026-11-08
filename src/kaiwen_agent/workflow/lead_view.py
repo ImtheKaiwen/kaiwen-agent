@@ -29,7 +29,6 @@ import logging
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime
-from functools import partial
 from typing import Any, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -43,19 +42,14 @@ from kaiwen_agent.runtime import (
     RuntimeRunStatus,
     WorkspaceBinding,
 )
-from kaiwen_agent.tasks import (
-    MAX_TASK_RUN_PAGE,
-    AgentTask,
-    TaskRunPage,
-    TaskRunQuery,
-    TaskStatus,
-)
+from kaiwen_agent.tasks import AgentTask, TaskRunQuery, TaskStatus
 from kaiwen_agent.tools.durability import (
     ActionIntentStatus,
     ActionIntentStore,
     ApprovalStatus,
     DurableApprovalStore,
 )
+from kaiwen_agent.workflow.run_tasks import RunTaskScanError, scan_run_tasks
 from kaiwen_agent.workflow.task_context import TaskContextAssembler
 
 logger = logging.getLogger(__name__)
@@ -333,45 +327,22 @@ class LeadViewAssembler:
         )
 
     async def _listed_tasks(self, run: RuntimeRunRecord) -> tuple[list[AgentTask], int, bool]:
-        """Up to `max_tasks` rows of the run, however the store behaves.
+        """Up to `max_tasks` rows of the run, however the store behaves (see `scan_run_tasks`).
 
-        Every accepted page must examine at least one row when it says more exist, its cursor must
-        strictly advance, its tasks must be unique and ascending, and tasks plus unreadable rows
-        may not exceed the requested limit. Any violation raises `task_listing_invalid` instead of
-        looping or returning more than `max_tasks`.
+        A contract-violating page raises `task_listing_invalid` and a failing store raises
+        `task_store_unavailable`, instead of looping or returning more than `max_tasks`.
         """
 
-        collected: list[AgentTask] = []
-        unreadable = 0
-        examined = 0
-        cursor: str | None = None
-        for _ in range(self.max_tasks):  # each continuing page examines >= 1 row, so this suffices
-            limit = min(MAX_TASK_RUN_PAGE, self.max_tasks - examined)
-            after = cursor
-            page = await _guard(
-                "task_store_unavailable",
-                partial(
-                    self.tasks.list_run_tasks,
-                    tenant_id=run.tenant_id,
-                    user_id=run.user_id,
-                    runtime_run_id=run.id,
-                    limit=limit,
-                    after_id=after,
-                ),
-                run.id,
-            )
-            tasks, dropped, cursor = _valid_page(page, limit=limit, after=after)
-            examined += len(tasks) + dropped
-            unreadable += dropped
-            for task in tasks:
-                # The store already scoped the query; a custom store is not trusted blindly.
-                if _belongs_to(task, run):
-                    collected.append(task)
-                else:
-                    unreadable += 1
-            if cursor is None or examined >= self.max_tasks:
-                break
-        return collected, unreadable, cursor is not None
+        code: str | None = None
+        error_type: str | None = None
+        try:
+            scan = await scan_run_tasks(self.tasks, run, max_tasks=self.max_tasks)
+        except RunTaskScanError as error:
+            code, error_type = error.code, error.error_type
+        if code is not None:  # raised outside the handler so nothing is chained
+            _log_failure(code, error_type or "TaskRunPage", run.id)
+            raise LeadViewError(code)
+        return list(scan.tasks), scan.unreadable, scan.truncated
 
     def _reference_capability(self, unavailable: set[str]) -> tuple[bool, bool]:
         """Whether artifact and evidence claims can be evaluated at all, and why not."""
@@ -534,48 +505,6 @@ def _note_failure(unavailable: set[str], code: str, error: Exception, run_id: st
     if code not in unavailable:
         unavailable.add(code)
         _log_failure(code, type(error).__name__, run_id)
-
-
-def _valid_page(
-    page: Any, *, limit: int, after: str | None
-) -> tuple[list[AgentTask], int, str | None]:
-    """A store page checked against the `TaskRunQuery` contract, or `task_listing_invalid`."""
-
-    if not isinstance(page, TaskRunPage):
-        raise LeadViewError("task_listing_invalid")
-    tasks, dropped, cursor = page.tasks, page.unreadable, page.next_after_id
-    if (
-        not isinstance(tasks, (tuple, list))
-        or not all(isinstance(task, AgentTask) for task in tasks)
-        or type(dropped) is not int
-        or dropped < 0
-        or len(tasks) + dropped > limit
-        or (cursor is not None and (not isinstance(cursor, str) or not cursor))
-    ):
-        raise LeadViewError("task_listing_invalid")
-    previous = after
-    for task in tasks:
-        # Strictly ascending and strictly after the cursor: no repeats, no going backwards.
-        if previous is not None and task.id <= previous:
-            raise LeadViewError("task_listing_invalid")
-        previous = task.id
-    if cursor is not None:
-        examined = len(tasks) + dropped
-        behind_cursor = after is not None and cursor <= after
-        behind_tasks = bool(tasks) and cursor < tasks[-1].id
-        if examined == 0 or behind_cursor or behind_tasks:
-            raise LeadViewError("task_listing_invalid")
-    return list(tasks), dropped, cursor
-
-
-def _belongs_to(task: AgentTask, run: RuntimeRunRecord) -> bool:
-    return (
-        task.tenant_id == run.tenant_id
-        and task.user_id == run.user_id
-        and task.session_id == run.session_id
-        and task.metadata.get("runtime_run_id") == run.id
-        and task.trace_id != run.id
-    )
 
 
 def _category(reason: str | None) -> str | None:

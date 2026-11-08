@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Add shared, host-controlled delegation admission (M6.3.3-B, ADR 0015 accepted):
+  `DelegationAdmission`, `DelegationClaim`, `AdmissionDecision` and `AdmissionOutcome` in
+  `kaiwen_agent.policy`. It reuses the central `PolicyEngine` (`agent.delegate`); only an
+  explicit allow admits, and require-approval, review and modify never admit or rewrite a
+  request. Decisions are preliminary and point-in-time (`preliminary` and `reserves_nothing`
+  are always true), not a reservation or a final authorization. `SubagentDelegator` is rebuilt
+  on it with its public behavior kept; a policy that raises, or malformed host facts, now fail
+  closed with a stable message and no exception text instead of propagating the raw exception.
+  `SubagentDelegator(resource_allowlist=...)` is a new opt-in that denies delegated
+  `resource_keys` outside a host-owned list; the default stays unrestricted. New
+  `WorkflowDelegationAdmission` and `WorkflowDelegationProposal` validate a Lead's workflow
+  proposal against the trusted run, workspace, parent task (depth derived by the host), the
+  host-owned `DelegationAuthority` mapping that says which workers may delegate and up to which
+  capabilities (a parent task's recorded capabilities are plan-authored and never the
+  authority), the `WorkflowCompiler` allowlists and limits and the shared admission, without
+  creating tasks, submitting jobs or running the scheduler. The bounded task scan of the Lead view moved to the
+  shared `scan_run_tasks` with unchanged behavior.
 - Add the read-only Lead coordination view foundation (M6.3.3-A, ADR 0015 proposed): the
   optional `TaskRunQuery` store capability (`list_run_tasks`, owner- and run-scoped, SQL-filtered,
   keyset-paged, with `SQLitePersistence` support), and `LeadViewAssembler`/`LeadView`, a bounded,
