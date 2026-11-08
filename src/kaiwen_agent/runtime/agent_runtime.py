@@ -20,6 +20,7 @@ from kaiwen_agent.models.base import ModelProvider
 from kaiwen_agent.runtime.models import AutonomyLevel, RunMode, RuntimeIdentity
 from kaiwen_agent.sessions import InMemoryRunStore, RunStore
 from kaiwen_agent.tools.definition import ToolDefinition
+from kaiwen_agent.tools.durability import DurableActionScope
 from kaiwen_agent.tools.execution import ToolExecutor
 from kaiwen_agent.tools.registry import ToolRegistry
 from kaiwen_agent.tools.results import ToolResultProcessingExecutor, ToolResultProcessor
@@ -32,6 +33,20 @@ class RuntimeModeUnavailableError(RuntimeError):
 
 class ContextWindowExceededError(RuntimeError):
     pass
+
+
+def _check_action_scope(scope: DurableActionScope, identity: RuntimeIdentity) -> None:
+    """A durable scope must belong to this invocation's owner; never fall back silently."""
+
+    if (scope.tenant_id, scope.user_id, scope.session_id) != (
+        identity.tenant_id,
+        identity.user_id,
+        identity.session_id,
+    ):
+        raise ValueError("Durable action scope does not match the runtime identity")
+    claimed = identity.metadata.get("runtime_run_id")
+    if claimed is not None and claimed != scope.runtime_run_id:
+        raise ValueError("Durable action scope does not match the identity's workflow run")
 
 
 class AgentRuntime:
@@ -93,11 +108,14 @@ class AgentRuntime:
         autonomy: AutonomyLevel | None = None,
         tool_names: Sequence[str] = (),
         services: Mapping[str, Any] | None = None,
+        action_scope: DurableActionScope | None = None,
     ) -> AgentResult:
         if mode == RunMode.WORKFLOW:
             raise RuntimeModeUnavailableError(
                 "Workflow mode requires the durable workflow controller"
             )
+        if action_scope is not None:
+            _check_action_scope(action_scope, identity)
         selected_tools = self._select_tools(tool_names) if mode == RunMode.ACTION else ()
         if mode == RunMode.CHAT and tool_names:
             raise ValueError("Chat mode does not expose tools; use action mode explicitly")
@@ -144,7 +162,7 @@ class AgentRuntime:
             tool_errors=self.tool_errors,
             max_tool_errors=self.max_tool_errors,
         )
-        return await agent.run(normalized_input, context=context)
+        return await agent.run(normalized_input, context=context, action_scope=action_scope)
 
     async def chat(
         self,
@@ -170,6 +188,7 @@ class AgentRuntime:
         tool_names: Sequence[str],
         autonomy: AutonomyLevel | None = None,
         services: Mapping[str, Any] | None = None,
+        action_scope: DurableActionScope | None = None,
     ) -> AgentResult:
         return await self.run(
             text,
@@ -178,6 +197,7 @@ class AgentRuntime:
             autonomy=autonomy,
             tool_names=tool_names,
             services=services,
+            action_scope=action_scope,
         )
 
     def _require_durable_side_effects(

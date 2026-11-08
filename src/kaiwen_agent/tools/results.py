@@ -13,7 +13,8 @@ from kaiwen_agent.artifacts import (
 from kaiwen_agent.context import AgentContext
 from kaiwen_agent.events import EventType
 from kaiwen_agent.tools.definition import ToolDefinition
-from kaiwen_agent.tools.execution import ToolExecutor
+from kaiwen_agent.tools.durability import DurableActionScope
+from kaiwen_agent.tools.execution import ToolExecutor, require_action_scope_support
 from kaiwen_agent.types import ToolCall, ToolResult
 
 ToolEventCallback = Callable[[EventType, dict[str, object]], Awaitable[None]]
@@ -121,6 +122,9 @@ class ArtifactToolResultProcessor:
 class ToolResultProcessingExecutor(ToolExecutor):
     """Decorates the existing executor without changing Agent's public API."""
 
+    # It forwards the scope to the inner executor, which must itself support it.
+    supports_action_scope = True
+
     def __init__(self, executor: ToolExecutor, processor: ToolResultProcessor) -> None:
         self.executor = executor
         self.processor = processor
@@ -133,16 +137,26 @@ class ToolResultProcessingExecutor(ToolExecutor):
         *,
         execution_scope: str,
         emit: ToolEventCallback = _no_events,
+        action_scope: DurableActionScope | None = None,
     ) -> ToolResult:
+        scoped: dict[str, DurableActionScope] = {}
+        run_id = execution_scope
+        if action_scope is not None:
+            # Never run a tool without the durable ownership the host asked for.
+            require_action_scope_support(self.executor)
+            scoped["action_scope"] = action_scope
+            # Offloaded output belongs to the durable run, like the action itself.
+            run_id = action_scope.runtime_run_id
         result = await self.executor.execute(
             definition,
             call,
             context,
             execution_scope=execution_scope,
             emit=emit,
+            **scoped,
         )
         return await self.processor.process(
             result,
             context=context,
-            run_id=execution_scope,
+            run_id=run_id,
         )

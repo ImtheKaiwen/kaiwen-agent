@@ -23,6 +23,7 @@ from kaiwen_agent.runtime import (
     RuntimeRunStatus,
 )
 from kaiwen_agent.tasks import AgentTask
+from kaiwen_agent.tools.durability import DurableActionScope
 
 _RESERVED_METADATA = frozenset(
     {
@@ -75,6 +76,32 @@ async def trusted_task_run(task: AgentTask, *, runs: DurableRunManager) -> Runti
     if record.status is not RuntimeRunStatus.RUNNING:
         raise TaskIdentityError("The durable run is not running")
     return record
+
+
+def trusted_action_scope(task: AgentTask, record: RuntimeRunRecord) -> DurableActionScope:
+    """The durable action scope of a task, from a run `trusted_task_run` just verified.
+
+    Raises `TaskIdentityError` if `record` is not the active run of the task's owner, so a
+    task can never claim actions under a run it does not belong to.
+    """
+
+    if (
+        record.status is not RuntimeRunStatus.RUNNING
+        or task.metadata.get("runtime_run_id") != record.id
+        or (task.tenant_id, task.user_id, task.session_id)
+        != (record.tenant_id, record.user_id, record.session_id)
+    ):
+        raise TaskIdentityError("The task is not bound to this active durable run")
+    try:
+        return DurableActionScope(
+            runtime_run_id=record.id,
+            task_id=task.id,
+            tenant_id=record.tenant_id,
+            user_id=record.user_id,
+            session_id=record.session_id,
+        )
+    except ValueError as error:
+        raise TaskIdentityError("The task identity is malformed") from error
 
 
 async def trusted_task_context(

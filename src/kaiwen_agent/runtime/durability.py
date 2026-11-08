@@ -132,6 +132,28 @@ class RecoveryReport(BaseModel):
     uncertain_action_ids: tuple[str, ...] = ()
     blocked_run_ids: tuple[str, ...] = ()
     owner_lost_run_ids: tuple[str, ...] = ()
+    # Actions that THIS pass found executing and made uncertain, and whose owning run could not
+    # be found for their owner (for example records written before actions were owned by the
+    # durable run). They are never replayed and no run was blocked for them. This is not an
+    # inventory: an action that was already uncertain before this pass is not listed, so an
+    # empty value does not prove there is nothing to reconcile. Use
+    # `RuntimeRecoveryManager.inventory_unassociated_actions` for that.
+    unassociated_action_ids: tuple[str, ...] = ()
+
+
+class UnassociatedActionInventory(BaseModel):
+    """Unresolved actions of one owner that no known durable run is proven to own.
+
+    `complete` is False when the bounded listing may have hidden more: the action ids are then
+    a lower bound and the inventory proves nothing about absence.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    tenant_id: str
+    user_id: str
+    action_ids: tuple[str, ...] = ()
+    complete: bool = True
 
 
 class RuntimeRecoveryManager:
@@ -160,6 +182,7 @@ class RuntimeRecoveryManager:
         if lease is None:
             raise RuntimeRecoveryError("Runtime recovery lease is already held")
         uncertain: list[str] = []
+        unassociated: list[str] = []
         blocked: set[str] = set()
         try:
             intents = await self.stores.actions.list_action_intents(
@@ -183,6 +206,8 @@ class RuntimeRecoveryManager:
                     tenant_id=intent.tenant_id,
                     user_id=intent.user_id,
                 )
+                if run is None:
+                    unassociated.append(intent.id)
                 if run is not None and run.status in {
                     RuntimeRunStatus.CREATED,
                     RuntimeRunStatus.RUNNING,
@@ -196,9 +221,44 @@ class RuntimeRecoveryManager:
                 uncertain_action_ids=tuple(uncertain),
                 blocked_run_ids=tuple(sorted(blocked)),
                 owner_lost_run_ids=tuple(owner_lost),
+                unassociated_action_ids=tuple(unassociated),
             )
         finally:
             await self.leases.release(lease)
+
+    async def inventory_unassociated_actions(
+        self, *, tenant_id: str, user_id: str, limit: int = 1_000
+    ) -> UnassociatedActionInventory:
+        """Read-only, owner-scoped, bounded list of unresolved actions with no known run.
+
+        Covers every executing or uncertain action of the owner, including ones that were
+        already uncertain before any recovery pass. It never infers an owning run: an action
+        whose recorded run id is not a durable run of this owner is listed as is. It changes
+        nothing and takes no lease. The store lists globally up to `limit`, so a full page is
+        reported as incomplete; resolve what is listed and call again.
+        """
+
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        page = await self.stores.actions.list_action_intents(
+            statuses=frozenset({ActionIntentStatus.EXECUTING, ActionIntentStatus.UNCERTAIN}),
+            limit=limit,
+        )
+        found: list[str] = []
+        for intent in page:
+            if (intent.tenant_id, intent.user_id) != (tenant_id, user_id):
+                continue
+            owner = await self.stores.runs.get_runtime_run(
+                run_id=intent.runtime_run_id, tenant_id=tenant_id, user_id=user_id
+            )
+            if owner is None:
+                found.append(intent.id)
+        return UnassociatedActionInventory(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            action_ids=tuple(sorted(found)),
+            complete=len(page) < limit,
+        )
 
     async def _save_blocked(self, run: RuntimeRunRecord, reason: str) -> None:
         """Block a run only if its stored status and owner still match the snapshot."""

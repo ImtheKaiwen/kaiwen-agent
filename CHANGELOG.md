@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- Fix durable action ownership for workflow workers: action intents and approvals of tools run
+  by `AgentRuntimeWorker` were stored under the per-invocation `AgentRun` id, so
+  `WorkflowController` cancellation and `RuntimeRecoveryManager` could not associate an in-flight
+  action with its durable run (a cancelled run could be recorded as safely cancelled while a side
+  effect was in flight). They are now owned by the durable workflow run through a host-verified
+  `DurableActionScope` (new optional `action_scope` on `Agent.run`, `AgentRuntime.run/action` and
+  `ToolExecutor.execute`), with the task as part of the idempotency identity. Standalone
+  executions are unchanged. Records written earlier are not rebound; `RecoveryReport` gains
+  `unassociated_action_ids` for them.
+  `WorkflowController(block_unassociated_actions=True)` (opt-in) blocks runs of an owner with an
+  unresolved action no known run owns, until an operator resolves it. `ToolResultProcessingExecutor`
+  forwards `action_scope` only when set (older `ToolExecutor` subclasses keep working; a scope is
+  never dropped silently), and offloaded tool-result artifacts of workflow workers are owned by
+  the durable run.
+  Durable-scope support is now an explicit executor capability (`supports_action_scope`,
+  `executor_supports_action_scope`): `**kwargs` no longer counts, and an executor that does not
+  declare it is refused before any tool runs when a scope is supplied. `WorkflowController`
+  re-blocks a restarted run that still has an executing or uncertain action of its own until an
+  operator resolves it. `RuntimeRecoveryManager.inventory_unassociated_actions` lists every
+  unresolved action of an owner that no known run owns (`RecoveryReport` only lists actions
+  that pass found executing).
 - Fix the OpenAI function-tool serializer: strict mode is now chosen per tool. A tool whose input
   schema contains a free-form mapping (for example the Coding Kit command tools' `parameters:
   dict[str, str]`) is sent with `strict: false` and its original schema, because OpenAI strict

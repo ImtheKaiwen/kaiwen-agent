@@ -150,16 +150,19 @@ async def _cancelled_run(
     store = SQLitePersistence(tmp_path / "lookup.sqlite3")
     await store.initialize()
     manager, run = await _runtime_run(store)
-    # Older rows first, so the target run's intent falls outside a 1,000-row page.
-    _bulk_insert(
-        tmp_path / "lookup.sqlite3",
-        [_intent(i, run_id="runtime-other") for i in range(unrelated)],
-    )
-    if target_in_flight:
-        _bulk_insert(tmp_path / "lookup.sqlite3", [_intent(0, run_id=run.id)])
     started = asyncio.Event()
 
     async def slow(task: Any, context: Any) -> dict[str, Any]:
+        # The rows exist while the run executes. Seeded before the run starts they would be the
+        # orphans of a dead owner, which the start-of-run guard refuses to start over; this
+        # test is about what cancellation sees. Older rows first, so the target run's intent
+        # falls outside a 1,000-row page.
+        _bulk_insert(
+            tmp_path / "lookup.sqlite3",
+            [_intent(i, run_id="runtime-other") for i in range(unrelated)],
+        )
+        if target_in_flight:
+            _bulk_insert(tmp_path / "lookup.sqlite3", [_intent(0, run_id=run.id)])
         started.set()
         await asyncio.sleep(60)
         return {}
@@ -167,7 +170,7 @@ async def _cancelled_run(
     intents_view: Any = _HidesScopedQuery(store) if hide_scoped_query else store
     controller = _controller(store, slow, action_intents=intents_view)
     task = asyncio.create_task(_execute(controller, run))
-    await started.wait()
+    await asyncio.wait_for(started.wait(), timeout=10)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -223,7 +226,11 @@ def test_complete_small_page_without_a_scoped_query_allows_a_safe_cancel(tmp_pat
 
 def test_failed_lookup_blocks_instead_of_cancelling(tmp_path) -> None:
     class _Broken(_HidesScopedQuery):
+        armed = False  # the store fails while the run executes, not at its start
+
         async def list_action_intents(self, **kwargs: Any) -> Any:
+            if not self.armed:
+                return await self._inner.list_action_intents(**kwargs)
             raise RuntimeError("store unavailable")
 
     async def scenario() -> Any:
@@ -231,14 +238,17 @@ def test_failed_lookup_blocks_instead_of_cancelling(tmp_path) -> None:
         manager, run = await _runtime_run(store)
         started = asyncio.Event()
 
+        broken = _Broken(store)
+
         async def slow(task: Any, context: Any) -> dict[str, Any]:
+            broken.armed = True
             started.set()
             await asyncio.sleep(60)
             return {}
 
-        controller = _controller(store, slow, action_intents=_Broken(store))
+        controller = _controller(store, slow, action_intents=broken)
         task = asyncio.create_task(_execute(controller, run))
-        await started.wait()
+        await asyncio.wait_for(started.wait(), timeout=10)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task

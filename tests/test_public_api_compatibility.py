@@ -36,8 +36,12 @@ def test_agent_and_provider_call_signatures_remain_compatible() -> None:
         assert agent_parameters[added].kind == inspect.Parameter.KEYWORD_ONLY
         assert agent_parameters[added].default is not inspect.Parameter.empty
     run_parameters = inspect.signature(Agent.run).parameters
-    assert tuple(run_parameters) == ("self", "agent_input", "context")
+    assert tuple(run_parameters)[:3] == ("self", "agent_input", "context")
     assert run_parameters["context"].kind == inspect.Parameter.KEYWORD_ONLY
+    # Later additions must stay optional and keyword-only (the durable action scope).
+    assert tuple(run_parameters)[3:] == ("action_scope",)
+    assert run_parameters["action_scope"].kind == inspect.Parameter.KEYWORD_ONLY
+    assert run_parameters["action_scope"].default is None
 
     provider_parameters = inspect.signature(ModelProvider.respond).parameters
     assert tuple(provider_parameters) == (

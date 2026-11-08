@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from hashlib import sha256
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 from pydantic import ValidationError
 
@@ -37,6 +38,7 @@ from kaiwen_agent.tools.durability import (
     ActionIntentRecord,
     ActionIntentStatus,
     ActionIntentStore,
+    DurableActionScope,
 )
 from kaiwen_agent.tools.idempotency import IdempotencyStore, InMemoryIdempotencyStore
 from kaiwen_agent.types import ToolCall, ToolResult
@@ -49,6 +51,11 @@ async def _no_events(event_type: EventType, payload: dict[str, object]) -> None:
 
 
 class ToolExecutor:
+    # Capability declaration for a durable action scope (`execute(action_scope=...)`). It is
+    # honored only when the class that defines the effective `execute` declares it itself, so a
+    # subclass that overrides `execute` must opt in again after making it enforce the scope.
+    supports_action_scope: ClassVar[bool] = True
+
     def __init__(
         self,
         *,
@@ -78,7 +85,21 @@ class ToolExecutor:
         *,
         execution_scope: str,
         emit: ToolEventCallback = _no_events,
+        action_scope: DurableActionScope | None = None,
     ) -> ToolResult:
+        # `execution_scope` is the per-invocation scope. When a host-verified durable
+        # workflow scope is present it owns the action (cancellation and recovery look
+        # actions up by durable run) and names the idempotency namespace: one task of one
+        # run, so tasks that reuse a provider-generated call id never share an intent.
+        owner_run_id = execution_scope
+        if action_scope is not None:
+            _check_action_scope(action_scope, context)
+            owner_run_id = action_scope.runtime_run_id
+            execution_scope = action_scope.execution_identity
+            if call.idempotency_key is not None:
+                call = call.model_copy(
+                    update={"idempotency_key": f"{execution_scope}:{call.idempotency_key}"}
+                )
         try:
             arguments = definition.input_model.model_validate(call.arguments)
         except ValidationError as error:
@@ -97,7 +118,7 @@ class ToolExecutor:
             agent_id=context.agent_id or "unknown-agent",
             session_id=context.session_id,
             conversation_id=context.conversation_id,
-            run_id=execution_scope,
+            run_id=owner_run_id,
             trace_id=context.trace_id or "trace_unavailable",
             environment=context.environment,
             action=f"tool.execute:{definition.name}",
@@ -154,6 +175,7 @@ class ToolExecutor:
             call,
             context,
             execution_scope=execution_scope,
+            owner_run_id=owner_run_id,
             arguments_checksum=arguments_checksum,
             idempotency_identity=idempotency_identity,
         )
@@ -173,6 +195,7 @@ class ToolExecutor:
                 arguments,
                 decision,
                 execution_scope=execution_scope,
+                owner_run_id=owner_run_id,
                 emit=emit,
                 arguments_checksum=arguments_checksum,
                 idempotency_identity=idempotency_identity,
@@ -298,6 +321,7 @@ class ToolExecutor:
         decision: PolicyDecision,
         *,
         execution_scope: str,
+        owner_run_id: str,
         emit: ToolEventCallback,
         arguments_checksum: str,
         idempotency_identity: str,
@@ -363,7 +387,7 @@ class ToolExecutor:
                 call_id=call.id,
                 arguments=call.arguments,
                 side_effect=definition.side_effect,
-                execution_scope=execution_scope,
+                execution_scope=owner_run_id,
                 action_intent_id=action_intent.id if action_intent is not None else None,
                 arguments_checksum=arguments_checksum,
             )
@@ -571,6 +595,7 @@ class ToolExecutor:
         context: AgentContext,
         *,
         execution_scope: str,
+        owner_run_id: str,
         arguments_checksum: str,
         idempotency_identity: str,
     ) -> ActionIntentRecord | None:
@@ -593,7 +618,7 @@ class ToolExecutor:
         intent_id = f"intent_{sha256(stable_material.encode()).hexdigest()}"
         return ActionIntentRecord(
             id=intent_id,
-            runtime_run_id=execution_scope,
+            runtime_run_id=owner_run_id,
             tenant_id=context.tenant_id,
             user_id=context.user_id,
             conversation_id=context.conversation_id,
@@ -643,6 +668,61 @@ async def execute_tool(
         context,
         execution_scope="standalone",
     )
+
+
+def executor_supports_action_scope(executor: object) -> bool:
+    """Whether `executor` declares that it enforces a durable action scope.
+
+    A permissive signature (`**kwargs`) proves nothing: such an executor could accept the scope
+    and ignore it, running a side effect under the wrong run identity. Support is therefore an
+    explicit declaration, `supports_action_scope = True`, made by the class that defines the
+    effective `execute`, which must also name an `action_scope` parameter. A wrapper's inner
+    executor must support it too. This is a contract for cooperating implementations: a
+    malicious or buggy executor can still declare support it does not honor, and no signature
+    inspection can prevent that.
+    """
+
+    if "execute" in vars(executor):
+        return False  # an instance-level override cannot be vouched for by its class
+    for klass in type(executor).__mro__:
+        if "execute" not in vars(klass):
+            continue
+        declared = vars(klass).get("supports_action_scope", False) is True
+        if (
+            not declared
+            or "action_scope" not in inspect.signature(vars(klass)["execute"]).parameters
+        ):
+            return False
+        break
+    else:
+        return False
+    inner = getattr(executor, "executor", None)
+    return executor_supports_action_scope(inner) if isinstance(inner, ToolExecutor) else True
+
+
+def require_action_scope_support(executor: object) -> None:
+    """Refuse, before any tool runs, an executor that cannot enforce a durable scope."""
+
+    if not executor_supports_action_scope(executor):
+        raise TypeError(
+            f"{type(executor).__name__} does not declare support for a durable action scope; "
+            "set `supports_action_scope = True` on the class that implements `execute` after "
+            "making it accept and enforce `action_scope`"
+        )
+
+
+def _check_action_scope(scope: DurableActionScope, context: AgentContext) -> None:
+    """Reject a workflow scope that does not belong to the caller's trusted owner."""
+
+    if (scope.tenant_id, scope.user_id, scope.session_id) != (
+        context.tenant_id,
+        context.user_id,
+        context.session_id,
+    ):
+        raise ValueError("Durable action scope does not match the execution owner")
+    claimed = context.metadata.get("runtime_run_id")
+    if claimed is not None and claimed != scope.runtime_run_id:
+        raise ValueError("Durable action scope does not match the context's workflow run")
 
 
 def _arguments_checksum(arguments: dict[str, Any]) -> str:
