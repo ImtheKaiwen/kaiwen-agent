@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 from collections.abc import Awaitable, Callable
 from typing import Protocol
@@ -136,16 +137,35 @@ class ToolResultProcessingExecutor(ToolExecutor):
         emit: ToolEventCallback = _no_events,
         action_scope: DurableActionScope | None = None,
     ) -> ToolResult:
+        scoped: dict[str, DurableActionScope] = {}
+        run_id = execution_scope
+        if action_scope is not None:
+            if not _accepts_action_scope(self.executor):
+                # Never run a tool without the durable ownership the host asked for.
+                raise TypeError(
+                    f"{type(self.executor).__name__}.execute does not support a durable "
+                    "action scope; update the executor to accept `action_scope`"
+                )
+            scoped["action_scope"] = action_scope
+            # Offloaded output belongs to the durable run, like the action itself.
+            run_id = action_scope.runtime_run_id
         result = await self.executor.execute(
             definition,
             call,
             context,
             execution_scope=execution_scope,
             emit=emit,
-            action_scope=action_scope,
+            **scoped,
         )
         return await self.processor.process(
             result,
             context=context,
-            run_id=execution_scope,
+            run_id=run_id,
         )
+
+
+def _accepts_action_scope(executor: ToolExecutor) -> bool:
+    parameters = inspect.signature(executor.execute).parameters
+    return "action_scope" in parameters or any(
+        item.kind is inspect.Parameter.VAR_KEYWORD for item in parameters.values()
+    )

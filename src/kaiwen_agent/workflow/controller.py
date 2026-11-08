@@ -144,6 +144,7 @@ class WorkflowController:
         lease_ttl_seconds: float = 30.0,
         fingerprint_provider: ProtectedInputFingerprintProvider | None = None,
         workspace_binding: WorkspaceBinding | None = None,
+        block_unassociated_actions: bool = False,
     ) -> None:
         if lease_ttl_seconds <= 0:
             raise ValueError("lease_ttl_seconds must be positive")
@@ -169,6 +170,11 @@ class WorkflowController:
         self.fingerprint_provider = fingerprint_provider
         # Optional. When set, a run must carry exactly this durable workspace binding.
         self.workspace_binding = workspace_binding
+        # Optional, needs `action_intents`. Actions of workflow workers written before they
+        # were owned by the durable run carry a per-invocation id, so no run can be proven to
+        # own them. When set, a run owner with such an unresolved (executing or uncertain)
+        # action cannot start work until an operator resolves it. See docs/persistence.md.
+        self.block_unassociated_actions = block_unassociated_actions
 
     async def execute(
         self,
@@ -296,6 +302,39 @@ class WorkflowController:
             and intent.user_id == run.user_id
         )
 
+    async def _unassociated_actions(
+        self, run: RuntimeRunRecord, identity: RuntimeIdentity
+    ) -> list[str]:
+        """Unresolved actions of this owner that no durable run is known to own.
+
+        Fails closed: no action store, an incomplete listing or any lookup error counts as
+        unresolved, because absence of proof is not proof of absence.
+        """
+
+        store = self.action_intents
+        if store is None:
+            return ["no_action_store"]
+        try:
+            page = await store.list_action_intents(
+                statuses=frozenset({ActionIntentStatus.EXECUTING, ActionIntentStatus.UNCERTAIN}),
+                limit=_UNCERTAIN_PAGE,
+            )
+            if len(page) >= _UNCERTAIN_PAGE:
+                return ["lookup_incomplete"]
+            unresolved: list[str] = []
+            for intent in page:
+                if (intent.tenant_id, intent.user_id) != (run.tenant_id, run.user_id):
+                    continue
+                if intent.runtime_run_id == run.id:
+                    continue
+                owner = await self.runs.get(run_id=intent.runtime_run_id, identity=identity)
+                if owner is None:
+                    unresolved.append(intent.id)
+            return sorted(unresolved)
+        except Exception:  # noqa: BLE001 - any lookup failure must fail closed
+            logger.warning("Could not look up unassociated actions", exc_info=True)
+            return ["unverified"]
+
     async def _execute(
         self,
         *,
@@ -329,6 +368,18 @@ class WorkflowController:
                 quality=None,
                 reason="workspace_binding_mismatch",
             )
+        if self.block_unassociated_actions:
+            unresolved = await self._unassociated_actions(run, identity)
+            if unresolved:
+                return await self._blocked(
+                    writer=writer,
+                    run=run,
+                    identity=identity,
+                    cycle=1,
+                    tasks=[],
+                    quality=None,
+                    reason=f"unassociated_action:{unresolved[0]}",
+                )
         current_plan = plan
         all_tasks: list[AgentTask] = []
         latest_quality: CompletionGateResult | None = None

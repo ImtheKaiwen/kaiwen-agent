@@ -139,8 +139,7 @@ def controller(flow: Flow, **options: Any) -> WorkflowController:
             graph=graph, workers=flow.workers, store=flow.store, max_concurrency=4
         ),
         completion_gate=base.completion_gate,
-        action_intents=flow.store,
-        **options,
+        **{"action_intents": flow.store, **options},
     )
 
 
@@ -848,5 +847,168 @@ def test_legacy_agent_run_scoped_records_are_never_rebound_or_replayed(tmp_path:
         assert report.uncertain_action_ids == ("intent_legacy",)
         assert report.unassociated_action_ids == ("intent_legacy",)
         assert report.blocked_run_ids == ()
+
+    asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------- legacy unresolved actions
+
+
+async def legacy_intent(
+    store: SQLitePersistence,
+    *,
+    status: ActionIntentStatus = ActionIntentStatus.EXECUTING,
+    user: str = "user-1",
+    intent_id: str = "intent_legacy",
+    run_id: str = "run_legacyinvocation",
+) -> ActionIntentRecord:
+    """An action written before workflow actions were owned by the durable run."""
+
+    intent = ActionIntentRecord(
+        id=intent_id,
+        runtime_run_id=run_id,
+        tenant_id="tenant-1",
+        user_id=user,
+        conversation_id="conversation-1",
+        tool_name="demo.write",
+        call_id="call-1",
+        arguments_checksum="a" * 64,
+        idempotency_key=f"{run_id}:call-1",
+        side_effect="reversible",
+    )
+    await store.prepare_action_intent(intent)
+    await store.transition_action_intent(
+        intent_id=intent_id,
+        tenant_id="tenant-1",
+        user_id=user,
+        expected=frozenset({ActionIntentStatus.PREPARED}),
+        status=ActionIntentStatus.EXECUTING,
+    )
+    if status == ActionIntentStatus.UNCERTAIN:
+        await store.transition_action_intent(
+            intent_id=intent_id,
+            tenant_id="tenant-1",
+            user_id=user,
+            expected=frozenset({ActionIntentStatus.EXECUTING}),
+            status=ActionIntentStatus.UNCERTAIN,
+            error_code="process_interrupted",
+        )
+    return intent
+
+
+def test_without_the_guard_an_identical_action_runs_beside_an_unresolved_legacy_one(
+    tmp_path: Path,
+) -> None:
+    """Documents a limit: provenance is missing, so duplicate prevention is not automatic."""
+
+    async def scenario() -> None:
+        flow, _ = build(tmp_path)
+        await legacy_intent(flow.store)
+        effects = Effects()
+        add_worker(flow, "w", Script(tool_call("call-1")), effects)
+        run = await flow.new_run()
+        outcome = await execute(flow, run, plan(spec("t", "w")))
+        assert outcome.status == WorkflowOutcomeStatus.COMPLETED
+        assert effects.count == 1  # guarantee 3 is NOT provided by default
+        untouched = await flow.store.get_action_intent(
+            intent_id="intent_legacy", tenant_id="tenant-1", user_id="user-1"
+        )
+        assert untouched is not None and untouched.status == ActionIntentStatus.EXECUTING
+
+    asyncio.run(scenario())
+
+
+def test_the_guard_blocks_work_until_an_operator_resolves_the_legacy_action(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        flow, _ = build(tmp_path)
+        await legacy_intent(flow.store)
+        effects = Effects()
+        add_worker(flow, "w", Script(tool_call("call-1")), effects)
+        run = await flow.new_run()
+        blocked = await execute(flow, run, plan(spec("t", "w")), block_unassociated_actions=True)
+        assert blocked.status == WorkflowOutcomeStatus.BLOCKED
+        assert blocked.reason == "unassociated_action:intent_legacy"
+        assert effects.count == 0 and blocked.tasks == ()
+        record = await flow.runs.get(run_id=run.id, identity=owner())
+        assert record is not None and record.status == RuntimeRunStatus.BLOCKED
+
+        # Recovery makes the interrupted record uncertain and reports it; that alone does not
+        # resolve it, so a new run is still refused.
+        report = await RuntimeRecoveryManager(
+            stores=DurableRuntimeStores(runs=flow.store, actions=flow.store, approvals=flow.store),
+            leases=InMemoryLeaseStore(),
+        ).reconcile(owner_id="operator")
+        assert report.unassociated_action_ids == ("intent_legacy",)
+        second = await flow.new_run()
+        again = await execute(flow, second, plan(spec("t", "w")), block_unassociated_actions=True)
+        assert again.reason == "unassociated_action:intent_legacy" and effects.count == 0
+
+        # The operator verified the external system and records the outcome explicitly.
+        resolved = await flow.store.transition_action_intent(
+            intent_id="intent_legacy",
+            tenant_id="tenant-1",
+            user_id="user-1",
+            expected=frozenset({ActionIntentStatus.UNCERTAIN}),
+            status=ActionIntentStatus.CANCELLED,
+            error_code="operator_reconciled",
+        )
+        assert resolved is not None and resolved.status == ActionIntentStatus.CANCELLED
+        third = await flow.new_run()
+        done = await execute(flow, third, plan(spec("t", "w")), block_unassociated_actions=True)
+        assert done.status == WorkflowOutcomeStatus.COMPLETED and effects.count == 1
+
+    asyncio.run(scenario())
+
+
+def test_the_guard_ignores_other_owners_and_actions_of_known_runs(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        flow, _ = build(tmp_path)
+        effects = Effects()
+        add_worker(flow, "w", Script(tool_call("call-1")), effects)
+        await legacy_intent(flow.store, user="user-2", intent_id="intent_other_owner")
+        run = await flow.new_run()
+        other_run = await flow.new_run()  # a real durable run owns this in-flight action
+        await legacy_intent(flow.store, intent_id="intent_known_run", run_id=other_run.id)
+        outcome = await execute(flow, run, plan(spec("t", "w")), block_unassociated_actions=True)
+        assert outcome.status == WorkflowOutcomeStatus.COMPLETED
+        assert effects.count == 1
+
+    asyncio.run(scenario())
+
+
+def test_the_guard_fails_closed_without_an_action_store_or_on_lookup_errors(
+    tmp_path: Path,
+) -> None:
+    class Failing:
+        def __init__(self, inner: SQLitePersistence) -> None:
+            self.inner = inner
+
+        async def list_action_intents(self, **_: Any) -> Any:
+            raise RuntimeError("store unavailable")
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.inner, name)
+
+    async def scenario() -> None:
+        flow, _ = build(tmp_path)
+        effects = Effects()
+        add_worker(flow, "w", Script(tool_call("call-1")), effects)
+        run = await flow.new_run()
+        no_store = await execute(
+            flow, run, plan(spec("t", "w")), action_intents=None, block_unassociated_actions=True
+        )
+        assert no_store.reason == "unassociated_action:no_action_store"
+        second = await flow.new_run()
+        broken = await execute(
+            flow,
+            second,
+            plan(spec("t", "w")),
+            action_intents=Failing(flow.store),
+            block_unassociated_actions=True,
+        )
+        assert broken.reason == "unassociated_action:unverified"
+        assert effects.count == 0
 
     asyncio.run(scenario())

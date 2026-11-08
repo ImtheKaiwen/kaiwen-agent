@@ -128,9 +128,31 @@ share an intent or an approval, while a retried task cannot repeat a keyed actio
 `AgentRuntime` and `Agent` executions keep the per-invocation scope unchanged.
 
 Records written by earlier versions for workflow workers carry the per-invocation `run_...`
-id as their owning run. They are not rebound or replayed. `RuntimeRecoveryManager.reconcile`
-marks interrupted ones uncertain and lists those whose owning run cannot be found in
-`RecoveryReport.unassociated_action_ids`; reconcile them manually in the owning system.
+id as their owning run, and nothing persisted says which durable run they belonged to, so the
+owning run is never guessed. Three different guarantees apply to such a record:
+
+1. It is not modified or rebound by this change.
+2. That exact record is never replayed: an executing or uncertain action raises
+   `ActionOutcomeUncertainError`, and recovery marks an interrupted one uncertain.
+3. A semantically identical new action is **not** prevented automatically. A workflow task that
+   repeats the same external effect gets a new, differently owned intent and runs.
+
+To make (3) fail closed, run the upgrade with `WorkflowController(action_intents=...,
+block_unassociated_actions=True)` (off by default). A run of an owner who has an executing or
+uncertain action that no known durable run owns is then blocked with
+`unassociated_action:<intent id>`; no listing, no store and any lookup error also block.
+Operator procedure:
+
+1. Stop old processes, then run `RuntimeRecoveryManager.reconcile`. Interrupted records become
+   uncertain and are listed in `RecoveryReport.unassociated_action_ids`.
+2. Check each one in the owning external system.
+3. Record the verified outcome explicitly with
+   `transition_action_intent(expected={UNCERTAIN}, status=SUCCEEDED | FAILED | CANCELLED,
+   error_code="operator_reconciled")`. History is never rewritten or deleted.
+
+The guard cannot tell a legacy workflow action from an unresolved action of a standalone agent
+with the same owner, so it may also hold workflows until that one is resolved. That is the
+conservative side of the missing provenance.
 
 ## SSE
 

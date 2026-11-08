@@ -11,6 +11,11 @@
   `ToolExecutor.execute`), with the task as part of the idempotency identity. Standalone
   executions are unchanged. Records written earlier are not rebound; `RecoveryReport` gains
   `unassociated_action_ids` for them.
+  `WorkflowController(block_unassociated_actions=True)` (opt-in) blocks runs of an owner with an
+  unresolved action no known run owns, until an operator resolves it. `ToolResultProcessingExecutor`
+  forwards `action_scope` only when set (older `ToolExecutor` subclasses keep working; a scope is
+  never dropped silently), and offloaded tool-result artifacts of workflow workers are owned by
+  the durable run.
 - Fix the OpenAI function-tool serializer: strict mode is now chosen per tool. A tool whose input
   schema contains a free-form mapping (for example the Coding Kit command tools' `parameters:
   dict[str, str]`) is sent with `strict: false` and its original schema, because OpenAI strict
