@@ -4,7 +4,7 @@ from kaiwen_agent.workflow.agent_worker import (
     WorkspaceAuthorization,
     WorkspaceBindingError,
 )
-from kaiwen_agent.workflow.compiler import WorkflowCompiler, WorkflowPlanError
+from kaiwen_agent.workflow.compiler import DelegationBinding, WorkflowCompiler, WorkflowPlanError
 from kaiwen_agent.workflow.context import (
     TaskIdentityError,
     trusted_task_context,
@@ -18,9 +18,12 @@ from kaiwen_agent.workflow.controller import (
 )
 from kaiwen_agent.workflow.delegation import (
     DelegationAuthority,
+    DelegationCandidate,
     WorkflowAdmissionDecision,
+    WorkflowDelegation,
     WorkflowDelegationAdmission,
     WorkflowDelegationProposal,
+    WorkflowDelegationSource,
 )
 from kaiwen_agent.workflow.lead_view import (
     LeadApprovalRef,
@@ -31,6 +34,8 @@ from kaiwen_agent.workflow.lead_view import (
     LeadViewSource,
 )
 from kaiwen_agent.workflow.models import (
+    DelegationBoundary,
+    DelegationParent,
     WorkflowLimits,
     WorkflowOutcome,
     WorkflowOutcomeStatus,
@@ -52,6 +57,10 @@ from kaiwen_agent.workflow.task_context import (
 __all__ = [
     "AgentRuntimeWorker",
     "DelegationAuthority",
+    "DelegationBinding",
+    "DelegationBoundary",
+    "DelegationCandidate",
+    "DelegationParent",
     "LeadApprovalRef",
     "LeadTaskView",
     "LeadView",
@@ -73,8 +82,10 @@ __all__ = [
     "SchedulerFactory",
     "WorkflowAdmissionDecision",
     "WorkflowCompiler",
+    "WorkflowDelegation",
     "WorkflowDelegationAdmission",
     "WorkflowDelegationProposal",
+    "WorkflowDelegationSource",
     "WorkflowController",
     "WorkflowLimits",
     "WorkflowOutcome",

@@ -507,8 +507,10 @@ Each defect was reproduced with a failing test before its fix.
       authorization; a delegation-driven revision gets its own reason and the child depth is
       derived from the trusted parent; job and workflow delegation share admission checks and no
       execution path.
-- [x] M6.3.3-B shared delegation admission (draft pull request, not merged, pending independent
-      review): `DelegationAdmission` in `kaiwen_agent.policy`, `SubagentDelegator` rebuilt on it
+- [x] M6.3.3-B shared delegation admission (pull request 13, squash commit `f114404`, merged after
+      an independent audit and its R1 correction; all 10 CI jobs passed on the exact head and the
+      post-merge run on `main` succeeded): `DelegationAdmission` in `kaiwen_agent.policy`,
+      `SubagentDelegator` rebuilt on it
       with its public behavior kept (a raising policy and malformed facts now fail closed with a
       sanitized message; opt-in `resource_allowlist` for the unrestricted job-path resource
       keys), `WorkflowDelegationAdmission` for workflow proposals (authority to delegate and the
@@ -517,13 +519,23 @@ Each defect was reproduced with a failing test before its fix.
       task scan extracted into `scan_run_tasks`. Admission only: nothing is submitted, created,
       revised or run. Verified by deterministic tests (including honest characterizations of the
       point-in-time and per-instance-lock limits) and mutation checks of the key protections.
-- Not done: the cycle-boundary integration, the explicit revision reason and the final
-  authorization with fresh policy and limit checks (PR-C1), model-facing proposal tools and
-  durable idempotent proposals (PR-C2), bounded cross-cycle handoff over existing stores
-  (PR-C3), reviewer approval and team acceptance (M6.3.4). There is no atomic reservation of
-  delegation quotas: the job path serializes within one delegator instance only, and the
-  workflow admission is preliminary. The Lead view and workflow admission need a store with
-  `TaskRunQuery`; custom and in-memory task stores do not provide it yet.
+- [x] M6.3.3-C1 cycle-boundary delegation (draft pull request, not merged, pending independent
+      review): opt-in `WorkflowController(delegation=...)`, the explicit
+      `WorkflowRevisionReason.DELEGATION_REQUESTED`, a fresh final authorization at the boundary
+      after a cycle and before the completion gate, a compiler-written parent reference and depth
+      for delegated tasks, and the child worker's declared capabilities checked at admission.
+      Requires a lease store; the next cycle is exactly the admitted task tuple and no planner is
+      consulted. Verified by deterministic SQLite-backed tests (restart, ownership loss,
+      cancellation, bounds, forged parents) and mutation checks of the key protections.
+- Not done: model-facing proposal tools and durable idempotent proposals (PR-C2), bounded
+  cross-cycle handoff over existing stores (PR-C3), reviewer approval and team acceptance
+  (M6.3.4). There is no atomic reservation of delegation quotas: delegation at the cycle
+  boundary is safe only because the run lease holder alone writes the run's tasks and the
+  counted quotas are run-scoped; the job path serializes within one delegator instance only.
+  After a restart, earlier delegated tasks count against the per-run limit, so an identical
+  proposal can be denied until durable proposal identity exists. The Lead view and workflow
+  admission need a store with `TaskRunQuery`; custom and in-memory task stores do not provide it
+  yet.
 
 ### M7 design items (not started)
 

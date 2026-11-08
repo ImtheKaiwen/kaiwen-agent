@@ -69,7 +69,13 @@ def limits(**fields: Any) -> DelegationPolicy:
 class Real:
     """Real `AgentRuntimeWorker`s behind the real compiler, so the worker boundary is exercised."""
 
-    def __init__(self, tmp_path: Path, **delegators: DelegationAuthority) -> None:
+    def __init__(
+        self,
+        tmp_path: Path,
+        *,
+        coder_caps: frozenset[str] = HOST_WIDE,
+        **delegators: DelegationAuthority,
+    ) -> None:
         self.flow = Flow(tmp_path)
         self.lead_worker = self.flow.worker(
             "lead",
@@ -77,7 +83,7 @@ class Real:
             allowed_capabilities=frozenset({"logs.read"}),
         )
         self.flow.worker(
-            "coder", self.flow.runtime(Provider(text="done")), allowed_capabilities=HOST_WIDE
+            "coder", self.flow.runtime(Provider(text="done")), allowed_capabilities=coder_caps
         )
         self.compiler = WorkflowCompiler(
             workers=self.flow.workers,
@@ -439,5 +445,37 @@ def test_function_workers_remain_unaffected_by_the_authority_source(tmp_path: Pa
         lead = await env.lead(run)
         assert (await env.ask(run, lead)).admitted
         assert env.executed == []
+
+    run_async(scenario)
+
+
+def test_a_child_worker_that_would_refuse_the_capabilities_is_not_admitted(tmp_path: Path) -> None:
+    """A real `AgentRuntimeWorker` checks `allowed_capabilities` only when it executes (PR #13 R1).
+
+    Admission now checks the same declared contract, so it never admits a child that is doomed to
+    fail at execution, and it still allows what the child worker declares it accepts.
+    """
+
+    async def scenario() -> None:
+        env = Real(
+            tmp_path,
+            coder_caps=frozenset({"logs.read"}),
+            lead=authority("lead", "lead", "logs.read", "deploy"),
+        )
+        run = await env.running_run()
+        parent = task(run.id, "lead", agent="lead", capabilities=frozenset({"logs.read"}))
+        await env.flow.store.save_task(parent)
+
+        async def ask(*caps: str) -> WorkflowAdmissionDecision:
+            return await env.admission().evaluate(
+                run_id=run.id,
+                identity=owner(),
+                parent_task_id=parent.id,
+                proposal=proposal(spec("a", "coder", capabilities=frozenset(caps))),
+            )
+
+        # Within the host ceiling and the host-wide set, but beyond what this worker accepts.
+        denied(await ask("deploy"), "worker_capability_mismatch", "a")
+        assert (await ask("logs.read")).admitted
 
     run_async(scenario)

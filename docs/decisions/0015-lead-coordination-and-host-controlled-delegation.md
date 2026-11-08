@@ -211,6 +211,54 @@ for any key. That is an availability concern, not a data-access one. M6.3.3-B ad
 behavior does not change; hosts that allow model delegation should configure it. The workflow
 admission path requires the compiler's allowlist and denies any other key.
 
+**4.5 Cycle-boundary integration (M6.3.3-C1).** `WorkflowController` takes an optional
+`WorkflowDelegation(source, admission, max_rounds)`; without it the controller is unchanged.
+
+- Boundary. The only point where a delegation can become executable is after a cycle whose
+  tasks all ended without failure and before the completion gate. All tasks of that cycle are
+  terminal, no graph is running, and the gate sees the final state. A failed cycle never reaches
+  it. The source is consulted at every such boundary, so no candidate is ignored: an excess
+  candidate blocks the run (`delegation_round_limit`, `delegation_cycle_limit`).
+- Candidate. A host-controlled `WorkflowDelegationSource` is called with a typed
+  `WorkflowRevisionRequest` whose reason is `DELEGATION_REQUESTED`; that reason can carry no task
+  failure and no gate result. The controller owns the run, the cycle and the eligible parents; a
+  `DelegationCandidate` holds only a parent task id and an untrusted proposal. No durable proposal
+  exists yet, and the controller does not pretend one does (PR-C2).
+- Eligible parent. Only a task that completed in the cycle that just ended is eligible. Task ids
+  carry their cycle, so a parent has exactly one boundary: a replayed candidate cannot delegate
+  twice in an execution, and no historical or unrelated task can delegate. The adapter must be
+  configured with `parent_statuses == {COMPLETED}` (the controller refuses anything broader), and
+  the parent's worker must be in the host-owned `DelegationAuthority` mapping.
+- Final authorization. A fresh `WorkflowDelegationAdmission.evaluate` runs at the boundary and no
+  earlier answer is accepted. It re-reads the run, the workspace binding, the parent and its
+  worker authority and role, the delegator's capability ceiling and any inherited narrowing, the
+  child worker's registration, allowlist and declared `allowed_capabilities`, the central policy
+  with live depth, parallel and per-run counters, and the compiler's structural validation. The
+  controller then re-verifies its fencing token and that the run is still running, and only then
+  compiles. Anything other than an explicit allow blocks the run with an explicit reason
+  (`delegation_denied:<code>`, `delegation_approval_required:<code>`); a pending or rejected
+  delegation is never a completion, never a failure and never a gate result.
+- Plan integrity. The next cycle's plan is built by the controller from the exact task tuple that
+  was admitted. No revision planner is consulted, so none can substitute or add tasks. The
+  compiler, the only writer of task identity, receives a `DelegationBinding` derived from the
+  admission and writes `parent_id` and `delegation_depth` (parent depth plus one) on the child
+  tasks; the plan has no way to set them.
+- Atomicity. A fresh evaluation is not a reservation. What makes the boundary safe is the run
+  lease: only its holder writes the run's tasks, and the quotas counted are run-scoped, so no
+  other controller can create tasks between the evaluation and the compile. Delegation therefore
+  requires a lease store and fails at configuration without one. Limits: external side effects
+  are not fenced by the run lease (the protected write boundary must enforce fencing, as before);
+  custom policy rules that read state outside the run are not covered; without a durable
+  lease store shared by every host the guarantee does not span hosts.
+- Recovery and idempotency. Nothing about an admission is stored, so a restart re-derives and
+  re-authorizes from scratch and a replay never inherits authority. Task ids are deterministic
+  (run, cycle, logical id), so a replay upserts the same rows, and action intents stay owned by
+  the durable run and scoped to `run:task`, so no tool action repeats. An unresolved executing or
+  uncertain action still blocks a restart before delegation is consulted. Honest limit: after a
+  restart the earlier delegated tasks count against the per-run limit, so an identical proposal
+  can be denied (the run blocks with an explicit reason); admitting an identical proposal
+  idempotently needs the durable proposal identity of PR-C2.
+
 ### 5. Private context and bounded handoffs
 
 Agent context stays private (ADR 0014). The Lead sees task state and bounded handoffs from
@@ -248,9 +296,9 @@ cross-run sharing or persistence system are not part of M6.3.3 and are not desig
   contract, `SubagentDelegator` rebuilt on it with unchanged behavior, and the workflow
   admission adapter. Admission only: no job submission, task creation, proposal storage,
   plan revision or scheduler call.
-- PR-C1: controller integration at the cycle boundary, the explicit revision reason, host
-  derivation of delegated task depth, and the final authorization with fresh policy and limit
-  checks.
+- PR-C1 (M6.3.3-C1): controller integration at the cycle boundary, the explicit revision reason,
+  host derivation of delegated task depth, and the final authorization with fresh policy and
+  limit checks (section 4.5). Opt-in, requires a lease store, no durable proposals.
 - PR-C2: model-facing proposal tools and durable, idempotent proposal storage.
 - PR-C3: bounded cross-cycle handoff over the existing stores.
 - M6.3.4: reviewer approval and team acceptance, including any approval workflow for

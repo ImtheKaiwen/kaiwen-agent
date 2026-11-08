@@ -85,6 +85,36 @@ and owner scope. Evidence references are kept as authenticated only when the exi
 `EvidenceSigner` verifies them for this owner and run. Authenticated evidence may be stale;
 only the completion gate decides whether a requirement is satisfied.
 
+## Delegation at the cycle boundary (opt-in)
+
+`WorkflowController(delegation=WorkflowDelegation(source=..., admission=..., max_rounds=...))`
+lets a host-controlled source propose more work after a cycle (ADR 0015). It is off by default
+and changes nothing when absent. It needs a lease store; configuration fails without one, with
+an admission built from a different compiler, with parent statuses other than completed, or with
+a workspace binding other than the controller's.
+
+After a cycle whose tasks all succeeded, and before the completion gate, the controller calls the
+source with a `WorkflowRevisionRequest` whose reason is `DELEGATION_REQUESTED`. The source may
+return a `DelegationCandidate` (a parent task id and an untrusted `WorkflowDelegationProposal`) or
+nothing, in which case the gate judges completion exactly as before. A candidate must name a task
+that completed in that cycle, and it is then freshly authorized: run and workspace, the parent's
+worker in the host-owned `DelegationAuthority` mapping, the capability ceiling, the child worker,
+the central policy with live depth and quota counters, and the compiler. The controller re-verifies
+its fencing token and compiles the admitted tasks, and only those, as the next cycle, with the
+parent reference and depth written by the compiler. A revision planner is never consulted.
+
+Anything but an explicit allow blocks the run with `delegation_denied:<code>` or
+`delegation_approval_required:<code>`; so do a failing source (`delegation_source_failed`), an
+invalid candidate, an ineligible parent and an exhausted round or cycle limit. A pending or
+rejected delegation is never a completion, a task failure or a gate failure, and the completion
+gate alone still decides whether the run is complete, after the delegation rounds.
+
+Limits. A fresh evaluation is not a reservation: the guarantee comes from the run lease and
+fencing token, not from the policy check, and external side effects are not fenced by it. There
+are no durable proposals yet, so a restart re-authorizes from scratch and an identical proposal
+can be denied because the earlier delegated tasks count against the per-run limit (PR-C2).
+Delegated tasks cannot depend on the parent or on earlier cycles (PR-C3).
+
 ## Recovery scope
 
 The runtime run and scheduled task records are durable when the host supplies durable

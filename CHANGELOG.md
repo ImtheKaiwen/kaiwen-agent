@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Add opt-in cycle-boundary delegation to `WorkflowController` (M6.3.3-C1, ADR 0015):
+  `WorkflowController(delegation=WorkflowDelegation(source, admission, max_rounds))`, a new
+  `WorkflowRevisionReason.DELEGATION_REQUESTED` (with typed `DelegationBoundary` data on
+  `WorkflowRevisionRequest`, which can carry no failure and no gate result), `DelegationCandidate`
+  and `WorkflowDelegationSource`. After a cycle with no failures and before the completion gate, a
+  host-controlled source may propose work; only a task completed in that cycle may be the parent,
+  and the proposal is freshly authorized (run, workspace, host `DelegationAuthority`, ceiling,
+  child worker, central policy with live counters, compiler) before the controller compiles
+  exactly the admitted tasks as the next cycle. Anything short of an explicit allow blocks the run
+  with an explicit reason. `WorkflowCompiler.compile` gains an optional `DelegationBinding` that
+  writes `parent_id` and `delegation_depth` on delegated tasks, and workflow admission now also
+  checks the child worker's declared `allowed_capabilities`. Delegation requires a lease store.
+  Without `delegation` configured nothing changes. No durable proposal storage yet (PR-C2).
 - Add shared, host-controlled delegation admission (M6.3.3-B, ADR 0015 accepted):
   `DelegationAdmission`, `DelegationClaim`, `AdmissionDecision` and `AdmissionOutcome` in
   `kaiwen_agent.policy`. It reuses the central `PolicyEngine` (`agent.delegate`); only an

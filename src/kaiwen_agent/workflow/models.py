@@ -71,6 +71,9 @@ class WorkflowLimits(BaseModel):
 class WorkflowRevisionReason(StrEnum):
     EXECUTION_FAILED = "execution_failed"
     QUALITY_BLOCKED = "quality_blocked"
+    # A host-controlled delegation source may propose more work at the cycle boundary (ADR 0015).
+    # It is never reported as a task failure or a gate failure, and it carries neither.
+    DELEGATION_REQUESTED = "delegation_requested"
 
 
 class WorkflowTaskFailure(BaseModel):
@@ -79,6 +82,35 @@ class WorkflowTaskFailure(BaseModel):
     task_id: str
     logical_task_id: str
     error_code: str | None = None
+
+
+class DelegationParent(BaseModel):
+    """A task that completed in the cycle that just ended and so may be named as a parent.
+
+    Every field is a host fact read from the controller's own task results.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    task_id: str
+    logical_task_id: str
+    worker_id: str
+    depth: int = Field(ge=0)
+
+
+class DelegationBoundary(BaseModel):
+    """What the controller tells a delegation source at the cycle boundary.
+
+    The controller owns the run, the cycle and the eligible parents; a source can name only one
+    of the listed parents and supplies untrusted task specs. Nothing here is authority.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    eligible_parents: tuple[DelegationParent, ...] = Field(default=(), max_length=1_000)
+    # Delegation rounds already granted in this execution, and the most that may be granted.
+    rounds_used: int = Field(default=0, ge=0)
+    rounds_allowed: int = Field(default=1, ge=1)
 
 
 class WorkflowRevisionRequest(BaseModel):
@@ -90,6 +122,17 @@ class WorkflowRevisionRequest(BaseModel):
     prior_plan: WorkflowPlan
     task_failures: tuple[WorkflowTaskFailure, ...] = ()
     quality_result: CompletionGateResult | None = None
+    # Present exactly when the reason is DELEGATION_REQUESTED.
+    delegation: DelegationBoundary | None = None
+
+    @model_validator(mode="after")
+    def delegation_is_never_a_failure(self) -> WorkflowRevisionRequest:
+        delegating = self.reason is WorkflowRevisionReason.DELEGATION_REQUESTED
+        if delegating != (self.delegation is not None):
+            raise ValueError("delegation data belongs to a delegation request and only to it")
+        if delegating and (self.task_failures or self.quality_result is not None):
+            raise ValueError("A delegation request carries no task failure and no gate result")
+        return self
 
 
 class WorkflowOutcomeStatus(StrEnum):
