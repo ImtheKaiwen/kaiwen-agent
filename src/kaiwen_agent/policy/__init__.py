@@ -1,3 +1,9 @@
+from kaiwen_agent.policy.admission import (
+    AdmissionDecision,
+    AdmissionOutcome,
+    DelegationAdmission,
+    DelegationClaim,
+)
 from kaiwen_agent.policy.capability import CapabilityPolicy
 from kaiwen_agent.policy.delegation import DelegationPolicy
 from kaiwen_agent.policy.engine import PolicyEngine
@@ -12,7 +18,11 @@ from kaiwen_agent.policy.scheduling import SchedulingPolicy
 from kaiwen_agent.policy.tool import ToolApprovalPolicy, ToolPermissionPolicy
 
 __all__ = [
+    "AdmissionDecision",
+    "AdmissionOutcome",
     "CapabilityPolicy",
+    "DelegationAdmission",
+    "DelegationClaim",
     "DelegationPolicy",
     "PolicyContext",
     "PolicyDecision",

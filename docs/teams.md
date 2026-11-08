@@ -96,6 +96,41 @@ or `None` if that owner has no such run. It reads existing state only (ADR 0015,
 - Ownership of the listed tasks is verified membership in an existing run of the owner, not
   proof of who wrote them; the trusted-write boundary is `TaskStore.save_task` (ADR 0015).
 
-Not part of this layer yet: delegation tools and admission (later M6.3.3 work, pending ADR
-0015), reviewer approval and team acceptance (M6.3.4), isolated parallel writers or worktree
-merging.
+## Delegation admission (workflow, preliminary)
+
+`WorkflowDelegationAdmission.evaluate(run_id=, identity=, parent_task_id=, proposal=)` answers
+"would this Lead proposal be admitted now" (ADR 0015, accepted). It validates and decides; it
+does not act. It creates no task, writes no proposal, revises no plan, calls no scheduler or
+`JobManager` and touches no approval. The only writes are what the central `PolicyEngine`
+itself records for its own audit trail.
+
+- Authority. A `WorkflowDelegationProposal` holds only plan-authored task specs; unknown fields
+  (owner, depth, parent, permissions, authorization) are rejected. The owner and run come from
+  the durable store for the host's identity, the parent task is a host record found in the run's
+  attested listing (`parent_task_id` must come from trusted context, never from the proposal),
+  and the parent's `delegation_depth` and `capabilities` are what the policy sees. The child's
+  depth is the parent's plus one, computed by the host and reported as `child_depth`.
+- Checks, in order: owner, session and running run; the expected workspace binding;
+  the proposal size; the parent and its state (`parent_statuses`, default running); a bounded,
+  validated scan of the run's tasks (a truncated or contract-violating listing fails closed);
+  worker, host-capability and resource-key allowlists of the `WorkflowCompiler`; the compiler's
+  own structural validation as a pure dry run; then, per task, the shared `DelegationAdmission`
+  (child capabilities within the parent's, the central `agent.delegate` policy with the caller's
+  active and per-run delegated-task counters, each task counting the ones before it).
+- Outcomes. Only an explicit allow admits. Deny, a policy error, missing or malformed state and
+  any storage failure are `denied` with a stable `code` and deterministic `reason` (no exception
+  text, nothing logged but the code and exception class). Require-approval, review and modify
+  are `approval_required`; they never admit and never rewrite the proposal. A later denial
+  outranks an earlier approval requirement.
+- Not a reservation, not final. Every decision has `preliminary` and `reserves_nothing` set to
+  true. Concurrent evaluations can all be admitted, and a later evaluation reads fresh state.
+  `WorkflowCompiler` validates structure, workers, host capabilities and resource keys but does
+  not evaluate the policy or know live delegation quotas, so it is not a final authorization.
+  The authoritative final admission, with fresh policy and limit checks where work becomes
+  executable, belongs to the controller integration (PR-C1). Per-run counters count the
+  caller's delegated tasks in this run; the job path counts across runs.
+
+Not part of this layer yet: the cycle-boundary integration with an explicit revision reason
+and the final authorization (PR-C1), model-facing proposal tools and durable idempotent
+proposals (PR-C2), bounded cross-cycle handoff (PR-C3), reviewer approval and team acceptance
+(M6.3.4), isolated parallel writers or worktree merging.

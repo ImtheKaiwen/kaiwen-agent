@@ -16,6 +16,11 @@ from kaiwen_agent.workflow.controller import (
     WorkflowController,
     WorkflowRevisionPlanner,
 )
+from kaiwen_agent.workflow.delegation import (
+    WorkflowAdmissionDecision,
+    WorkflowDelegationAdmission,
+    WorkflowDelegationProposal,
+)
 from kaiwen_agent.workflow.lead_view import (
     LeadApprovalRef,
     LeadTaskView,
@@ -64,7 +69,10 @@ __all__ = [
     "TaskIdentityError",
     "trusted_task_context",
     "SchedulerFactory",
+    "WorkflowAdmissionDecision",
     "WorkflowCompiler",
+    "WorkflowDelegationAdmission",
+    "WorkflowDelegationProposal",
     "WorkflowController",
     "WorkflowLimits",
     "WorkflowOutcome",

@@ -7,7 +7,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from kaiwen_agent.jobs.manager import JobManager
 from kaiwen_agent.jobs.models import AgentJobRef, JobContext, JobSubmitRequest
-from kaiwen_agent.policy import PolicyContext, PolicyDecisionType, PolicyEngine
+from kaiwen_agent.policy import (
+    AdmissionOutcome,
+    DelegationAdmission,
+    DelegationClaim,
+    PolicyEngine,
+)
 
 
 class DelegationDeniedError(PermissionError):
@@ -35,9 +40,21 @@ class DelegationRequest(BaseModel):
 class SubagentDelegator:
     """Fail-closed delegation boundary layered on the shared JobManager."""
 
-    def __init__(self, *, jobs: JobManager, policy_engine: PolicyEngine) -> None:
+    def __init__(
+        self,
+        *,
+        jobs: JobManager,
+        policy_engine: PolicyEngine,
+        resource_allowlist: frozenset[str] | None = None,
+    ) -> None:
         self.jobs = jobs
         self.policy_engine = policy_engine
+        # None keeps the historical behavior: resource keys are not restricted on the job path
+        # (ADR 0015). A host that lets a model delegate should configure an allowlist.
+        self.resource_allowlist = resource_allowlist
+        self.admission = DelegationAdmission(policy_engine=policy_engine)
+        # Serializes counting, policy evaluation and submission within this instance only. It is
+        # not atomic across delegator instances or processes over the same JobManager.
         self._submission_lock = asyncio.Lock()
 
     async def delegate(self, context: JobContext, request: DelegationRequest) -> AgentJobRef:
@@ -73,34 +90,30 @@ class SubagentDelegator:
                 requested_by_agent_id=context.agent_id,
                 parent_run_id=context.run_id,
             )
-        decision = await self.policy_engine.evaluate(
-            PolicyContext(
+        decision = await self.admission.evaluate(
+            DelegationClaim(
                 tenant_id=context.tenant_id,
                 user_id=context.user_id,
-                agent_id=context.agent_id,
                 session_id=context.session_id,
+                agent_id=context.agent_id,
+                delegate_id=request.worker_agent_id,
+                parent_depth=current_depth,
+                active_delegations=parallel,
+                delegations_in_run=jobs_in_run,
+                caller_capabilities=context.capabilities,
+                requested_capabilities=request.requested_capabilities,
+                parent_capabilities=parent.capabilities if parent is not None else None,
+                resource_keys=tuple(request.resource_keys),
+                resource_allowlist=self.resource_allowlist,
                 conversation_id=context.conversation_id,
                 run_id=context.run_id,
-                trace_id=context.trace_id or "delegation",
-                action="agent.delegate",
-                resource=request.worker_agent_id,
-                capabilities=context.capabilities,
-                metadata={
-                    "delegation_depth": current_depth,
-                    "parallel_jobs": parallel,
-                    "jobs_in_run": jobs_in_run,
-                    "requested_capabilities": sorted(request.requested_capabilities),
-                    "parent_job_id": request.parent_job_id,
-                },
+                trace_id=context.trace_id,
+                parent_id=request.parent_job_id,
             )
         )
-        if decision.decision in {
-            PolicyDecisionType.REQUIRE_APPROVAL,
-            PolicyDecisionType.REVIEW,
-            PolicyDecisionType.MODIFY,
-        }:
+        if decision.outcome is AdmissionOutcome.APPROVAL_REQUIRED:
             raise DelegationApprovalRequiredError(decision.reason)
-        if decision.decision != PolicyDecisionType.ALLOW:
+        if not decision.admitted:
             raise DelegationDeniedError(decision.reason)
         return await self.jobs.submit_delegated(
             context,

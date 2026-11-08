@@ -1,6 +1,8 @@
 # ADR 0015: Lead coordination view and host-controlled delegation
 
-- Status: Proposed (pending operator review; not accepted)
+- Status: Accepted (operator decision of 2026-11-09, with the amendments A1 to A4 incorporated
+  in section 4). The acceptance covers the architecture and the M6.3.3-B implementation, not a
+  merge, release or deployment of any pull request.
 - Builds on: ADR 0011, ADR 0013, ADR 0014. It does not supersede ADR 0014.
 
 ## Context
@@ -27,6 +29,26 @@ The audit of the code at baseline `3f2d967` found what already owns each concern
   remains the only judge of requirement satisfaction (ADR 0013).
 - Action intents and approvals are owned by the durable run (PR #11) and have owner-scoped
   retrieval, per run for intents and per intent for approvals.
+
+The audit of the delegation code at baseline `276e814` (for section 4) found:
+
+- `SubagentDelegator` is the only model-facing delegation boundary. It checks capabilities
+  against the caller and the parent job, counts jobs in the `JobStore`, evaluates the central
+  `PolicyEngine` (`agent.delegate`, `DelegationPolicy`) and only then calls
+  `JobManager.submit_delegated`. REQUIRE_APPROVAL, REVIEW and MODIFY already raise a typed
+  approval-required error; DENY raises a denial. It serializes count, policy and submit with a
+  per-instance `asyncio.Lock`.
+- `PolicyEngine` returns the most restrictive decision (DENY, REQUIRE_APPROVAL, REVIEW,
+  MODIFY, ALLOW) and denies by default when no rule applies. A policy that raises propagates
+  the raw exception.
+- `WorkflowCompiler` validates structure, workers, host-wide capabilities, resource keys and
+  size limits. It does not call the `PolicyEngine`, does not know live delegation quotas and
+  does not set `delegation_depth` (compiled tasks are depth 0).
+- The job path does not allowlist `resource_keys`: `SubagentDelegator` does not check them and
+  `JobManager._submit` stores them on the job. The workflow path does, through
+  `WorkflowCompiler.resource_allowlist`.
+- `WorkflowRevisionReason` has only `EXECUTION_FAILED` and `QUALITY_BLOCKED`, and the
+  revision planner is consulted only for those.
 
 ## Decision
 
@@ -95,28 +117,86 @@ would address (a trusted host component forging ownership) is outside the bounda
 assumes, and nothing found requires it. A deployment that exposes `save_task` to less-trusted
 code must add its own authorization in front of it.
 
-### 4. Host-controlled delegation admission (future, not implemented here)
+### 4. Host-controlled delegation admission
 
-Delegation is a request, never an execution. A Lead may later propose tasks; the host admits
-them. This ADR fixes the shape so PR-A does not foreclose it:
+Delegation is a request, never an execution. A Lead proposes; the host admits. A proposal is
+untrusted input, and permissions come from the host's worker configuration, never from the
+proposal. A proposal is a durable, owner- and run-scoped record with a host-derived idempotency
+key, so a retried proposal cannot admit work twice (PR-C2). Admission happens only at an
+explicit cycle boundary of the existing `WorkflowController`; tasks are not injected into a
+running graph. The amendments A1 to A4 of the operator decision are part of this section.
 
-- A proposal is a durable, owner- and run-scoped record with a host-derived idempotency key,
-  so a retried proposal cannot admit work twice. Proposal content is untrusted input.
-- Admission is a host decision: plan validation by the existing `WorkflowCompiler` (worker
-  allowlist, capabilities, resource keys, size limits), workspace binding consistency, and
-  limits on count, depth and fan-out. Permissions come from the host's worker
-  configuration, never from the proposal.
-- Admission happens only at an explicit cycle boundary of the existing `WorkflowController`,
-  as a plan revision through the existing planner seam. Tasks are not injected into a
-  running graph.
-- No fake Completion Gate failure: a delegation request must not be modelled by making the
-  gate fail to force another cycle. The gate reports requirement results only.
-- Delegation depth and the existing `delegation_depth` field bound recursion.
+**4.1 Central policy authority (A1).** Admission reuses the central `PolicyEngine` and its
+`agent.delegate` action (`DelegationPolicy` and any other registered rule). It adds no second
+policy engine. Only an explicit ALLOW admits. DENY fails closed. REQUIRE_APPROVAL, REVIEW and
+MODIFY never authorize and never modify what runs: they produce a typed approval-required
+outcome, as `SubagentDelegator` does with `DelegationApprovalRequiredError`, and a MODIFY
+decision's modifications are not applied. Until an approval workflow exists for delegation
+(M6.3.4), approval-required means not admitted. A policy lookup or evaluation error fails
+closed with a stable, sanitized outcome that carries no exception text. The policy context is
+assembled by the host from trusted records; model-authored fields never set identity,
+permissions, capabilities, depth, counters or authorization metadata.
+
+**4.2 Preliminary versus final admission (A2).** Two different things must not be confused:
+
+1. A preliminary admission evaluation is a point-in-time answer to "would this be admitted
+   now". It is not a reservation: it holds no counter and no lock, it does not guarantee a
+   later submission stays authorized, and concurrent preliminary evaluations can all be
+   admitted.
+2. An authoritative final admission happens at the point where work becomes executable. Only
+   it authorizes work, and it must run fresh policy and limit checks.
+
+`SubagentDelegator` serializes counting, policy evaluation and submission with a per-instance
+lock. That keeps the parallel limit within one delegator instance. It is not cross-process or
+cross-instance atomicity: two delegators over one `JobManager` can both pass the same counters.
+This ADR claims nothing more, and M6.3.3-B adds no distributed reservation system.
+`WorkflowCompiler` validates plan structure, workers, host-wide capabilities, resource keys and
+size limits. It does not evaluate the `PolicyEngine` and does not know live delegation quotas,
+so running it alone is not sufficient authorization. PR-C1 must provide the final
+host-controlled authorization boundary at the cycle boundary, with fresh policy and limit
+checks, before a delegated task is compiled into a graph.
+
+**4.3 Revision reason and host-derived depth (A3).** A delegation-driven workflow revision has
+its own explicit `WorkflowRevisionReason`, added with the controller integration in PR-C1. It is
+never reported as `EXECUTION_FAILED` or `QUALITY_BLOCKED`, and no fake Completion Gate failure
+is used: the gate reports requirement results only. Delegation depth is derived from the trusted
+parent task record and incremented by the host (child depth is parent depth plus one). Depth,
+owner, capabilities and parent identity from a proposal are never authoritative. Parent depth,
+which policies compare against `max_depth`, and child depth, which is recorded on the new task,
+are distinct values. The existing per-agent parallel limit and per-run limit are preserved.
+
+**4.4 Workflow and job delegation are different paths (A4).** `SubagentDelegator` submits jobs
+through `JobManager`. The future Lead path revises a durable workflow plan through
+`WorkflowController` and `TaskScheduler`. They share policy evaluation and admission checks and
+nothing else: there is no shared submission or execution mechanism, and no second orchestration
+engine. Responsibilities:
+
+- Reusable admission (shared): `PolicyEngine` evaluation, capability subset checks, an optional
+  resource-key allowlist, fail-closed validation of host-supplied facts, and the mapping of a
+  policy decision to an outcome.
+- Job-specific: parent job ownership and assigned worker, caller depth equal to parent depth,
+  counting jobs in the `JobStore`, the `JobManager` allowlist, depth and parent checks, and the
+  submission itself.
+- Workflow-specific: the trusted run (owner, session, running), the workspace binding, the
+  trusted parent task and its depth, counting delegated tasks of the run, plan validity by
+  `WorkflowCompiler`, and the proposal size bound.
+- Final execution-time authorization: PR-C1.
+- Execution: `TaskScheduler` and `JobManager`, unchanged.
+
+Resource keys: the job path does not allowlist `resource_keys` (see the audit above). They are
+lock names shared across jobs and tenants, so an unrestricted key lets a delegated job contend
+for any key. That is an availability concern, not a data-access one. M6.3.3-B adds an opt-in
+`SubagentDelegator(resource_allowlist=...)` and keeps the default unrestricted so that existing
+behavior does not change; hosts that allow model delegation should configure it. The workflow
+admission path requires the compiler's allowlist and denies any other key.
 
 ### 5. Private context and bounded handoffs
 
 Agent context stays private (ADR 0014). The Lead sees task state and bounded handoffs from
-the existing assembler rules, not transcripts. Cross-run sharing is not offered.
+the existing assembler rules, not transcripts. Cross-run sharing is not offered. Bounded
+cross-cycle handoff over the existing stores (task outputs, artifacts and the
+`TaskContextAssembler` rules) may be part of PR-C3; a new cross-run sharing or persistence
+system is not authorized.
 
 ### 6. Run and workspace isolation
 
@@ -136,15 +216,24 @@ cross-tenant or cross-user data is returned.
 
 ### 8. M6.3.4 exclusions
 
-Reviewer approval, team acceptance, isolated parallel writers, worktree merging and
-cross-cycle handoff persistence are not part of M6.3.3 and are not designed here.
+Reviewer approval, team acceptance, isolated parallel writers, worktree merging and a new
+cross-run sharing or persistence system are not part of M6.3.3 and are not designed here.
 
 ## Staging
 
-- PR-A (this change set): this ADR, `TaskRunQuery` with the SQLite implementation and
-  migration, and the read-only `LeadViewAssembler`. No delegation code.
-- Later work packages implement the proposal record and admission only after this ADR is
-  accepted. Anything in section 4 may change in review.
+- PR-A (merged, `276e814`): this ADR as Proposed, `TaskRunQuery` with the SQLite
+  implementation and migration, and the read-only `LeadViewAssembler`.
+- PR-B (M6.3.3-B): this ADR accepted with the amendments, the shared `DelegationAdmission`
+  contract, `SubagentDelegator` rebuilt on it with unchanged behavior, and the workflow
+  admission adapter. Admission only: no job submission, task creation, proposal storage,
+  plan revision or scheduler call.
+- PR-C1: controller integration at the cycle boundary, the explicit revision reason, host
+  derivation of delegated task depth, and the final authorization with fresh policy and limit
+  checks.
+- PR-C2: model-facing proposal tools and durable, idempotent proposal storage.
+- PR-C3: bounded cross-cycle handoff over the existing stores.
+- M6.3.4: reviewer approval and team acceptance, including any approval workflow for
+  delegation decisions that need one.
 
 ## Consequences
 
