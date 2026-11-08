@@ -14,8 +14,10 @@
   `resource_keys` outside a host-owned list; the default stays unrestricted. New
   `WorkflowDelegationAdmission` and `WorkflowDelegationProposal` validate a Lead's workflow
   proposal against the trusted run, workspace, parent task (depth derived by the host), the
-  `WorkflowCompiler` allowlists and limits and the shared admission, without creating tasks,
-  submitting jobs or running the scheduler. The bounded task scan of the Lead view moved to the
+  host-owned `DelegationAuthority` mapping that says which workers may delegate and up to which
+  capabilities (a parent task's recorded capabilities are plan-authored and never the
+  authority), the `WorkflowCompiler` allowlists and limits and the shared admission, without
+  creating tasks, submitting jobs or running the scheduler. The bounded task scan of the Lead view moved to the
   shared `scan_run_tasks` with unchanged behavior.
 - Add the read-only Lead coordination view foundation (M6.3.3-A, ADR 0015 proposed): the
   optional `TaskRunQuery` store capability (`list_run_tasks`, owner- and run-scoped, SQL-filtered,

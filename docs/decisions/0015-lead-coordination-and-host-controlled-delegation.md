@@ -183,6 +183,27 @@ engine. Responsibilities:
 - Final execution-time authorization: PR-C1.
 - Execution: `TaskScheduler` and `JobManager`, unchanged.
 
+Delegator authority (clarification from the PR #13 audit). A parent task's recorded
+`capabilities` are what a plan asked for. The compiler checks them only against the host-wide
+capability set, and an `AgentRuntimeWorker` checks them against its own `allowed_capabilities`
+only when it executes the task, so they are neither proof that the parent's worker may delegate
+nor a ceiling for what it may hand down. The workflow admission path therefore takes both from
+a host-owned source: a mapping of `DelegationAuthority` entries (worker id, role, capability
+ceiling) keyed by the parent task's worker id, which the host writes when it composes the
+workflow, for example from the members of a `TeamDefinition` with `may_delegate`. The ceiling is
+what the shared admission and the central policy see as the caller's capabilities; the role is
+checked against the registered worker's own role when it declares one; a parent whose worker has
+no entry is refused even when the central policy allows the target, because the delegate
+allowlist (who may be delegated to) is distinct from the caller's permission to delegate. There
+is no default: without the mapping nobody may delegate. Tool permissions
+(`AgentRuntimeWorker.permissions`) and capability labels (`allowed_capabilities`) are separate
+contracts with no enforced relation, so neither is used as the ceiling. Nested delegation is
+supported by authorizing more than one worker, bounded by the existing depth limit, and nothing
+is keyed to a literal role name. A delegated parent's (depth of at least one) recorded labels,
+which an earlier admission set, additionally narrow its children as on the job path; they never
+widen anything. The trusted-write boundary of `TaskStore` (section 3) still applies to the
+parent record's identity fields.
+
 Resource keys: the job path does not allowlist `resource_keys` (see the audit above). They are
 lock names shared across jobs and tenants, so an unrestricted key lets a delegated job contend
 for any key. That is an availability concern, not a data-access one. M6.3.3-B adds an opt-in

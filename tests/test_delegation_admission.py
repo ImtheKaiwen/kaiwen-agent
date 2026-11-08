@@ -197,8 +197,11 @@ def test_the_policy_context_is_built_from_host_facts_for_each_kind() -> None:
         rule = Rule(PolicyDecisionType.ALLOW)
         engine = admission(rule)
         await engine.evaluate(claim(parent_id="job-1"))
-        await engine.evaluate(claim(parent_id="task-1", kind="workflow", run_id="run-1"))
-        job, workflow = rule.contexts
+        await engine.evaluate(
+            claim(parent_id="task-1", kind="workflow", run_id="run-1", caller_role="lead")
+        )
+        await engine.evaluate(claim(parent_id="task-2", kind="workflow", run_id="run-1"))
+        job, workflow, unnamed = rule.contexts
         assert job.metadata == {
             "delegation_depth": 0,
             "parallel_jobs": 0,
@@ -208,6 +211,8 @@ def test_the_policy_context_is_built_from_host_facts_for_each_kind() -> None:
         }
         assert workflow.metadata["parent_task_id"] == "task-1"
         assert workflow.metadata["delegation_kind"] == "workflow"
+        assert workflow.metadata["delegator_role"] == "lead"  # a host-assigned role, for policies
+        assert "delegator_role" not in unnamed.metadata and "delegator_role" not in job.metadata
         assert "parent_job_id" not in workflow.metadata
         assert (workflow.action, workflow.resource, workflow.run_id) == (
             "agent.delegate",
@@ -287,6 +292,8 @@ def test_resource_keys_are_checked_only_when_an_allowlist_is_given() -> None:
         {"resource_keys": ["repo:main"]},
         {"resource_keys": ("",)},
         {"resource_allowlist": {"repo:main"}},
+        {"caller_role": ""},
+        {"caller_role": 5},
     ],
     ids=lambda bad: next(iter(bad)) + "=" + repr(next(iter(bad.values()))),
 )

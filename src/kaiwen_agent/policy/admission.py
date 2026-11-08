@@ -76,9 +76,14 @@ class AdmissionDecision(BaseModel):
 class DelegationClaim:
     """Host-assembled facts about one delegation. Never taken from model-authored fields.
 
-    `parent_depth` is the depth of the delegating parent (what policies compare to a maximum);
-    the child's depth is `parent_depth + 1`, computed here. `resource_allowlist=None` means
-    resource keys are not enforced (the legacy job path); the workflow path always passes one.
+    `caller_capabilities` is the delegator's authority ceiling and is what the central policy sees
+    as the caller's capabilities: it must come from host-owned configuration (a `JobContext` or a
+    `DelegationAuthority`), never from a plan or a recorded task. `parent_capabilities` only
+    narrows further (a child never exceeds its delegated parent). `parent_depth` is the depth of
+    the delegating parent (what policies compare to a maximum); the child's depth is
+    `parent_depth + 1`, computed here. `resource_allowlist=None` means resource keys are not
+    enforced (the legacy job path); the workflow path always passes one. `caller_role` is the
+    host-assigned role of a workflow delegator, shown to policies as `delegator_role`.
     """
 
     tenant_id: str
@@ -98,6 +103,7 @@ class DelegationClaim:
     run_id: str | None = None
     trace_id: str | None = None
     parent_id: str | None = None
+    caller_role: str | None = None
     kind: Literal["job", "workflow"] = "job"
 
 
@@ -178,6 +184,8 @@ def _policy_context(claim: DelegationClaim) -> PolicyContext:
     else:
         metadata["parent_task_id"] = claim.parent_id
         metadata["delegation_kind"] = "workflow"
+        if claim.caller_role is not None:
+            metadata["delegator_role"] = claim.caller_role
     return PolicyContext(
         tenant_id=claim.tenant_id,
         user_id=claim.user_id,
@@ -218,6 +226,10 @@ def _valid(claim: DelegationClaim) -> bool:
                 isinstance(claim.parent_capabilities, frozenset)
                 and all(isinstance(item, str) for item in claim.parent_capabilities)
             )
+        )
+        and (
+            claim.caller_role is None
+            or (isinstance(claim.caller_role, str) and bool(claim.caller_role))
         )
         and isinstance(claim.resource_keys, tuple)
         and all(isinstance(key, str) and key for key in claim.resource_keys)

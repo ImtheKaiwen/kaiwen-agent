@@ -31,6 +31,7 @@ from kaiwen_agent.runtime import RuntimeIdentity, WorkspaceBinding
 from kaiwen_agent.tasks import AgentTask, TaskRunPage, TaskStatus
 from kaiwen_agent.workers import FunctionWorker
 from kaiwen_agent.workflow import (
+    DelegationAuthority,
     WorkflowAdmissionDecision,
     WorkflowCompiler,
     WorkflowDelegationAdmission,
@@ -118,6 +119,7 @@ class Env:
         rules: list[Any] | None = None,
         limits: WorkflowLimits | None = None,
         allowlist: frozenset[str] = frozenset({"lead", "coder", "phantom"}),
+        delegators: dict[str, DelegationAuthority] | None = None,
         **options: Any,
     ) -> None:
         self.flow = Flow(tmp_path)
@@ -149,6 +151,12 @@ class Env:
                 )
             ]
         )
+        # The host-owned delegation authority: only the Lead may delegate, up to logs.read.
+        self.delegators = (
+            delegators
+            if delegators is not None
+            else {"lead": DelegationAuthority("lead", "lead", frozenset({"logs.read"}))}
+        )
         self.options = options
 
     def admission(self, **overrides: Any) -> WorkflowDelegationAdmission:
@@ -159,6 +167,7 @@ class Env:
             "runs": self.flow.runs,
             "tasks": self.store,
             "compiler": self.compiler,
+            "delegators": self.delegators,
             **self.options,
         }
         settings.update(overrides)

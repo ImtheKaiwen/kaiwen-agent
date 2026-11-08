@@ -13,11 +13,25 @@ task, writes a proposal, revises a plan, starts the scheduler, submits a job or 
 The only writes are whatever the central `PolicyEngine` itself records for its own audit trail.
 
 Trust. The run comes from the durable store for the host-supplied identity. The parent task is
-found in the run's attested listing, so it is a host record; its `delegation_depth`,
-`capabilities` and `agent_id` are what the policy sees (parent depth is read from it and the
-child's depth is parent plus one, computed by the host). `parent_task_id` must come from trusted
-context, never from the proposal. The proposal holds only plan-authored task specs; it has no
-field for owner, depth, permissions or authorization, and unknown fields are rejected.
+found in the run's attested listing, so its identity (`agent_id`, `delegation_depth`) is a host
+record; the child's depth is the parent's plus one, computed by the host. `parent_task_id` must
+come from trusted context, never from the proposal. The proposal holds only plan-authored task
+specs; it has no field for owner, depth, permissions or authorization, and unknown fields are
+rejected.
+
+Delegator authority. A parent task's recorded `capabilities` are what a plan asked for: the
+compiler checks them only against the host-wide capability set, and an `AgentRuntimeWorker`
+checks them against its own `allowed_capabilities` only when it executes the task. They are not
+proof that the parent's worker may delegate, or may hand those capabilities down. Whether a
+worker may delegate at all, and the ceiling of what it may hand down, come only from the
+host-owned `delegators` mapping of `DelegationAuthority` entries, keyed by the parent task's
+worker id and bound to that worker's role. A parent whose worker has no entry is refused even
+when the central policy allows the target worker: the delegate allowlist (who may be delegated
+to) is distinct from the caller's permission to delegate. Tool permissions and capability
+labels are separate contracts (`AgentRuntimeWorker.permissions` versus `allowed_capabilities`,
+with no enforced relation), so neither is used as the ceiling. A delegated parent's recorded
+labels (depth of at least one, set by an earlier admission) additionally narrow its children,
+as on the job path; they never widen anything.
 
 Limits of the answer (ADR 0015, 4.2). The result is preliminary and point-in-time: nothing is
 reserved, concurrent evaluations can all be admitted, and `WorkflowCompiler` alone is not a
@@ -30,6 +44,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
+from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -68,11 +85,41 @@ _REASONS = {
     "plan_too_large": "The proposal exceeds the task limit",
     "parent_not_found": "The parent task was not found in this run",
     "parent_not_active": "The parent task is not in a state that may delegate",
+    "delegator_not_authorized": "The parent task's worker is not authorized to delegate",
+    "delegator_role_mismatch": "The parent task's worker does not hold the authorized role",
     "worker_not_allowed": "A proposed worker is not allowlisted",
     "capability_unavailable": "A proposed capability is not available to the host",
     "resource_not_allowed": "Requested resource keys are not allowlisted",
     "plan_invalid": "The proposed plan is not valid",
 }
+
+
+@dataclass(frozen=True, slots=True)
+class DelegationAuthority:
+    """Host-owned permission for one worker to delegate, and the ceiling of what it may hand down.
+
+    The host writes this when it composes the workflow (for example from the members of a
+    `TeamDefinition` with `may_delegate`); it is never read from a plan, a proposal or a stored
+    task. `worker_id` is the id the worker is registered under (a parent task's `agent_id`),
+    `role` is the host-assigned role it must hold (checked against the registered worker's own
+    `role` when it has one, as `AgentRuntimeWorker` does), and `capabilities` is the delegation
+    ceiling: no child may carry a capability outside it. It is a capability-label ceiling, not a
+    tool-permission set; the two are distinct contracts and are not converted into each other.
+    """
+
+    worker_id: str
+    role: str
+    capabilities: frozenset[str]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.worker_id, str) or not self.worker_id:
+            raise ValueError("A delegation authority needs a worker id")
+        if not isinstance(self.role, str) or not self.role.strip():
+            raise ValueError("A delegation authority needs a role")
+        if not isinstance(self.capabilities, frozenset) or not all(
+            isinstance(item, str) and item for item in self.capabilities
+        ):
+            raise ValueError("A delegation authority needs a frozenset of capability labels")
 
 
 class WorkflowDelegationProposal(BaseModel):
@@ -118,10 +165,24 @@ class WorkflowDelegationAdmission:
         runs: DurableRunManager,
         tasks: TaskRunQuery,
         compiler: WorkflowCompiler,
+        delegators: Mapping[str, DelegationAuthority],
         expected_workspace: WorkspaceBinding | None = None,
         parent_statuses: frozenset[TaskStatus] = frozenset({TaskStatus.RUNNING}),
         max_scan_tasks: int = 500,
     ) -> None:
+        # `delegators` has no default: without the host-owned authority source nobody may
+        # delegate. An empty mapping is allowed and refuses every parent.
+        for worker_id, authority in delegators.items():
+            if not isinstance(authority, DelegationAuthority) or authority.worker_id != worker_id:
+                raise ValueError("Each delegator must be keyed by its own worker id")
+            known = worker_id in compiler.worker_allowlist
+            if known:
+                try:
+                    compiler.workers.get(worker_id)
+                except WorkerNotFoundError:
+                    known = False
+            if not known:
+                raise ValueError("A delegator must be an allowlisted, registered worker")
         if not 1 <= max_scan_tasks <= _MAX_SCAN:
             raise ValueError(f"max_scan_tasks must be between 1 and {_MAX_SCAN}")
         if not parent_statuses:
@@ -133,6 +194,7 @@ class WorkflowDelegationAdmission:
         self.runs = runs
         self.tasks = tasks
         self.compiler = compiler
+        self.delegators: Mapping[str, DelegationAuthority] = MappingProxyType(dict(delegators))
         self.expected_workspace = expected_workspace
         self.parent_statuses = parent_statuses
         self.max_scan_tasks = max_scan_tasks
@@ -203,6 +265,12 @@ class WorkflowDelegationAdmission:
             return _deny("parent_not_found")
         if parent.status not in self.parent_statuses:
             return _deny("parent_not_active")
+        authority = self.delegators.get(parent.agent_id)
+        if authority is None:
+            # Being a running, attested task does not confer the right to delegate.
+            return _deny("delegator_not_authorized")
+        if not self._holds_role(parent.agent_id, authority):
+            return _deny("delegator_role_mismatch")
         active, in_run = _caller_delegations(scan.tasks, parent)
 
         denied = self._check_proposal(proposal)
@@ -212,8 +280,23 @@ class WorkflowDelegationAdmission:
         if denied is not None:
             return denied
         return await self._evaluate_tasks(
-            proposal, run, identity, parent, active=active, in_run=in_run
+            proposal, run, identity, parent, authority, active=active, in_run=in_run
         )
+
+    def _holds_role(self, worker_id: str, authority: DelegationAuthority) -> bool:
+        """Whether the registered worker is the one the authority was granted to.
+
+        A worker that declares a `role` (an `AgentRuntimeWorker`) must declare the authorized one;
+        a worker without a role cannot be cross-checked and is trusted to its registered id. A
+        worker that is no longer registered holds nothing.
+        """
+
+        try:
+            worker = self.compiler.workers.get(worker_id)
+        except WorkerNotFoundError:
+            return False
+        role = getattr(worker, "role", None)
+        return role is None or (isinstance(role, str) and role == authority.role)
 
     def _check_proposal(
         self, proposal: WorkflowDelegationProposal
@@ -263,12 +346,19 @@ class WorkflowDelegationAdmission:
         run: RuntimeRunRecord,
         identity: RuntimeIdentity,
         parent: AgentTask,
+        authority: DelegationAuthority,
         *,
         active: int,
         in_run: int,
     ) -> WorkflowAdmissionDecision:
-        """Central admission per task; each task counts the ones before it in the batch."""
+        """Central admission per task; each task counts the ones before it in the batch.
 
+        The caller's capabilities, for the shared checks and for the central policy, are the host
+        authority's ceiling, never the parent's recorded labels. Those labels only narrow, and only
+        for a delegated parent (depth of at least one), whose labels an earlier admission set.
+        """
+
+        narrowing = parent.capabilities if parent.delegation_depth >= 1 else None
         pending: WorkflowAdmissionDecision | None = None
         for position, spec in enumerate(proposal.tasks):
             decision = await self.admission.evaluate(
@@ -281,15 +371,16 @@ class WorkflowDelegationAdmission:
                     parent_depth=parent.delegation_depth,
                     active_delegations=active + position,
                     delegations_in_run=in_run + position,
-                    caller_capabilities=parent.capabilities,
+                    caller_capabilities=authority.capabilities,
                     requested_capabilities=spec.capabilities,
-                    parent_capabilities=parent.capabilities,
+                    parent_capabilities=narrowing,
                     resource_keys=spec.resource_keys,
                     resource_allowlist=self.compiler.resource_allowlist,
                     conversation_id=run.conversation_id,
                     run_id=run.id,
                     trace_id=identity.trace_id or f"trace_{run.id}",
                     parent_id=parent.id,
+                    caller_role=authority.role,
                     kind="workflow",
                 )
             )

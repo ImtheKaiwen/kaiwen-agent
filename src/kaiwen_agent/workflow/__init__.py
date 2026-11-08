@@ -17,6 +17,7 @@ from kaiwen_agent.workflow.controller import (
     WorkflowRevisionPlanner,
 )
 from kaiwen_agent.workflow.delegation import (
+    DelegationAuthority,
     WorkflowAdmissionDecision,
     WorkflowDelegationAdmission,
     WorkflowDelegationProposal,
@@ -50,6 +51,7 @@ from kaiwen_agent.workflow.task_context import (
 
 __all__ = [
     "AgentRuntimeWorker",
+    "DelegationAuthority",
     "LeadApprovalRef",
     "LeadTaskView",
     "LeadView",

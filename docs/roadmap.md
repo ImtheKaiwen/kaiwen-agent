@@ -511,7 +511,9 @@ Each defect was reproduced with a failing test before its fix.
       review): `DelegationAdmission` in `kaiwen_agent.policy`, `SubagentDelegator` rebuilt on it
       with its public behavior kept (a raising policy and malformed facts now fail closed with a
       sanitized message; opt-in `resource_allowlist` for the unrestricted job-path resource
-      keys), `WorkflowDelegationAdmission` for workflow proposals, and the Lead view's bounded
+      keys), `WorkflowDelegationAdmission` for workflow proposals (authority to delegate and the
+      capability ceiling come from a host-owned `DelegationAuthority` mapping, not from the parent
+      task's recorded capabilities), and the Lead view's bounded
       task scan extracted into `scan_run_tasks`. Admission only: nothing is submitted, created,
       revised or run. Verified by deterministic tests (including honest characterizations of the
       point-in-time and per-instance-lock limits) and mutation checks of the key protections.
