@@ -398,17 +398,15 @@ def test_strict_schema_checker_flags_open_objects_and_ignores_non_strict_tools()
 def test_openai_dry_run_reports_schema_warnings_without_a_request() -> None:
     report = asyncio.run(lv.run_validation(config(live=False), environ={}))
     assert report.verdict == "NOT_RUN" and report.model_requests == 0
-    assert report.request_compatibility_warnings == lv.probe_openai_tool_schemas()
+    assert report.request_compatibility_warnings == lv.probe_openai_tool_schemas() == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Known, documented incompatibility (not yet fixed, needs an adapter decision): the "
-        "OpenAI guides require additionalProperties: false on every object of a strict function "
-        "schema, but testing.run is sent with strict=true and a free-form `parameters` object. "
-        "Whether the API rejects it is unverified; no network request was made."
-    ),
-)
-def test_testing_run_strict_schema_closes_every_object() -> None:
+def test_the_serialized_tools_are_consistent_with_their_strict_flag() -> None:
+    """Fixed: tools with a free-form mapping are sent non-strict, so nothing is flagged."""
+
     assert lv.probe_openai_tool_schemas() == []
+    strictness = lv.probe_openai_tool_strictness()
+    assert strictness and all(value is False for value in strictness.values())
+    report = asyncio.run(lv.run_validation(config(live=False), environ={}))
+    assert report.request_compatibility_warnings == []
+    assert report.openai_tool_strictness == strictness

@@ -48,6 +48,7 @@ from kaiwen_agent.kits.coding.prompting import install_coding_prompts
 from kaiwen_agent.kits.coding.standards import coding_standards_packs
 from kaiwen_agent.models import OpenAIResponsesProvider
 from kaiwen_agent.models.ollama import OllamaChatProvider
+from kaiwen_agent.models.openai_tools import serialize_openai_tool
 from kaiwen_agent.persistence import SQLitePersistence
 from kaiwen_agent.prompts import PromptRegistry
 from kaiwen_agent.quality import CompletionGate, VerifierRegistry
@@ -519,6 +520,7 @@ class Report:
     billing_note: str | None = None
     provider_error: dict[str, Any] | None = None
     request_compatibility_warnings: list[str] = field(default_factory=list)
+    openai_tool_strictness: dict[str, bool] = field(default_factory=dict)
     worst_case_cost_usd: float | None = None
     request_seconds: float = 0.0
     elapsed_seconds: float = 0.0
@@ -647,6 +649,7 @@ async def run_validation(
     )
     if config.provider == "openai":
         report.request_compatibility_warnings = probe_openai_tool_schemas()
+        report.openai_tool_strictness = probe_openai_tool_strictness()
     if not config.live:
         report.finish()
         return report
@@ -1215,10 +1218,8 @@ class _NullRunner:
         raise AssertionError("the schema probe never executes a command")
 
 
-def probe_openai_tool_schemas() -> list[str]:
-    """Offline check of the exact strict tool schemas the OpenAI adapter would send."""
-
-    from kaiwen_agent.models.openai_tools import serialize_openai_tool
+def probe_openai_tools() -> list[dict[str, Any]]:
+    """The exact function tools the OpenAI adapter would send. Offline; no request is made."""
 
     with tempfile.TemporaryDirectory(prefix="kaiwen-probe-", ignore_cleanup_errors=True) as tmp:
         root = Path(tmp)
@@ -1234,10 +1235,20 @@ def probe_openai_tool_schemas() -> list[str]:
                 ),
             ),
         )
-        issues: list[str] = []
-        for definition in testing_tools(catalog, unattended_categories=frozenset({"test"})):
-            issues.extend(strict_schema_issues(serialize_openai_tool(definition)))
-        return issues
+        return [
+            serialize_openai_tool(definition)
+            for definition in testing_tools(catalog, unattended_categories=frozenset({"test"}))
+        ]
+
+
+def probe_openai_tool_schemas() -> list[str]:
+    """Strict tools whose schema still contains an open object; empty when consistent."""
+
+    return [issue for tool in probe_openai_tools() for issue in strict_schema_issues(tool)]
+
+
+def probe_openai_tool_strictness() -> dict[str, bool]:
+    return {str(tool["name"]): bool(tool["strict"]) for tool in probe_openai_tools()}
 
 
 def build_parser() -> argparse.ArgumentParser:

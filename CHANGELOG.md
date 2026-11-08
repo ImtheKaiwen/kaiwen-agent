@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Fix the OpenAI function-tool serializer: strict mode is now chosen per tool. A tool whose input
+  schema contains a free-form mapping (for example the Coding Kit command tools' `parameters:
+  dict[str, str]`) is sent with `strict: false` and its original schema, because OpenAI strict
+  schemas require `additionalProperties: false` on every object; strict-compatible tools stay
+  strict. Host-side argument validation is unchanged. Add an opt-in live validation harness
+  (`scripts/live_validation.py`) with sanitized provider diagnostics.
 - Add `AgentRuntimeWorker`, which runs a configured `AgentRuntime` as a workflow `Worker` over
   the existing scheduler with host-owned permissions and tools, a bounded handoff-shaped result
   (`verified: false`) and private per-task conversation ids. Add `WorkspaceBinding` stored in the

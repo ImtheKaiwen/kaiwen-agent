@@ -111,14 +111,21 @@ and are `null` when no response reported any: an attempt without usage has unkno
 never zero (`billing_note`, `cost_is_lower_bound`). The local budget treats such an attempt at
 its worst-case estimate.
 
-## Request compatibility warnings
+## Request compatibility
 
-`request_compatibility_warnings` lists strict function schemas that are not closed with
-`additionalProperties: false` on every object, which the OpenAI function-calling and
-structured-outputs guides require. It is computed offline from the exact tool schema the adapter
-sends and does not block the run. The current `testing.run` tool reports one (its free-form
-`parameters` object). Whether the API rejects it has not been verified; a strict xfail test
-records it until an adapter decision is made.
+OpenAI strict function schemas require `additionalProperties: false` on every object. The
+shared serializer (`serialize_openai_tool`) therefore chooses strict mode per tool: it stays on
+when every object can be closed, and a tool with a free-form mapping field is sent with
+`strict: false` and its original JSON Schema. The Coding Kit command tools (`testing.run`,
+`quality.lint`, `quality.typecheck`, `build.run`) take `parameters: dict[str, str]`, so they are
+non-strict. This changes only what the provider is told; the host still validates every
+argument (Pydantic, the registered preset allowlist, the exact parameter set, workspace
+authorization, permissions, the sandbox, signed evidence and the gate).
+
+The harness computes the exact tool definitions offline and reports `openai_tool_strictness`
+and `request_compatibility_warnings` (strict tools whose schema still has an open object; it
+should be empty). Whether a given model accepts every other keyword in a strict schema, such as
+string length limits, is not verified here.
 
 ## Troubleshooting
 
