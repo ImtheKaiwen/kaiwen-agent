@@ -127,6 +127,29 @@ id (or the call's idempotency key), so tasks that reuse a provider-generated cal
 share an intent or an approval, while a retried task cannot repeat a keyed action. Standalone
 `AgentRuntime` and `Agent` executions keep the per-invocation scope unchanged.
 
+Support for the scope is a declared capability, not a signature: a `ToolExecutor` subclass that
+overrides `execute` must accept `action_scope`, enforce it (normally by passing it to
+`super().execute`) and set `supports_action_scope = True` on that class. `**kwargs` is not
+evidence, because an executor could accept the scope and ignore it, attributing a side effect to
+the wrong run. `Agent.run` and `ToolResultProcessingExecutor` refuse, before any model call or
+tool, a scope for an executor that does not declare support (`TypeError`); a wrapper also
+requires its inner executor to. Executors without a scope are unaffected. This is a contract for
+cooperating implementations: a malicious executor can declare support it does not honor.
+
+A restarted run (blocked or paused) never starts new work while one of its own actions is still
+executing or uncertain: `WorkflowController` re-blocks it with `uncertain_action:<intent id>`,
+because a different tool-call id is not proof of a different external operation. The same
+happens when the lookup is incomplete or fails. An operator resolves the action explicitly (see
+below) and the run can then restart. This check needs `WorkflowController(action_intents=...)`.
+
+The start check counts `EXECUTING` as well as `UNCERTAIN`, and it does not assume that
+`RuntimeRecoveryManager.reconcile` ran first (the controller never runs recovery). When a run
+starts it is not `RUNNING`, and with a lease store the controller holds the exclusive run lease,
+so a live owner cannot have an action in flight for it: an `EXECUTING` action of that run is the
+orphan of a dead owner with an unknown outcome. A live owner is excluded by the lease
+(`RunOwnershipError`, nothing is touched), and actions of other verified runs never block this
+one. Tests that need an in-flight action must create it while the run executes.
+
 Records written by earlier versions for workflow workers carry the per-invocation `run_...`
 id as their owning run, and nothing persisted says which durable run they belonged to, so the
 owning run is never guessed. Three different guarantees apply to such a record:
@@ -138,21 +161,49 @@ owning run is never guessed. Three different guarantees apply to such a record:
    repeats the same external effect gets a new, differently owned intent and runs.
 
 To make (3) fail closed, run the upgrade with `WorkflowController(action_intents=...,
-block_unassociated_actions=True)` (off by default). A run of an owner who has an executing or
-uncertain action that no known durable run owns is then blocked with
-`unassociated_action:<intent id>`; no listing, no store and any lookup error also block.
-Operator procedure:
+block_unassociated_actions=True)`. A run of an owner who has an executing or uncertain action
+that no known durable run owns is then blocked with `unassociated_action:<intent id>`; no
+listing, no store and any lookup error also block.
 
-1. Stop old processes, then run `RuntimeRecoveryManager.reconcile`. Interrupted records become
-   uncertain and are listed in `RecoveryReport.unassociated_action_ids`.
-2. Check each one in the owning external system.
+`RecoveryReport` is not an inventory. `reconcile` only processes actions that are EXECUTING at
+that moment, so `unassociated_action_ids` lists the ones that pass found and made uncertain. An
+action that was already UNCERTAIN (an earlier startup, an interrupted approval) is invisible
+to it, so an empty report does not prove there is nothing to reconcile. The complete list is
+`RuntimeRecoveryManager.inventory_unassociated_actions(tenant_id=..., user_id=..., limit=...)`:
+read-only, owner-scoped and bounded; it covers every executing or uncertain action of the owner
+whose recorded run id is not a durable run of that owner, and never infers an owning run. It
+returns `complete=False` when the bounded page may hide more; then its ids are only a lower
+bound.
+
+Operator procedure, for every owner (tenant and user) with workflow workers:
+
+1. Stop old processes, run `RuntimeRecoveryManager.reconcile`, then call
+   `inventory_unassociated_actions` for each owner.
+2. Check each listed action in the owning external system.
 3. Record the verified outcome explicitly with
    `transition_action_intent(expected={UNCERTAIN}, status=SUCCEEDED | FAILED | CANCELLED,
-   error_code="operator_reconciled")`. History is never rewritten or deleted.
+   error_code="operator_reconciled")`. Use `expected={EXECUTING}` with `UNCERTAIN` first if
+   reconcile has not run. History is never rewritten or deleted.
+4. Repeat until the inventory is empty and `complete` is true. Only then may the upgrade run
+   without the guard.
 
 The guard cannot tell a legacy workflow action from an unresolved action of a standalone agent
 with the same owner, so it may also hold workflows until that one is resolved. That is the
 conservative side of the missing provenance.
+
+Why the guard is opt-in. The only situation it protects is an upgrade with unresolved legacy
+records; elsewhere it is a no-op that costs one bounded listing per run.
+- Fresh installations and existing databases without unresolved legacy records: nothing to
+  protect, so the default stays off.
+- Upgrades with unresolved legacy records: enable it for the upgrade (the procedure above).
+- Custom action-intent stores: it needs `list_action_intents` and fails closed when the store is
+  absent, the page is full or the call fails. Default-on would block workflows on stores that
+  cannot list completely.
+- Standalone agents: their unresolved actions look identical to legacy ones, so default-on would
+  block unrelated workflows of the same owner.
+Provenance that separates legacy workflow actions from other actions does not exist, so no
+narrower default is possible without a breaking change. Hosts that upgrade with unresolved
+records must follow the procedure or enable the guard; there is no automatic protection.
 
 ## SSE
 

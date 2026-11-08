@@ -182,11 +182,38 @@ def _plan() -> WorkflowPlan:
     )
 
 
+async def _seed_in_flight_action(store: SQLitePersistence, run_id: str) -> None:
+    intent = ActionIntentRecord(
+        id="intent-1",
+        runtime_run_id=run_id,
+        tenant_id="tenant-1",
+        user_id="user-1",
+        tool_name="send",
+        call_id="call-1",
+        arguments_checksum="a" * 64,
+        idempotency_key="key-1",
+        side_effect="reversible",
+    )
+    await store.prepare_action_intent(intent)
+    await store.transition_action_intent(
+        intent_id="intent-1",
+        tenant_id="tenant-1",
+        user_id="user-1",
+        expected=frozenset({ActionIntentStatus.PREPARED}),
+        status=ActionIntentStatus.EXECUTING,
+    )
+
+
 async def _run_cancelled_workflow(tmp_path, *, in_flight_action: bool, with_action_store: bool):
     store = SQLitePersistence(tmp_path / "workflow.sqlite3")
     started = asyncio.Event()
 
     async def slow(task: AgentTask, context: TaskExecutionContext) -> dict[str, Any]:
+        if in_flight_action:
+            # The action is in flight while the run executes (the run is RUNNING and owns it).
+            # Seeding it before the run starts would model an orphan of a dead owner, which the
+            # controller deliberately refuses to start over.
+            await _seed_in_flight_action(store, run.id)
         started.set()
         await asyncio.sleep(60)
         return {}
@@ -211,26 +238,6 @@ async def _run_cancelled_workflow(tmp_path, *, in_flight_action: bool, with_acti
         completion_gate=CompletionGate(verifiers=VerifierRegistry(), artifacts=ArtifactManager()),
         action_intents=store if with_action_store else None,
     )
-    if in_flight_action:
-        intent = ActionIntentRecord(
-            id="intent-1",
-            runtime_run_id=run.id,
-            tenant_id="tenant-1",
-            user_id="user-1",
-            tool_name="send",
-            call_id="call-1",
-            arguments_checksum="a" * 64,
-            idempotency_key="key-1",
-            side_effect="reversible",
-        )
-        await store.prepare_action_intent(intent)
-        await store.transition_action_intent(
-            intent_id="intent-1",
-            tenant_id="tenant-1",
-            user_id="user-1",
-            expected=frozenset({ActionIntentStatus.PREPARED}),
-            status=ActionIntentStatus.EXECUTING,
-        )
     task = asyncio.create_task(
         controller.execute(
             run=run,
@@ -240,7 +247,7 @@ async def _run_cancelled_workflow(tmp_path, *, in_flight_action: bool, with_acti
             protected_input_fingerprint="input-1",
         )
     )
-    await started.wait()
+    await asyncio.wait_for(started.wait(), timeout=10)
     await _cancel(task)
     persisted = await manager.get(run_id=run.id, identity=_identity())
     assert persisted is not None

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 import json
 from collections.abc import Awaitable, Callable
 from typing import Protocol
@@ -15,7 +14,7 @@ from kaiwen_agent.context import AgentContext
 from kaiwen_agent.events import EventType
 from kaiwen_agent.tools.definition import ToolDefinition
 from kaiwen_agent.tools.durability import DurableActionScope
-from kaiwen_agent.tools.execution import ToolExecutor
+from kaiwen_agent.tools.execution import ToolExecutor, require_action_scope_support
 from kaiwen_agent.types import ToolCall, ToolResult
 
 ToolEventCallback = Callable[[EventType, dict[str, object]], Awaitable[None]]
@@ -123,6 +122,9 @@ class ArtifactToolResultProcessor:
 class ToolResultProcessingExecutor(ToolExecutor):
     """Decorates the existing executor without changing Agent's public API."""
 
+    # It forwards the scope to the inner executor, which must itself support it.
+    supports_action_scope = True
+
     def __init__(self, executor: ToolExecutor, processor: ToolResultProcessor) -> None:
         self.executor = executor
         self.processor = processor
@@ -140,12 +142,8 @@ class ToolResultProcessingExecutor(ToolExecutor):
         scoped: dict[str, DurableActionScope] = {}
         run_id = execution_scope
         if action_scope is not None:
-            if not _accepts_action_scope(self.executor):
-                # Never run a tool without the durable ownership the host asked for.
-                raise TypeError(
-                    f"{type(self.executor).__name__}.execute does not support a durable "
-                    "action scope; update the executor to accept `action_scope`"
-                )
+            # Never run a tool without the durable ownership the host asked for.
+            require_action_scope_support(self.executor)
             scoped["action_scope"] = action_scope
             # Offloaded output belongs to the durable run, like the action itself.
             run_id = action_scope.runtime_run_id
@@ -162,10 +160,3 @@ class ToolResultProcessingExecutor(ToolExecutor):
             context=context,
             run_id=run_id,
         )
-
-
-def _accepts_action_scope(executor: ToolExecutor) -> bool:
-    parameters = inspect.signature(executor.execute).parameters
-    return "action_scope" in parameters or any(
-        item.kind is inspect.Parameter.VAR_KEYWORD for item in parameters.values()
-    )

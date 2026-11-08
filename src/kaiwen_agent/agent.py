@@ -21,7 +21,7 @@ from kaiwen_agent.models.base import ModelProvider
 from kaiwen_agent.sessions import InMemoryRunStore, RunStore
 from kaiwen_agent.tools.definition import ToolDefinition
 from kaiwen_agent.tools.durability import DurableActionScope
-from kaiwen_agent.tools.execution import ToolExecutor
+from kaiwen_agent.tools.execution import ToolExecutor, require_action_scope_support
 from kaiwen_agent.tools.registry import ToolRegistry
 from kaiwen_agent.types import (
     AgentInput,
@@ -72,6 +72,10 @@ class Agent:
         context: AgentContext,
         action_scope: DurableActionScope | None = None,
     ) -> AgentResult:
+        if action_scope is not None:
+            # Before any model call or tool: an executor that cannot enforce the scope would
+            # attribute side effects to the wrong run.
+            require_action_scope_support(self.tool_executor)
         trace_id = context.trace_id or f"trace_{uuid4().hex}"
         effective_context = AgentContext(
             session_id=context.session_id,

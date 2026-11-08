@@ -302,6 +302,27 @@ class WorkflowController:
             and intent.user_id == run.user_id
         )
 
+    async def _unresolved_run_actions(self, run: RuntimeRunRecord) -> list[str]:
+        """Executing or uncertain actions owned by this run; fails closed on lookup errors.
+
+        At this point the run is not RUNNING (a RUNNING run is refused above) and, with a
+        lease store, this controller holds the exclusive run lease, so no live owner can have
+        an action in flight for it. An EXECUTING action is therefore the orphan of a dead
+        owner whose outcome is unknown, exactly like an UNCERTAIN one. The controller does not
+        run recovery itself, so it must not assume `reconcile` ran first. Without a configured
+        action store the controller cannot know and does nothing.
+        """
+
+        if self.action_intents is None:
+            return []
+        try:
+            return await self._uncertain_actions(run)
+        except ActionLookupIncompleteError:
+            return ["lookup_incomplete"]
+        except Exception:  # noqa: BLE001 - any lookup failure must fail closed
+            logger.warning("Could not look up actions of run %s", run.id, exc_info=True)
+            return ["unverified"]
+
     async def _unassociated_actions(
         self, run: RuntimeRunRecord, identity: RuntimeIdentity
     ) -> list[str]:
@@ -367,6 +388,20 @@ class WorkflowController:
                 tasks=[],
                 quality=None,
                 reason="workspace_binding_mismatch",
+            )
+        # A run that is restarted (blocked, paused) must not start new work while one of its
+        # own actions has an unknown outcome: a different tool-call id is not proof of a
+        # different external operation. Only an explicit operator resolution lifts this.
+        same_run = await self._unresolved_run_actions(run)
+        if same_run:
+            return await self._blocked(
+                writer=writer,
+                run=run,
+                identity=identity,
+                cycle=1,
+                tasks=[],
+                quality=None,
+                reason=f"uncertain_action:{same_run[0]}",
             )
         if self.block_unassociated_actions:
             unresolved = await self._unassociated_actions(run, identity)

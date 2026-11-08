@@ -175,6 +175,7 @@ from kaiwen_agent.runtime import (
     RuntimeRunStatus,
     RuntimeRunStore,
     RuntimeVersionPins,
+    UnassociatedActionInventory,
     WorkspaceProfile,
 )
 from kaiwen_agent.secrets import EnvironmentSecretProvider, SecretProvider, SecretValue
@@ -381,6 +382,7 @@ __all__ = [
     "RequirementObligation",
     "RequirementSeverity",
     "RecoveryReport",
+    "UnassociatedActionInventory",
     "ResolvedRequirement",
     "RetryPolicy",
     "RuntimePolicy",

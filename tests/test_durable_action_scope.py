@@ -146,12 +146,16 @@ def controller(flow: Flow, **options: Any) -> WorkflowController:
 async def execute(flow: Flow, run: Any, workflow: Any, **options: Any) -> Any:
     from kaiwen_agent.standards import StandardResolution
 
-    return await controller(flow, **options).execute(
-        run=run,
-        identity=owner(),
-        plan=workflow,
-        standards=StandardResolution(pack_refs=(), requirements=(), prompt_refs=()),
-        protected_input_fingerprint="objective-1",
+    # Bounded: a regression must fail the test, never hang pytest.
+    return await asyncio.wait_for(
+        controller(flow, **options).execute(
+            run=run,
+            identity=owner(),
+            plan=workflow,
+            standards=StandardResolution(pack_refs=(), requirements=(), prompt_refs=()),
+            protected_input_fingerprint="objective-1",
+        ),
+        timeout=30,
     )
 
 
@@ -873,7 +877,7 @@ async def legacy_intent(
         tool_name="demo.write",
         call_id="call-1",
         arguments_checksum="a" * 64,
-        idempotency_key=f"{run_id}:call-1",
+        idempotency_key=f"{run_id}:{intent_id}",
         side_effect="reversible",
     )
     await store.prepare_action_intent(intent)

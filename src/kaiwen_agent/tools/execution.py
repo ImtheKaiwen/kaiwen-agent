@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from hashlib import sha256
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 from pydantic import ValidationError
 
@@ -50,6 +51,11 @@ async def _no_events(event_type: EventType, payload: dict[str, object]) -> None:
 
 
 class ToolExecutor:
+    # Capability declaration for a durable action scope (`execute(action_scope=...)`). It is
+    # honored only when the class that defines the effective `execute` declares it itself, so a
+    # subclass that overrides `execute` must opt in again after making it enforce the scope.
+    supports_action_scope: ClassVar[bool] = True
+
     def __init__(
         self,
         *,
@@ -662,6 +668,47 @@ async def execute_tool(
         context,
         execution_scope="standalone",
     )
+
+
+def executor_supports_action_scope(executor: object) -> bool:
+    """Whether `executor` declares that it enforces a durable action scope.
+
+    A permissive signature (`**kwargs`) proves nothing: such an executor could accept the scope
+    and ignore it, running a side effect under the wrong run identity. Support is therefore an
+    explicit declaration, `supports_action_scope = True`, made by the class that defines the
+    effective `execute`, which must also name an `action_scope` parameter. A wrapper's inner
+    executor must support it too. This is a contract for cooperating implementations: a
+    malicious or buggy executor can still declare support it does not honor, and no signature
+    inspection can prevent that.
+    """
+
+    if "execute" in vars(executor):
+        return False  # an instance-level override cannot be vouched for by its class
+    for klass in type(executor).__mro__:
+        if "execute" not in vars(klass):
+            continue
+        declared = vars(klass).get("supports_action_scope", False) is True
+        if (
+            not declared
+            or "action_scope" not in inspect.signature(vars(klass)["execute"]).parameters
+        ):
+            return False
+        break
+    else:
+        return False
+    inner = getattr(executor, "executor", None)
+    return executor_supports_action_scope(inner) if isinstance(inner, ToolExecutor) else True
+
+
+def require_action_scope_support(executor: object) -> None:
+    """Refuse, before any tool runs, an executor that cannot enforce a durable scope."""
+
+    if not executor_supports_action_scope(executor):
+        raise TypeError(
+            f"{type(executor).__name__} does not declare support for a durable action scope; "
+            "set `supports_action_scope = True` on the class that implements `execute` after "
+            "making it accept and enforce `action_scope`"
+        )
 
 
 def _check_action_scope(scope: DurableActionScope, context: AgentContext) -> None:
