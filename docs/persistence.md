@@ -62,19 +62,27 @@ run in SQL before any row is materialized, orders by task id, pages with a keyse
 need the capability, such as the Lead view, fail closed without it.
 
 The `tasks` table gains nullable `tenant_id`, `user_id` and `runtime_run_id` columns and the
-index `idx_tasks_owner_run`. They hold an attested owner, not a copy of task metadata: a task is
-attested only if it names a run that exists in `runtime_runs` for the same tenant and user,
-the run's session matches, and the trace id differs from the run id. `save_task` re-checks this
-on every write, so saving a task again after its run exists attests it; anything else stores
-NULL and is invisible to the query (the task stays readable through `get_task`).
+index `idx_tasks_owner_run`. They are filled only when the task's claim is confirmed: the task
+names a run that exists in `runtime_runs` for the same tenant and user, the run's session
+matches, and the trace id differs from the run id. `save_task` re-checks this on every write,
+so saving a task again after its run exists makes it visible; anything else stores NULL and is
+invisible to the query (the task stays readable through `get_task`).
+
+This is a membership check, not proof of origin. It shows the claimed run exists and belongs
+to that owner; it does not show that `WorkflowCompiler` or `TaskScheduler` wrote the task. The
+trusted-write boundary is `save_task`: `TaskStore` is a host-controlled interface and its
+callers are trusted to record truthful ownership. In this package only `TaskScheduler` writes
+tasks, only `WorkflowCompiler` writes `runtime_run_id`, and model-authored data reaches
+`task.input` only (see ADR 0015). Do not expose `save_task` to less-trusted code without your
+own authorization in front of it.
 
 On first start after upgrading, one transaction under the write lock adds the columns and
-attests existing rows with the same check, in batches. Rows that cannot be attested (malformed
-JSON, no run, a run of another owner or session, non-string metadata) keep NULL columns and are
-unavailable, never assigned a guessed owner. A crash leaves the old schema and the next start
-retries; a concurrent starter waits and finds the work done. Older code ignores the columns,
-so rolling back is safe. To make an unavailable historical task visible, re-save it once its
-run exists (the scheduler already does this when a task changes).
+checks existing rows the same way, in batches. Rows that fail it (malformed JSON, no run, a
+run of another owner or session, non-string metadata) keep NULL columns and are unavailable,
+never assigned a guessed owner. A crash leaves the old schema and the next start retries; a
+concurrent starter waits and finds the work done. Older code ignores the columns, so rolling
+back is safe. To make an unavailable historical task visible, re-save it once its run exists
+(the scheduler already does this when a task changes).
 
 `SQLitePersistence` also implements the durable workflow stores. The standalone
 `SQLiteIdempotencyStore` persists the existing tool receipt contract and may share

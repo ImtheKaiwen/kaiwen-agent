@@ -7,8 +7,13 @@
   keyset-paged, with `SQLitePersistence` support), and `LeadViewAssembler`/`LeadView`, a bounded,
   provenance-labelled projection of one durable run that writes nothing and fails closed without
   the capability. `SQLitePersistence` adds nullable ownership columns and an index to `tasks`;
-  existing rows are attested once against `runtime_runs` and rows that cannot be attested stay
-  unavailable to run-scoped queries. `TaskContextAssembler.owned_references` is now public.
+  existing rows are checked once against `runtime_runs` (membership of the claimed run, not proof
+  of who wrote the task) and rows that fail the check stay unavailable to run-scoped queries.
+  `TaskContextAssembler.owned_references` is now public. The view stays bounded however a custom
+  `TaskRunQuery` behaves (a page that violates the contract raises `LeadViewError`
+  `task_listing_invalid`), storage failures surface as stable `LeadViewError` codes or
+  `unavailable_sources` without raw exception text in values or logs, and reference
+  availability is explicit per task (`artifact_check`, `evidence_check`, `unchecked_reference_count`).
 - Fix durable action ownership for workflow workers: action intents and approvals of tools run
   by `AgentRuntimeWorker` were stored under the per-invocation `AgentRun` id, so
   `WorkflowController` cancellation and `RuntimeRecoveryManager` could not associate an in-flight

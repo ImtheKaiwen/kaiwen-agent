@@ -67,14 +67,34 @@ or `None` if that owner has no such run. It reads existing state only (ADR 0015,
   conversations, permissions or capabilities. The view reports no requirement verdict
   (`requirement_status` is always `not_evaluated`); authenticated evidence is not proof that a
   requirement passed, and the completion gate stays authoritative.
-- Explicit absence: pending approvals are `None` (unavailable) unless an action store with a
-  run-scoped query and an approval store were given; reference lists are empty and
-  `references_checked` is false without an artifact verifier; a truncated listing and dropped
-  records are reported (`tasks_truncated`, `unreadable_task_count`).
+- Explicit absence: `unavailable_sources` lists stable `source:reason` codes for everything
+  that was not configured or could not be read (`approvals:not_configured`,
+  `approvals:incomplete`, `approvals:store_error`, `artifacts:not_configured`,
+  `artifacts:store_error`, `evidence:not_configured`, `evidence:no_signer`,
+  `evidence:store_error`). Pending approvals are `None` when unavailable, never an empty
+  list. Per task, `artifact_check` and `evidence_check` are `checked` (an empty reference
+  list is then a real result) or `unavailable` (empty says nothing). Claims that failed
+  verification are counted in `unverified_reference_count`; claims that were never evaluated
+  because verification was unavailable are counted in `unchecked_reference_count`. Artifacts
+  without an evidence signer give `artifact_check=checked`, `evidence_check=unavailable`. A
+  truncated listing and dropped records are reported (`tasks_truncated`,
+  `unreadable_task_count`).
 - Read-only and fail-closed: building the view writes nothing, runs no tool and takes no
   lease. The assembler requires a task store with the `TaskRunQuery` capability and refuses
   to fall back to the global `list_tasks`. `expected_workspace` refuses a run bound to another
   workspace. `LeadViewSource` feeds the view through the existing `ContextBuilder` budget.
+- Bounded however the store behaves: at most `max_tasks` rows are read, each continuing page
+  must make progress and advance its cursor, and a page that returns repeated or out-of-order
+  tasks, more rows than requested or malformed fields is rejected (`task_listing_invalid`)
+  instead of looped on.
+- Sanitized failures: a failing run, task or approval store never escapes as a raw exception.
+  `assemble` raises `LeadViewError` with a stable code (`run_store_unavailable`,
+  `task_store_unavailable`, `task_listing_invalid`, `workspace_binding_mismatch`,
+  `assembly_failed`) when ownership or completeness cannot be established, and optional
+  sources become `unavailable_sources`. Logs carry only the code, the exception class name and
+  the run id, never the exception message.
+- Ownership of the listed tasks is verified membership in an existing run of the owner, not
+  proof of who wrote them; the trusted-write boundary is `TaskStore.save_task` (ADR 0015).
 
 Not part of this layer yet: delegation tools and admission (later M6.3.3 work, pending ADR
 0015), reviewer approval and team acceptance (M6.3.4), isolated parallel writers or worktree

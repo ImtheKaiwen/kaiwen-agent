@@ -168,23 +168,24 @@ def test_a_custom_store_that_returns_foreign_tasks_is_not_trusted(tmp_path: Path
         run = await lead.flow.new_run()
         other = await lead.flow.new_run()
         tasks = [
-            make_task(run.id, "ok"),
-            make_task(other.id, "otherrun"),
-            make_task(run.id, "otheruser", user="user-2"),
-            make_task(run.id, "othertenant", tenant="tenant-2"),
-            make_task(run.id, "othersession", session="session-2"),
-            make_task(run.id, "tracerun", trace=run.id),
+            # Ids ascend, as the `TaskRunQuery` contract requires; the content is what is foreign.
+            make_task(run.id, "a_ok"),
+            make_task(other.id, "b_otherrun"),
+            make_task(run.id, "c_otheruser", user="user-2"),
+            make_task(run.id, "d_othertenant", tenant="tenant-2"),
+            make_task(run.id, "e_othersession", session="session-2"),
+            make_task(run.id, "f_tracerun", trace=run.id),
         ]
         assembler = LeadViewAssembler(runs=lead.flow.runs, tasks=Leaky(tasks))
         view = await assembler.assemble(run_id=run.id, identity=owner())
         assert view is not None
-        assert [task.logical_task_id for task in view.tasks] == ["ok"]
+        assert [task.logical_task_id for task in view.tasks] == ["a_ok"]
         assert view.unreadable_task_count == 1 + 5  # the store's own count plus the five dropped
 
     run_async(scenario)
 
 
-def test_tasks_whose_ownership_cannot_be_attested_do_not_appear(tmp_path: Path) -> None:
+def test_tasks_whose_ownership_claim_cannot_be_verified_do_not_appear(tmp_path: Path) -> None:
     async def scenario() -> None:
         lead = Lead(tmp_path)
         run = await lead.flow.new_run()
@@ -449,7 +450,11 @@ def test_only_host_authenticated_evidence_is_listed_and_forgeries_are_counted(
         assert item.authenticated_evidence_refs == (good,)
         assert item.artifact_refs == (good,)
         assert item.unverified_reference_count == len(forged) + 1
-        assert view.references_checked
+        assert (item.artifact_check, item.evidence_check) == ("checked", "checked")
+        assert item.unchecked_reference_count == 0
+        assert not any(
+            code.startswith(("artifacts:", "evidence:")) for code in view.unavailable_sources
+        )
         # Authentic is not satisfied: the view carries no requirement verdict at all.
         assert view.requirement_status == "not_evaluated"
         assert not any("pass" in name or "satisf" in name for name in LeadView.model_fields)
@@ -472,17 +477,21 @@ def test_without_a_signer_or_a_verifier_nothing_authenticates_and_it_says_so(
 
         no_signer = TaskContextAssembler(store=lead.store, artifacts=lead.artifacts)
         view = await lead.view(run, context=no_signer)
-        assert view.tasks[0].authenticated_evidence_refs == ()
-        assert view.tasks[0].artifact_refs == (good,)  # same rule as handoffs
-        assert view.tasks[0].unverified_reference_count == 1
+        item = view.tasks[0]
+        assert item.authenticated_evidence_refs == ()
+        assert item.artifact_refs == (good,)  # same rule as handoffs
+        # Evidence could not be authenticated, which is "not checked", not "failed verification".
+        assert (item.artifact_check, item.evidence_check) == ("checked", "unavailable")
+        assert item.unverified_reference_count == 0 and item.unchecked_reference_count == 1
+        assert "evidence:no_signer" in view.unavailable_sources
         unchecked = await LeadViewAssembler(runs=lead.flow.runs, tasks=lead.store).assemble(
             run_id=run.id, identity=owner()
         )
-        assert unchecked is not None and not unchecked.references_checked
-        assert (
-            unchecked.tasks[0].artifact_refs == ()
-            and unchecked.tasks[0].unverified_reference_count == 0
-        )
+        assert unchecked is not None
+        bare = unchecked.tasks[0]
+        assert (bare.artifact_check, bare.evidence_check) == ("unavailable", "unavailable")
+        assert bare.artifact_refs == () and bare.unverified_reference_count == 0
+        assert bare.unchecked_reference_count == 2
 
     run_async(scenario)
 

@@ -50,8 +50,16 @@ separate group of untrusted, model-authored text (bounded summaries). Rules:
   component wrote it. A signed evidence reference is authentic, not proof that a requirement
   passed; the view never reports a requirement result, and the completion gate stays
   authoritative.
-- Absence is explicit. A source the assembler was not given (artifacts, approvals) is
-  reported as unavailable, never as empty. A truncated listing says so.
+- Absence is explicit. A source the assembler was not given or could not read (artifacts,
+  evidence signer, approvals) is reported as unavailable with a stable code, never as empty.
+  Per task, references are `checked` (an empty list is then a real result) or `unavailable`
+  (empty says nothing); claims that failed verification and claims that were never evaluated
+  are counted separately. A truncated listing says so.
+- Bounded and fail-closed. The task listing is bounded by `max_tasks` however a custom
+  `TaskRunQuery` behaves: a page that violates the contract (no progress, a cursor that does
+  not advance, repeated or out-of-order tasks, more rows than requested, malformed fields) is
+  rejected rather than looped on. Storage failures surface as a `LeadViewError` with a stable
+  code, never as a raw exception, and logs carry only the code and the exception type.
 - No raw private conversations or transcripts, no raw exception text (`AgentTask.error` is
   never exposed; only a pattern-checked error code), no credentials, no permissions.
 
@@ -63,12 +71,29 @@ keyset pagination, a hard page maximum, and database-level filtering. The base `
 protocol is unchanged, so custom stores keep working; a consumer that needs the capability
 fails closed when it is missing.
 
-Ownership of a stored task is an attested fact, not a copy of arbitrary metadata. The SQLite
-adapter fills the owner and run columns only when the task names a durable run that exists
-for the same tenant, user and session and its trace id differs from the run id, checked
-against `runtime_runs` at write time. Rows written earlier are backfilled once with the same
-check; rows that cannot be verified keep NULL columns and are unavailable to the query, never
-assigned guessed ownership.
+The SQLite adapter fills the owner and run columns only when the task names a durable run
+that exists for the same tenant, user and session and its trace id differs from the run id,
+checked against `runtime_runs` at write time. Rows written earlier are backfilled once with
+the same check; rows that cannot be verified keep NULL columns and are unavailable to the
+query, never assigned guessed ownership.
+
+What this check establishes, precisely: **membership**. The claimed run exists and belongs to
+the same owner and session. It does not establish **origin**: it does not show that
+`WorkflowCompiler` or `TaskScheduler` wrote the task, or that the run's controller created it.
+A component that can call `save_task` and names an existing run of the same owner is accepted.
+
+Trusted-write boundary. `TaskStore` is a host-controlled, in-process interface, and every
+component that can call `save_task` is trusted to record truthful ownership. Audit of the
+code at the baseline: `TaskScheduler` is the only caller of `save_task`; `WorkflowCompiler` is
+the only writer of `runtime_run_id` into task metadata; the other places that build tasks
+(`JobAdapter`, the realtime task bridge, `SkillRegistry`) set fixed metadata keys that never
+include a run id, and model-authored data reaches `task.input` only, which is never consulted
+for ownership. No untrusted entry point can therefore write `runtime_run_id`. This is pinned
+by a test (`test_only_the_workflow_compiler_writes_a_run_id_into_task_metadata`) so a new
+writer is a deliberate, reviewed change. No cryptographic task signing is added: the threat it
+would address (a trusted host component forging ownership) is outside the boundary this ADR
+assumes, and nothing found requires it. A deployment that exposes `save_task` to less-trusted
+code must add its own authorization in front of it.
 
 ### 4. Host-controlled delegation admission (future, not implemented here)
 
@@ -126,7 +151,8 @@ cross-cycle handoff persistence are not part of M6.3.3 and are not designed here
 - One schema change in the existing SQLite database: three nullable columns on `tasks` and
   one index. Rollback is safe: older code ignores the columns.
 - Historical tasks that cannot be tied to a verified run stay invisible to the Lead view.
-  That is deliberate; an operator can re-save such a task after the run exists to attest it.
+  That is deliberate; a host component can re-save such a task after the run exists, which
+  re-verifies its claim (an operator action inside the trusted-write boundary above).
 - Custom and in-memory task stores have no Lead view until they implement the capability.
 - The view is a snapshot of independently read stores, not a transaction; counts can be
   slightly stale, and it says what it could not read.

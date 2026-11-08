@@ -36,9 +36,15 @@ class TaskRunQuery(Protocol):
 
     Implementations filter by tenant, user and durable run before materializing any row, order
     by task id, and reject `limit` outside `1..MAX_TASK_RUN_PAGE` with `ValueError`. A task is
-    returned only if the store can attest that it belongs to that run for that owner; a task
-    whose ownership cannot be attested is not returned. A store without this capability is not
-    queried through `list_tasks`: consumers fail closed instead.
+    returned only if the store can verify that its claimed owner and run are an existing run of
+    that owner; a task whose claim cannot be verified is not returned. This is membership, not
+    proof of who wrote the task: callers of `save_task` are trusted (ADR 0015). A store without
+    this capability is not queried through `list_tasks`: consumers fail closed instead.
+
+    A conforming page examines at least one row when it reports a cursor, returns tasks in
+    strictly ascending id order after `after_id`, never more than `limit` rows in total
+    (tasks plus `unreadable`), and a cursor that strictly advances. Consumers must not rely on
+    this: `LeadViewAssembler` rejects a page that violates it.
     """
 
     async def list_run_tasks(

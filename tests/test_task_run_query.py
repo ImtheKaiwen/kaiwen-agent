@@ -1,8 +1,8 @@
-"""M6.3.3-A: owner- and run-scoped task query, its attested ownership and its SQLite migration.
+"""M6.3.3-A: owner- and run-scoped task query, its verified ownership and SQLite migration.
 
 The query must filter by tenant, user and durable run in SQL before any row is materialized, page
-deterministically with a bounded keyset, and return a task only if a durable run attests its
-ownership. Historical rows that cannot be attested stay unavailable; ownership is never guessed
+deterministically with a bounded keyset, and return a task only if a durable run confirms its
+ownership. Historical rows that cannot be verified stay unavailable; ownership is never guessed
 from model-authored data. Every wait is bounded so a regression fails instead of hanging.
 """
 
@@ -213,10 +213,10 @@ def test_page_size_and_scope_arguments_are_validated(tmp_path: Path) -> None:
     run_async(scenario)
 
 
-# ------------------------------------------------------------------ attested ownership
+# ------------------------------------------------------------------ verified ownership claim
 
 
-def test_a_task_is_returned_only_if_a_durable_run_attests_its_owner(tmp_path: Path) -> None:
+def test_a_task_is_returned_only_if_a_durable_run_confirms_its_owner_claim(tmp_path: Path) -> None:
     async def scenario() -> None:
         store = SQLitePersistence(tmp_path / "s.sqlite3")
         run = await make_run(store)
@@ -253,7 +253,7 @@ def test_a_task_is_returned_only_if_a_durable_run_attests_its_owner(tmp_path: Pa
     run_async(scenario)
 
 
-def test_saving_again_after_the_run_exists_attests_the_task(tmp_path: Path) -> None:
+def test_saving_again_after_the_run_exists_verifies_the_task(tmp_path: Path) -> None:
     async def scenario() -> None:
         store = SQLitePersistence(tmp_path / "s.sqlite3")
         runs = DurableRunManager(store)
@@ -375,7 +375,7 @@ def columns(path: Path) -> set[str]:
         return {row[1] for row in connection.execute("PRAGMA table_info(tasks)")}
 
 
-def test_migration_attests_verifiable_rows_and_leaves_the_rest_unavailable(tmp_path: Path) -> None:
+def test_migration_verifies_verifiable_rows_and_leaves_the_rest_unavailable(tmp_path: Path) -> None:
     path = tmp_path / "legacy.sqlite3"
     run = make_legacy_run()
     legacy_database(path, run, legacy_rows(run))
@@ -397,11 +397,11 @@ def test_migration_attests_verifiable_rows_and_leaves_the_rest_unavailable(tmp_p
     run_async(scenario)
     with sqlite3.connect(path) as connection:
         indexes = {row[1] for row in connection.execute("PRAGMA index_list(tasks)")}
-        unattested = connection.execute(
+        unverified_rows = connection.execute(
             "SELECT COUNT(*) FROM tasks WHERE runtime_run_id IS NULL"
         ).fetchone()[0]
     assert "idx_tasks_owner_run" in indexes
-    assert unattested == len(legacy_rows(run)) - 1
+    assert unverified_rows == len(legacy_rows(run)) - 1
 
 
 def test_migration_backfills_across_batch_boundaries(tmp_path: Path) -> None:

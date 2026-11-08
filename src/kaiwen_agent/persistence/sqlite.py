@@ -280,7 +280,7 @@ class SQLitePersistence:
         await self.initialize()
 
         def operation(connection: sqlite3.Connection) -> None:
-            # Ownership columns hold only an attested owner and run (see
+            # Ownership columns hold only a claim an existing run confirms (see
             # `_verified_task_owner`); otherwise NULL, which keeps the task out of run queries.
             owner = _verified_task_owner(connection, task) or (None, None, None)
             connection.execute(
@@ -1746,12 +1746,19 @@ class SQLitePersistence:
 def _verified_task_owner(
     connection: sqlite3.Connection, task: AgentTask
 ) -> tuple[str, str, str] | None:
-    """The (tenant, user, run) of a task, only if a durable run attests it.
+    """The (tenant, user, run) a task claims, only if an existing durable run confirms the claim.
 
     The task's own fields and metadata are claims. They are accepted only when the task names
     a run that exists in `runtime_runs` for the same tenant and user, whose session matches,
     and the trace id differs from the run id. Anything else returns `None`: unverifiable
     ownership is unavailable, never guessed.
+
+    What this establishes is membership: the claimed run exists and belongs to that owner. It
+    does not prove origin, i.e. that `WorkflowCompiler` or `TaskScheduler` wrote the task or
+    that the run's controller created it. The trusted-write boundary is `save_task` itself:
+    `TaskStore` is a host-controlled interface, every caller is trusted to record truthful
+    ownership, and in this package only `TaskScheduler` writes tasks and only
+    `WorkflowCompiler` writes `runtime_run_id`. Model-authored data reaches `task.input` only.
     """
 
     run_id = task.metadata.get("runtime_run_id")
@@ -1802,11 +1809,12 @@ _TASK_BACKFILL_BATCH = 500
 
 
 def _migrate_task_ownership(connection: sqlite3.Connection) -> None:
-    """Add the task ownership columns and attest existing rows once.
+    """Add the task ownership columns and verify existing rows once.
 
     The change runs in one transaction under the write lock, so a crash leaves the old
     schema and the next start retries, and a concurrent starter re-checks after waiting. Each
-    existing row is attested with `_verified_task_owner`; rows that fail it (malformed, no run,
+    existing row is checked with `_verified_task_owner` (membership of its claim in an existing
+    run of the same owner, not proof of who wrote it); rows that fail it (malformed, no run,
     run missing or owned by someone else) keep NULL columns and stay unavailable.
     """
 

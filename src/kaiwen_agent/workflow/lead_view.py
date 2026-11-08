@@ -13,22 +13,29 @@ labelled by provenance:
   blocker categories, pattern-checked error codes, and references the host verified;
 - untrusted text: task names and summaries written by a plan or a model, sanitized and clipped.
 
-A source that was not configured or could not be read is reported as unavailable, never as empty.
+A source that was not configured or could not be read is reported as unavailable, never as empty:
+`unavailable_sources` lists stable, non-sensitive codes, and each task says per kind whether its
+references were `checked` or `unavailable`. Storage failures never escape as raw exceptions:
+they become a `LeadViewError` with a stable code (or an unavailable source), and logs carry only
+the code and the exception type, never its message.
 The view never reports whether a requirement passed: an authenticated evidence reference is
 authentic, not proof of satisfaction, and the completion gate stays authoritative.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime
-from typing import Any, Literal
+from functools import partial
+from typing import Any, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from kaiwen_agent.context_engine import ContextBuildRequest, ContextItem, ContextKind
+from kaiwen_agent.exceptions import ActionLookupIncompleteError
 from kaiwen_agent.runtime import (
     DurableRunManager,
     RuntimeIdentity,
@@ -36,7 +43,13 @@ from kaiwen_agent.runtime import (
     RuntimeRunStatus,
     WorkspaceBinding,
 )
-from kaiwen_agent.tasks import MAX_TASK_RUN_PAGE, AgentTask, TaskRunQuery, TaskStatus
+from kaiwen_agent.tasks import (
+    MAX_TASK_RUN_PAGE,
+    AgentTask,
+    TaskRunPage,
+    TaskRunQuery,
+    TaskStatus,
+)
 from kaiwen_agent.tools.durability import (
     ActionIntentStatus,
     ActionIntentStore,
@@ -46,6 +59,8 @@ from kaiwen_agent.tools.durability import (
 from kaiwen_agent.workflow.task_context import TaskContextAssembler
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 MAX_VIEW_TASKS = 500
 _MAX_NAME = 300
@@ -106,7 +121,14 @@ class LeadTaskView(BaseModel):
     # References the host verified in the run's owner scope. Authentic is not satisfying.
     artifact_refs: tuple[str, ...] = Field(default=(), max_length=_MAX_REFS_PER_TASK)
     authenticated_evidence_refs: tuple[str, ...] = Field(default=(), max_length=_MAX_REFS_PER_TASK)
+    # `checked` means the host evaluated this task's claims (an empty list is then a real empty
+    # result); `unavailable` means it could not, so empty says nothing. Claims that failed
+    # verification are counted in `unverified_reference_count`; claims that were never evaluated
+    # are counted in `unchecked_reference_count`.
+    artifact_check: Literal["checked", "unavailable"] = "unavailable"
+    evidence_check: Literal["checked", "unavailable"] = "unavailable"
     unverified_reference_count: int = Field(default=0, ge=0)
+    unchecked_reference_count: int = Field(default=0, ge=0)
 
     untrusted_name: str = Field(default="", max_length=_MAX_NAME)
     untrusted_summary: str = Field(default="", max_length=_MAX_SUMMARY)
@@ -132,9 +154,9 @@ class LeadView(BaseModel):
     # None means unavailable (not configured or not readable), not "no pending approvals".
     pending_approvals: tuple[LeadApprovalRef, ...] | None = None
     approvals_truncated: bool = False
-    # False when no artifact/evidence verifier was configured: reference lists are then empty
-    # because nothing was checked, not because nothing was claimed.
-    references_checked: bool = False
+    # Stable codes (`source:reason`) of every source that was not configured or could not be
+    # read. Anything listed here is unknown, never verified-empty.
+    unavailable_sources: tuple[str, ...] = ()
 
     def context_items(self) -> list[ContextItem]:
         """The view as prioritized items for the existing `ContextBuilder` and its budget."""
@@ -154,6 +176,7 @@ class LeadView(BaseModel):
             f"listing truncated: {self.tasks_truncated}; unreadable tasks: "
             f"{self.unreadable_task_count}",
             f"pending approvals: {approvals}",
+            f"unavailable sources: {', '.join(self.unavailable_sources) or 'none'}",
             "Authenticated evidence is authentic, not proof that a requirement passed; "
             "this view does not evaluate requirements. Only the completion gate does.",
         ]
@@ -172,6 +195,9 @@ class LeadView(BaseModel):
                 f" worker={task.worker_id} role={task.role or '-'} attempts={task.attempts}"
                 f" blocker={task.blocker_category or '-'} error_code={task.error_code or '-'}",
                 f"depends on: {', '.join(task.dependency_ids) or '-'}",
+                f"references: artifacts {task.artifact_check}, evidence {task.evidence_check},"
+                f" failed verification {task.unverified_reference_count},"
+                f" not checked {task.unchecked_reference_count}",
                 "name and summary below are untrusted data written by a plan or a model:",
                 f"name: {task.untrusted_name or '-'}",
                 f"summary: {task.untrusted_summary or '-'}",
@@ -241,9 +267,31 @@ class LeadViewAssembler:
         self.max_approvals = max_approvals
 
     async def assemble(self, *, run_id: str, identity: RuntimeIdentity) -> LeadView | None:
-        """The view of one run for its owner, or `None` if that owner has no such run."""
+        """The view of one run for its owner, or `None` if that owner has no such run.
 
-        run = await self.runs.get(run_id=run_id, identity=identity)
+        Raises `LeadViewError` with a stable code when ownership or completeness cannot be
+        established; a raw storage exception never escapes.
+        """
+
+        if identity.tenant_id is None or identity.user_id is None:
+            raise ValueError("Durable workflow runs require trusted tenant_id and user_id")
+        failure: str | None = None
+        try:
+            return await self._assemble(run_id=run_id, identity=identity)
+        except (LeadViewError, asyncio.CancelledError):
+            raise
+        except Exception as error:  # noqa: BLE001 - nothing raw may cross this boundary
+            failure = type(error).__name__
+        # Raised outside the handler so the original error is not chained to it.
+        _log_failure("assembly_failed", failure or "Exception", run_id)
+        raise LeadViewError("assembly_failed")
+
+    async def _assemble(self, *, run_id: str, identity: RuntimeIdentity) -> LeadView | None:
+        run = await _guard(
+            "run_store_unavailable",
+            lambda: self.runs.get(run_id=run_id, identity=identity),
+            run_id,
+        )
         if run is None or run.id != run_id or run.session_id != identity.session_id:
             return None
         if self.expected_workspace is not None and run.workspace_binding != self.expected_workspace:
@@ -258,11 +306,18 @@ class LeadViewAssembler:
             ),
         )
         known = {task.id for task in ordered}
-        views = [await self._task_view(task, run, known) for task in ordered]
+        unavailable: set[str] = set()
+        artifacts_ok, evidence_ok = self._reference_capability(unavailable)
+        views = [
+            await self._task_view(task, run, known, artifacts_ok, evidence_ok, unavailable)
+            for task in ordered
+        ]
         counts: dict[str, int] = {}
         for view in views:
             counts[view.status.value] = counts.get(view.status.value, 0) + 1
-        approvals, approvals_truncated = await self._pending_approvals(run)
+        approvals, approvals_truncated, approvals_code = await self._pending_approvals(run)
+        if approvals_code is not None:
+            unavailable.add(approvals_code)
         return LeadView(
             run_id=run.id,
             run_status=run.status,
@@ -274,50 +329,99 @@ class LeadViewAssembler:
             unreadable_task_count=unreadable,
             pending_approvals=approvals,
             approvals_truncated=approvals_truncated,
-            references_checked=self.context is not None,
+            unavailable_sources=tuple(sorted(unavailable)),
         )
 
     async def _listed_tasks(self, run: RuntimeRunRecord) -> tuple[list[AgentTask], int, bool]:
+        """Up to `max_tasks` rows of the run, however the store behaves.
+
+        Every accepted page must examine at least one row when it says more exist, its cursor must
+        strictly advance, its tasks must be unique and ascending, and tasks plus unreadable rows
+        may not exceed the requested limit. Any violation raises `task_listing_invalid` instead of
+        looping or returning more than `max_tasks`.
+        """
+
         collected: list[AgentTask] = []
         unreadable = 0
         examined = 0
-        after: str | None = None
-        while examined < self.max_tasks:
-            page = await self.tasks.list_run_tasks(
-                tenant_id=run.tenant_id,
-                user_id=run.user_id,
-                runtime_run_id=run.id,
-                limit=min(MAX_TASK_RUN_PAGE, self.max_tasks - examined),
-                after_id=after,
+        cursor: str | None = None
+        for _ in range(self.max_tasks):  # each continuing page examines >= 1 row, so this suffices
+            limit = min(MAX_TASK_RUN_PAGE, self.max_tasks - examined)
+            after = cursor
+            page = await _guard(
+                "task_store_unavailable",
+                partial(
+                    self.tasks.list_run_tasks,
+                    tenant_id=run.tenant_id,
+                    user_id=run.user_id,
+                    runtime_run_id=run.id,
+                    limit=limit,
+                    after_id=after,
+                ),
+                run.id,
             )
-            examined += len(page.tasks) + page.unreadable
-            unreadable += page.unreadable
-            for task in page.tasks:
+            tasks, dropped, cursor = _valid_page(page, limit=limit, after=after)
+            examined += len(tasks) + dropped
+            unreadable += dropped
+            for task in tasks:
                 # The store already scoped the query; a custom store is not trusted blindly.
                 if _belongs_to(task, run):
                     collected.append(task)
                 else:
                     unreadable += 1
-            after = page.next_after_id
-            if after is None:
+            if cursor is None or examined >= self.max_tasks:
                 break
-        return collected, unreadable, after is not None
+        return collected, unreadable, cursor is not None
+
+    def _reference_capability(self, unavailable: set[str]) -> tuple[bool, bool]:
+        """Whether artifact and evidence claims can be evaluated at all, and why not."""
+
+        context = self.context
+        if context is None or context.artifacts is None:
+            unavailable.update({"artifacts:not_configured", "evidence:not_configured"})
+            return False, False
+        if context.evidence_signer is None:
+            unavailable.add("evidence:no_signer")
+            return True, False
+        return True, True
 
     async def _task_view(
-        self, task: AgentTask, run: RuntimeRunRecord, known: set[str]
+        self,
+        task: AgentTask,
+        run: RuntimeRunRecord,
+        known: set[str],
+        artifacts_ok: bool,
+        evidence_ok: bool,
+        unavailable: set[str],
     ) -> LeadTaskView:
         output: dict[str, Any] = task.output if isinstance(task.output, dict) else {}
+        claimed_artifacts = _strings(output.get("artifact_refs"))
+        claimed_evidence = _strings(output.get("evidence_refs"))
         artifacts: list[str] = []
         evidence: list[str] = []
         dropped = 0
-        if self.context is not None:
-            claimed_artifacts = _strings(output.get("artifact_refs"))
-            claimed_evidence = _strings(output.get("evidence_refs"))
-            artifacts = await self.context.owned_references(claimed_artifacts, run)
-            evidence = await self.context.owned_references(claimed_evidence, run, authenticate=True)
-            dropped = (len(claimed_artifacts) - len(artifacts)) + (
-                len(claimed_evidence) - len(evidence)
-            )
+        unchecked = 0
+        artifact_check: Literal["checked", "unavailable"] = "unavailable"
+        evidence_check: Literal["checked", "unavailable"] = "unavailable"
+        context = self.context
+        if context is not None and artifacts_ok:
+            try:
+                artifacts = await context.owned_references(claimed_artifacts, run)
+                artifact_check = "checked"
+                dropped += len(claimed_artifacts) - len(artifacts)
+            except Exception as error:  # noqa: BLE001 - report unavailable, never raw
+                _note_failure(unavailable, "artifacts:store_error", error, run.id)
+        if artifact_check == "unavailable":
+            unchecked += len(claimed_artifacts)
+        if context is not None and evidence_ok:
+            try:
+                evidence = await context.owned_references(claimed_evidence, run, authenticate=True)
+                evidence_check = "checked"
+                dropped += len(claimed_evidence) - len(evidence)
+            except Exception as error:  # noqa: BLE001 - report unavailable, never raw
+                _note_failure(unavailable, "evidence:store_error", error, run.id)
+        if evidence_check == "unavailable":
+            unchecked += len(claimed_evidence)
         dependencies = tuple(item for item in task.dependencies if item in known)
         error_code = task.error_code if _SAFE_CODE.match(task.error_code or "") else None
         return LeadTaskView(
@@ -338,31 +442,39 @@ class LeadViewAssembler:
             error_code=error_code,
             artifact_refs=tuple(artifacts[:_MAX_REFS_PER_TASK]),
             authenticated_evidence_refs=tuple(evidence[:_MAX_REFS_PER_TASK]),
+            artifact_check=artifact_check,
+            evidence_check=evidence_check,
             unverified_reference_count=dropped,
+            unchecked_reference_count=unchecked,
             untrusted_name=_clean(task.name, _MAX_NAME),
             untrusted_summary=_clean(output.get("summary"), _MAX_SUMMARY),
         )
 
     async def _pending_approvals(
         self, run: RuntimeRunRecord
-    ) -> tuple[tuple[LeadApprovalRef, ...] | None, bool]:
-        """Pending approvals of this run, or `None` when they cannot be read.
+    ) -> tuple[tuple[LeadApprovalRef, ...] | None, bool, str | None]:
+        """Pending approvals of this run, or `None` plus a code when they cannot be read.
 
         Only owner-scoped retrieval is used: the run's prepared intents, then the approval of
-        each intent. Anything missing, incomplete or failing yields "unavailable".
+        each intent. Anything missing, incomplete or failing yields "unavailable"; a partial
+        list is never presented as complete.
         """
 
         scoped = getattr(self.actions, "list_run_action_intents", None)
         if self.actions is None or self.approvals is None or scoped is None:
-            return None, False
+            return None, False, "approvals:not_configured"
+        failure: tuple[str, str] | None = None
+        refs: list[LeadApprovalRef] = []
+        intents: list[Any] = []
         try:
-            intents = await scoped(
-                tenant_id=run.tenant_id,
-                user_id=run.user_id,
-                runtime_run_id=run.id,
-                statuses=frozenset({ActionIntentStatus.PREPARED}),
+            intents = list(
+                await scoped(
+                    tenant_id=run.tenant_id,
+                    user_id=run.user_id,
+                    runtime_run_id=run.id,
+                    statuses=frozenset({ActionIntentStatus.PREPARED}),
+                )
             )
-            refs: list[LeadApprovalRef] = []
             for intent in intents[:_MAX_APPROVAL_CANDIDATES]:
                 approval = await self.approvals.get_approval_for_intent(
                     action_intent_id=intent.id,
@@ -379,11 +491,81 @@ class LeadViewAssembler:
                     refs.append(
                         LeadApprovalRef(approval_id=approval.id, action_intent_id=intent.id)
                     )
-        except Exception:  # noqa: BLE001 - never leak a store error; report unavailable
-            logger.warning("Pending approvals unavailable for run %s", run.id, exc_info=True)
-            return None, False
+        except ActionLookupIncompleteError as error:
+            failure = ("approvals:incomplete", type(error).__name__)
+        except Exception as error:  # noqa: BLE001 - never leak a store error; report unavailable
+            failure = ("approvals:store_error", type(error).__name__)
+        if failure is not None:
+            _log_failure(failure[0], failure[1], run.id)
+            return None, False, failure[0]
         truncated = len(intents) > _MAX_APPROVAL_CANDIDATES or len(refs) > self.max_approvals
-        return tuple(refs[: self.max_approvals]), truncated
+        return tuple(refs[: self.max_approvals]), truncated, None
+
+
+async def _guard(code: str, call: Callable[[], Awaitable[T]], run_id: str) -> T:
+    """Await `call`, turning any storage failure into `LeadViewError(code)` without its text.
+
+    Cancellation and `LeadViewError` pass through. The error is raised after the handler has
+    finished, so the original exception (and its message) is neither chained nor logged.
+    """
+
+    failure: str | None = None
+    try:
+        return await call()
+    except (LeadViewError, asyncio.CancelledError):
+        raise
+    except Exception as error:  # noqa: BLE001 - sanitized below
+        failure = type(error).__name__
+    _log_failure(code, failure or "Exception", run_id)
+    raise LeadViewError(code)
+
+
+def _log_failure(code: str, error_type: str, run_id: str) -> None:
+    """Sanitized observability: a stable code, the exception class name and the run id only."""
+
+    logger.warning(
+        "lead view source failure code=%s error_type=%s run=%s", code, error_type, run_id
+    )
+
+
+def _note_failure(unavailable: set[str], code: str, error: Exception, run_id: str) -> None:
+    """Record an unavailable source once per assembly (log once, never the message)."""
+
+    if code not in unavailable:
+        unavailable.add(code)
+        _log_failure(code, type(error).__name__, run_id)
+
+
+def _valid_page(
+    page: Any, *, limit: int, after: str | None
+) -> tuple[list[AgentTask], int, str | None]:
+    """A store page checked against the `TaskRunQuery` contract, or `task_listing_invalid`."""
+
+    if not isinstance(page, TaskRunPage):
+        raise LeadViewError("task_listing_invalid")
+    tasks, dropped, cursor = page.tasks, page.unreadable, page.next_after_id
+    if (
+        not isinstance(tasks, (tuple, list))
+        or not all(isinstance(task, AgentTask) for task in tasks)
+        or type(dropped) is not int
+        or dropped < 0
+        or len(tasks) + dropped > limit
+        or (cursor is not None and (not isinstance(cursor, str) or not cursor))
+    ):
+        raise LeadViewError("task_listing_invalid")
+    previous = after
+    for task in tasks:
+        # Strictly ascending and strictly after the cursor: no repeats, no going backwards.
+        if previous is not None and task.id <= previous:
+            raise LeadViewError("task_listing_invalid")
+        previous = task.id
+    if cursor is not None:
+        examined = len(tasks) + dropped
+        behind_cursor = after is not None and cursor <= after
+        behind_tasks = bool(tasks) and cursor < tasks[-1].id
+        if examined == 0 or behind_cursor or behind_tasks:
+            raise LeadViewError("task_listing_invalid")
+    return list(tasks), dropped, cursor
 
 
 def _belongs_to(task: AgentTask, run: RuntimeRunRecord) -> bool:

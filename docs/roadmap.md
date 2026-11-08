@@ -489,10 +489,16 @@ Each defect was reproduced with a failing test before its fix.
       inventory API exists. This is the prerequisite for the Lead work below.
 - [x] M6.3.3-A (draft pull request, not merged, pending independent review): ADR 0015 (status
       Proposed), the optional `TaskRunQuery` capability (owner- and run-scoped, keyset-paged,
-      SQL-filtered; SQLite ownership columns attested against `runtime_runs`, with a one-time,
-      atomic backfill that leaves unverifiable historical rows unavailable), and the read-only
-      `LeadViewAssembler`/`LeadView`. Verified by deterministic tests including a real
+      SQL-filtered; SQLite ownership columns verified against `runtime_runs`, which establishes
+      membership of a claim in an existing run of the owner and not who wrote the task, with a
+      one-time atomic backfill that leaves unverifiable historical rows unavailable), and the
+      read-only `LeadViewAssembler`/`LeadView`. Verified by deterministic tests including a real
       workflow integration test and mutation checks of the key protections.
+- [x] M6.3.3-A independent review R1 corrections (same draft pull request): the Lead view is
+      bounded and rejects contract-violating `TaskRunQuery` pages instead of looping, storage
+      failures surface as stable `LeadViewError` codes or `unavailable_sources` with sanitized
+      logs, reference availability is explicit (`checked` versus `unavailable`, failed versus
+      unchecked claims), and the trusted-write boundary of `TaskStore` is documented accurately.
 - Not done: delegation proposals and admission, the Lead tools, cycle-boundary delegation
   (later M6.3.3 work packages, blocked on acceptance of ADR 0015), reviewer approval and team
   acceptance (M6.3.4). The Lead view needs a store with `TaskRunQuery`; custom and in-memory
