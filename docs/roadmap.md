@@ -525,6 +525,20 @@ Each defect was reproduced with a failing test before its fix.
   workflow admission is preliminary. The Lead view and workflow admission need a store with
   `TaskRunQuery`; custom and in-memory task stores do not provide it yet.
 
+### Fenced execution foundation (draft pull request, pending independent review)
+
+- [x] Implemented on branch `feat/fenced-execution-foundation` (ADR 0016, accepted and scoped):
+      `SQLiteLeaseStore` with transactional, never-reset epochs in the protected database; fenced
+      task writes, run transitions with monotonic epoch publication, and action-intent writes
+      (including PREPARED to EXECUTING) checked in the write's own transaction; a scheduler that
+      stops, cancels its workers and writes nothing after a refusal; fail-closed rejection of
+      Redis, in-memory, custom-store and second-database configurations. Verified by deterministic
+      adversarial tests and mutation checks; not merged.
+- Not done: Redis plus SQLite and multi-host delegation (not approved), fencing of arbitrary worker
+  code and external effects, exactly-once effects.
+- Pull request 14 (cycle-boundary delegation) stays blocked until this foundation is merged and
+  the integration is rebuilt and re-verified on top of it.
+
 ### M7 design items (not started)
 
 - Lifecycle failure recovery: a failed cycle leaves `LifecycleRuntime` in `failed`, and

@@ -7,11 +7,14 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TypeVar
+from uuid import uuid4
 
 from kaiwen_agent.audit import AuditRecord
 from kaiwen_agent.control.checkpoints import TaskCheckpoint
+from kaiwen_agent.coordination.fencing import OwnerEpoch
+from kaiwen_agent.coordination.sqlite import read_lease_row
 from kaiwen_agent.events import AgentEvent, EventScope, redact_agent_event
-from kaiwen_agent.exceptions import ActionLookupIncompleteError
+from kaiwen_agent.exceptions import ActionLookupIncompleteError, OwnershipLostError
 from kaiwen_agent.jobs.models import TERMINAL_JOB_STATUSES, AgentJob, JobStatus
 from kaiwen_agent.lifecycle.models import (
     LifecycleCycle,
@@ -44,9 +47,18 @@ class SQLitePersistence:
     """Dependency-free SQLite reference adapter for local and small deployments."""
 
     is_durable = True
+    # Explicit capability contract for fenced execution (ADR 0016). A store is accepted for
+    # fenced execution only if it declares this and enforces it in the write's own transaction.
+    fenced_execution_contract = "kaiwen.fenced-execution.v1"
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, busy_timeout_seconds: float = 30.0) -> None:
+        if busy_timeout_seconds <= 0:
+            raise ValueError("busy_timeout_seconds must be positive")
         self.path = Path(path)
+        self.busy_timeout_seconds = busy_timeout_seconds
+        # The one clock that decides lease expiry for every fenced write and for
+        # `SQLiteLeaseStore`. Wall-clock based: see docs/decisions/0016.
+        self.lease_clock: Callable[[], datetime] = utc_now
         self._initialized = False
         self._init_lock = asyncio.Lock()
 
@@ -282,33 +294,46 @@ class SQLitePersistence:
         def operation(connection: sqlite3.Connection) -> None:
             # Ownership columns hold only a claim an existing run confirms (see
             # `_verified_task_owner`); otherwise NULL, which keeps the task out of run queries.
-            owner = _verified_task_owner(connection, task) or (None, None, None)
-            connection.execute(
-                """INSERT INTO tasks
-                    (id, status, agent_id, parent_id, task_json, updated_at,
-                     tenant_id, user_id, runtime_run_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    status = excluded.status,
-                    agent_id = excluded.agent_id,
-                    parent_id = excluded.parent_id,
-                    task_json = excluded.task_json,
-                    updated_at = excluded.updated_at,
-                    tenant_id = excluded.tenant_id,
-                    user_id = excluded.user_id,
-                    runtime_run_id = excluded.runtime_run_id""",
-                (
-                    task.id,
-                    task.status,
-                    task.agent_id,
-                    task.parent_id,
-                    task.model_dump_json(),
-                    utc_now().isoformat(),
-                    *owner,
-                ),
-            )
+            _upsert_task(connection, task, _verified_task_owner(connection, task))
 
         await self._run(operation)
+
+    async def save_task_fenced(self, task: AgentTask, owner_epoch: OwnerEpoch) -> None:
+        """Persist `task` only while `owner_epoch` is the live authority over its run.
+
+        The lease, the run and the write share one `BEGIN IMMEDIATE` transaction, so a lease that
+        expired or was taken over is refused when the write evaluates it, even if no successor has
+        written anything yet. A refusal raises `OwnershipLostError` and rolls back; it never falls
+        back to an ordinary save.
+        """
+
+        await self.initialize()
+        now_ms = _ms(self.lease_clock())
+
+        def operation(connection: sqlite3.Connection) -> None:
+            connection.execute("BEGIN IMMEDIATE")
+            run = _authorize_epoch(connection, owner_epoch, now_ms=now_ms)
+            _require_published(run, owner_epoch)
+            # Membership comes from the verified owner tuple only: it names the task's own run.
+            owner = _verified_task_owner(connection, task)
+            if owner != (owner_epoch.tenant_id, owner_epoch.user_id, owner_epoch.run_id):
+                raise OwnershipLostError("task_not_in_run")
+            _upsert_task(connection, task, owner)
+
+        await self._run(operation)
+
+    async def database_id(self) -> str:
+        """The identity of this database file, created once and stored inside it."""
+
+        await self.initialize()
+
+        def operation(connection: sqlite3.Connection) -> str:
+            row = connection.execute("SELECT database_id FROM fence_meta WHERE id = 1").fetchone()
+            if row is None or not isinstance(row["database_id"], str) or not row["database_id"]:
+                raise OwnershipLostError("authority_unavailable")
+            return str(row["database_id"])
+
+        return await self._run(operation)
 
     async def list_run_tasks(
         self,
@@ -1137,14 +1162,42 @@ class SQLitePersistence:
         *,
         expected_status: RuntimeRunStatus | None = None,
         expected_owner_fence: int | None = None,
+        owner_epoch: OwnerEpoch | None = None,
     ) -> None:
+        """Persist a run, optionally conditional on its status, owner token and live lease.
+
+        With `owner_epoch` the write is fenced: the lease and epoch are evaluated in this same
+        transaction. Starting (becoming RUNNING) publishes the epoch and needs a strictly higher
+        epoch than any published; every other transition needs the run to be RUNNING under exactly
+        this epoch. A flagged (fenced) run cannot be started without an epoch.
+        """
+
         await self.initialize()
+        now_ms = _ms(self.lease_clock())
 
         def operation(connection: sqlite3.Connection) -> None:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 "SELECT run_json FROM runtime_runs WHERE id = ?", (run.id,)
             ).fetchone()
+            if owner_epoch is not None:
+                if row is None:
+                    raise OwnershipLostError("run_not_found")
+                _authorize_run_write(
+                    connection,
+                    owner_epoch,
+                    RuntimeRunRecord.model_validate_json(row["run_json"]),
+                    run,
+                    now_ms=now_ms,
+                )
+            elif row is not None:
+                existing = RuntimeRunRecord.model_validate_json(row["run_json"])
+                if (
+                    existing.fenced
+                    and existing.status is not RuntimeRunStatus.RUNNING
+                    and run.status is RuntimeRunStatus.RUNNING
+                ):
+                    raise OwnershipLostError("fenced_run_requires_epoch")
             if row is None and (expected_status is not None or expected_owner_fence is not None):
                 raise RuntimeRunConflictError("Runtime run does not exist")
             if row is not None:
@@ -1236,11 +1289,29 @@ class SQLitePersistence:
 
         return await self._run(operation)
 
-    async def prepare_action_intent(self, intent: ActionIntentRecord) -> ActionIntentRecord:
+    async def prepare_action_intent(
+        self, intent: ActionIntentRecord, *, owner_epoch: OwnerEpoch | None = None
+    ) -> ActionIntentRecord:
+        """Persist (or return) an intent. With `owner_epoch`, only while that epoch is live.
+
+        Without an epoch, an intent for a fenced, running run is refused: a platform tool call
+        that does not carry the executor's authority cannot be admitted by accident.
+        """
+
         await self.initialize()
+        now_ms = _ms(self.lease_clock())
 
         def operation(connection: sqlite3.Connection) -> ActionIntentRecord:
             connection.execute("BEGIN IMMEDIATE")
+            _authorize_intent_write(
+                connection,
+                owner_epoch,
+                tenant_id=intent.tenant_id,
+                user_id=intent.user_id,
+                run_id=intent.runtime_run_id,
+                admits_side_effect=True,
+                now_ms=now_ms,
+            )
             connection.execute(
                 """INSERT OR IGNORE INTO action_intents
                     (id, runtime_run_id, tenant_id, user_id, status,
@@ -1358,9 +1429,18 @@ class SQLitePersistence:
         result: ToolResult | None = None,
         error_code: str | None = None,
         external_receipt: dict[str, object] | None = None,
+        owner_epoch: OwnerEpoch | None = None,
     ) -> ActionIntentRecord | None:
+        """Transition an intent. With `owner_epoch`, only while that epoch is live.
+
+        PREPARED -> EXECUTING authorizes a side-effecting handler to start. For a fenced, running
+        run it needs the live epoch; a stale owner is refused and an EXECUTING intent it can no
+        longer finish stays EXECUTING for recovery to mark uncertain.
+        """
+
         _validate_action_transition_request(expected, status)
         await self.initialize()
+        now_ms = _ms(self.lease_clock())
 
         def operation(connection: sqlite3.Connection) -> ActionIntentRecord | None:
             connection.execute("BEGIN IMMEDIATE")
@@ -1372,6 +1452,18 @@ class SQLitePersistence:
             if row is None:
                 return None
             current = ActionIntentRecord.model_validate_json(row["intent_json"])
+            _authorize_intent_write(
+                connection,
+                owner_epoch,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                run_id=current.runtime_run_id,
+                admits_side_effect=(
+                    status is ActionIntentStatus.EXECUTING
+                    and ActionIntentStatus.PREPARED in expected
+                ),
+                now_ms=now_ms,
+            )
             if current.status not in expected:
                 return None
             updated = current.model_copy(
@@ -1591,7 +1683,7 @@ class SQLitePersistence:
 
     async def _run(self, operation: Callable[[sqlite3.Connection], T]) -> T:
         def execute() -> T:
-            connection = sqlite3.connect(self.path, timeout=30)
+            connection = sqlite3.connect(self.path, timeout=self.busy_timeout_seconds)
             connection.row_factory = sqlite3.Row
             try:
                 connection.execute("PRAGMA foreign_keys = ON")
@@ -1714,6 +1806,13 @@ class SQLitePersistence:
                 ON action_intents(status, updated_at);
             CREATE INDEX IF NOT EXISTS idx_action_intents_run
                 ON action_intents(runtime_run_id, updated_at);
+            CREATE TABLE IF NOT EXISTS fence_meta (
+                id INTEGER PRIMARY KEY CHECK (id = 1), database_id TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS fence_leases (
+                key TEXT PRIMARY KEY, owner_id TEXT NOT NULL, token TEXT NOT NULL,
+                epoch INTEGER NOT NULL, expires_at_ms INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS durable_approvals (
                 id TEXT PRIMARY KEY, action_intent_id TEXT NOT NULL,
                 tenant_id TEXT NOT NULL, user_id TEXT NOT NULL,
@@ -1740,6 +1839,10 @@ class SQLitePersistence:
         connection.execute(
             """CREATE INDEX IF NOT EXISTS idx_tasks_owner_run
             ON tasks(tenant_id, user_id, runtime_run_id, id)"""
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO fence_meta (id, database_id) VALUES (1, ?)",
+            (f"db_{uuid4().hex}",),
         )
 
 
@@ -1784,6 +1887,142 @@ def _verified_task_owner(
     if session_id != task.session_id:
         return None
     return task.tenant_id, task.user_id, run_id
+
+
+def _ms(moment: datetime) -> int:
+    if moment.tzinfo is None:
+        raise ValueError("Lease timestamps must be timezone-aware")
+    return int(moment.timestamp() * 1000)
+
+
+def _upsert_task(
+    connection: sqlite3.Connection, task: AgentTask, owner: tuple[str, str, str] | None
+) -> None:
+    owner_columns = owner or (None, None, None)
+    connection.execute(
+        """INSERT INTO tasks
+            (id, status, agent_id, parent_id, task_json, updated_at,
+             tenant_id, user_id, runtime_run_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            status = excluded.status,
+            agent_id = excluded.agent_id,
+            parent_id = excluded.parent_id,
+            task_json = excluded.task_json,
+            updated_at = excluded.updated_at,
+            tenant_id = excluded.tenant_id,
+            user_id = excluded.user_id,
+            runtime_run_id = excluded.runtime_run_id""",
+        (
+            task.id,
+            task.status,
+            task.agent_id,
+            task.parent_id,
+            task.model_dump_json(),
+            utc_now().isoformat(),
+            *owner_columns,
+        ),
+    )
+
+
+def _authorize_epoch(
+    connection: sqlite3.Connection, epoch: OwnerEpoch, *, now_ms: int
+) -> RuntimeRunRecord:
+    """Raise `OwnershipLostError` unless `epoch` is the live lease holder of its run.
+
+    Must run inside the write's own transaction. Checks the database, the lease row (credential,
+    generation, owner, expiry) and the run's owner and session; returns the run record.
+    """
+
+    meta = connection.execute("SELECT database_id FROM fence_meta WHERE id = 1").fetchone()
+    if meta is None or meta["database_id"] != epoch.database_id:
+        raise OwnershipLostError("database_mismatch")
+    lease = read_lease_row(connection, epoch.lease_key)
+    if lease is None:
+        raise OwnershipLostError("lease_not_held")
+    owner_id, token, generation, expires = lease
+    if generation > epoch.epoch:
+        raise OwnershipLostError("lease_superseded")
+    if generation < epoch.epoch or token != epoch.credential or owner_id != epoch.owner_id:
+        raise OwnershipLostError("lease_not_held")
+    if expires <= now_ms:
+        raise OwnershipLostError("lease_expired")
+    row = connection.execute(
+        "SELECT run_json FROM runtime_runs WHERE id = ? AND tenant_id = ? AND user_id = ?",
+        (epoch.run_id, epoch.tenant_id, epoch.user_id),
+    ).fetchone()
+    if row is None:
+        raise OwnershipLostError("run_not_found")
+    run = RuntimeRunRecord.model_validate_json(row["run_json"])
+    if run.session_id != epoch.session_id:
+        raise OwnershipLostError("binding_mismatch")
+    return run
+
+
+def _require_published(run: RuntimeRunRecord, epoch: OwnerEpoch) -> None:
+    """The run is RUNNING and has this epoch published as its owner."""
+
+    if run.status is not RuntimeRunStatus.RUNNING:
+        raise OwnershipLostError("run_not_running")
+    if run.owner_lease_key != epoch.lease_key or run.owner_fencing_token != epoch.epoch:
+        raise OwnershipLostError("epoch_not_published")
+
+
+def _authorize_run_write(
+    connection: sqlite3.Connection,
+    epoch: OwnerEpoch,
+    current: RuntimeRunRecord,
+    new: RuntimeRunRecord,
+    *,
+    now_ms: int,
+) -> None:
+    if new.id != epoch.run_id:
+        raise OwnershipLostError("binding_mismatch")
+    _authorize_epoch(connection, epoch, now_ms=now_ms)
+    if new.status is RuntimeRunStatus.RUNNING and current.status is not RuntimeRunStatus.RUNNING:
+        # Starting publishes the epoch. A lower or equal epoch can never replace a published one.
+        published = current.owner_fencing_token
+        if published is not None and published >= epoch.epoch:
+            raise OwnershipLostError("epoch_regressed")
+        if new.owner_fencing_token != epoch.epoch or new.owner_lease_key != epoch.lease_key:
+            raise OwnershipLostError("epoch_not_published")
+        if not new.fenced:
+            raise OwnershipLostError("binding_mismatch")
+        return
+    _require_published(current, epoch)
+    if new.owner_fencing_token != current.owner_fencing_token:
+        raise OwnershipLostError("epoch_regressed")
+
+
+def _authorize_intent_write(
+    connection: sqlite3.Connection,
+    epoch: OwnerEpoch | None,
+    *,
+    tenant_id: str,
+    user_id: str,
+    run_id: str,
+    admits_side_effect: bool,
+    now_ms: int,
+) -> None:
+    """Fence an action-intent write. See `prepare_action_intent` and `transition_action_intent`."""
+
+    if epoch is not None:
+        if (epoch.tenant_id, epoch.user_id, epoch.run_id) != (tenant_id, user_id, run_id):
+            raise OwnershipLostError("binding_mismatch")
+        run = _authorize_epoch(connection, epoch, now_ms=now_ms)
+        _require_published(run, epoch)
+        return
+    if not admits_side_effect:
+        return
+    row = connection.execute(
+        "SELECT run_json FROM runtime_runs WHERE id = ? AND tenant_id = ? AND user_id = ?",
+        (run_id, tenant_id, user_id),
+    ).fetchone()
+    if row is None:
+        return
+    run = RuntimeRunRecord.model_validate_json(row["run_json"])
+    if run.fenced and run.status is RuntimeRunStatus.RUNNING:
+        raise OwnershipLostError("fenced_run_requires_epoch")
 
 
 def _materialize_run_task(

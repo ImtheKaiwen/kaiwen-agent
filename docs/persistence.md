@@ -126,6 +126,27 @@ paused or stalled executor whose lease was taken over cannot complete, fail, or 
 run the new owner is executing, and a recovery pass cannot overwrite a state the owner
 wrote after recovery listed the runs.
 
+## Fenced execution (opt-in, one SQLite database)
+
+The run lease above is checked, not enforced: the task store, the scheduler and the action-intent
+claim carry no authority, and the run record only learns of a new owner when that owner writes.
+For one configuration the platform can enforce ownership inside each protected write (ADR 0016):
+`SQLiteLeaseStore(persistence)` keeps leases and per-key, never-reset epochs in the same SQLite
+file as the tasks, runs and action intents, and `FencedExecution(persistence=..., leases=...)`
+passed to `WorkflowController(fenced=...)` binds the controller's `OwnerEpoch` to everything it
+runs. Task writes (`FencedTaskStore`), run-state transitions and action-intent writes then
+evaluate the lease and epoch in their own transaction and raise `OwnershipLostError` (stable
+`code`) when the lease expired, was taken over, or does not belong to this run. This holds even
+when no successor exists and when the run record still names the old owner.
+
+What it does not do: a worker that was already invoked keeps running and its external effects are
+not undone; an action admitted before the loss may finish, and if it cannot record its outcome it
+stays `EXECUTING` for recovery to mark uncertain; durable approvals are not epoch-checked; replay
+stays at-least-once and external effects are not exactly-once. It needs one local database file,
+the same `SQLitePersistence` object for leases and records, and a wall clock (`lease_clock`);
+Redis leases, in-memory stores, custom task stores and second databases are refused at
+construction and nothing downgrades to ordinary writes. Existing workflows are unchanged.
+
 ## Upgrading action intents persisted by 0.7.0a1 and earlier
 
 Action-intent ids no longer include the arguments checksum. No migration is required

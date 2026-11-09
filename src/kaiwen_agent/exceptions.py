@@ -65,6 +65,22 @@ class RunOwnershipError(AgentError):
     """Raised when a workflow run is owned by another executor or ownership was lost."""
 
 
+class OwnershipLostError(RunOwnershipError):
+    """A fenced write was refused by the authoritative lease state.
+
+    `code` is stable and non-sensitive. The message never carries lease credentials, SQL text or
+    storage error messages.
+    """
+
+    def __init__(self, code: str) -> None:
+        super().__init__(f"Fenced write refused: {code}")
+        self.code = code
+
+
+class FencedConfigurationError(AgentError):
+    """Fenced execution was requested for a configuration that cannot enforce it."""
+
+
 class ActionLookupIncompleteError(AgentError):
     """Raised when in-flight action intents cannot be listed completely."""
 

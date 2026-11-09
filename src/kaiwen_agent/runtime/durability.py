@@ -73,6 +73,10 @@ class RuntimeRunRecord(BaseModel):
     owner_lease_key: str | None = Field(default=None, min_length=1, max_length=300)
     # Fencing token of the lease under which the current owner started the run.
     owner_fencing_token: int | None = Field(default=None, ge=1)
+    # True once an executor started the run under fenced execution (ADR 0016). It is never
+    # cleared: a fenced run cannot be continued by an unfenced executor, so fenced mode does not
+    # silently downgrade. Records written before fenced execution load as False.
+    fenced: bool = False
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
     completed_at: datetime | None = None
