@@ -83,7 +83,16 @@ class SQLiteLeaseStore:
         self.persistence = persistence
 
     def _clock(self, now: datetime | None) -> datetime:
-        return now if now is not None else self.persistence.lease_clock()
+        """The time of the transaction: an explicit `now` (tests), else the shared clock.
+
+        Always called inside the transaction, after the write lock is held, never before waiting
+        for it, so expiry is judged at the protected boundary and not at a stale sample.
+        """
+
+        moment = now if now is not None else self.persistence.lease_clock()
+        if moment.tzinfo is None:
+            raise ValueError("Lease timestamps must be timezone-aware")
+        return moment
 
     async def acquire(
         self,
@@ -93,14 +102,15 @@ class SQLiteLeaseStore:
         ttl_seconds: float,
         now: datetime | None = None,
     ) -> DistributedLease | None:
-        observed = _validate(key, owner_id, ttl_seconds, self._clock(now))
-        now_ms = _ms(observed)
-        expires_ms = now_ms + max(1, int(ttl_seconds * 1000))
+        _validate(key, owner_id, ttl_seconds, now)
         token = f"lease_{uuid4().hex}"
         await self.persistence.initialize()
 
-        def operation(connection: sqlite3.Connection) -> int | None:
+        def operation(connection: sqlite3.Connection) -> tuple[int, datetime, int, int] | None:
             connection.execute("BEGIN IMMEDIATE")
+            observed = self._clock(now)
+            now_ms = _ms(observed)
+            expires_ms = now_ms + max(1, int(ttl_seconds * 1000))
             row = read_lease_row(connection, key)
             if row is not None and row[1] != "" and row[3] > now_ms:
                 return None  # held and unexpired
@@ -113,11 +123,12 @@ class SQLiteLeaseStore:
                     epoch = excluded.epoch, expires_at_ms = excluded.expires_at_ms""",
                 (key, owner_id, token, epoch, expires_ms),
             )
-            return epoch
+            return epoch, observed, now_ms, expires_ms
 
-        epoch = await self.persistence._run(operation)
-        if epoch is None:
+        granted = await self.persistence._run(operation)
+        if granted is None:
             return None
+        epoch, observed, now_ms, expires_ms = granted
         return DistributedLease(
             key=key,
             owner_id=owner_id,
@@ -134,13 +145,14 @@ class SQLiteLeaseStore:
         ttl_seconds: float,
         now: datetime | None = None,
     ) -> DistributedLease | None:
-        observed = _validate(lease.key, lease.owner_id, ttl_seconds, self._clock(now))
-        now_ms = _ms(observed)
-        expires_ms = now_ms + max(1, int(ttl_seconds * 1000))
+        _validate(lease.key, lease.owner_id, ttl_seconds, now)
         await self.persistence.initialize()
 
-        def operation(connection: sqlite3.Connection) -> bool:
+        def operation(connection: sqlite3.Connection) -> tuple[datetime, int, int] | None:
             connection.execute("BEGIN IMMEDIATE")
+            observed = self._clock(now)
+            now_ms = _ms(observed)
+            expires_ms = now_ms + max(1, int(ttl_seconds * 1000))
             row = read_lease_row(connection, lease.key)
             if (
                 row is None
@@ -149,14 +161,16 @@ class SQLiteLeaseStore:
                 or row[2] != lease.fencing_token
                 or row[3] <= now_ms
             ):
-                return False  # not the holder, or already expired: expiry is never revived
+                return None  # not the holder, or already expired: expiry is never revived
             connection.execute(
                 "UPDATE fence_leases SET expires_at_ms = ? WHERE key = ?", (expires_ms, lease.key)
             )
-            return True
+            return observed, now_ms, expires_ms
 
-        if not await self.persistence._run(operation):
+        renewed = await self.persistence._run(operation)
+        if renewed is None:
             return None
+        observed, now_ms, expires_ms = renewed
         return lease.model_copy(
             update={"expires_at": observed + timedelta(milliseconds=expires_ms - now_ms)}
         )
@@ -202,10 +216,10 @@ class SQLiteLeaseStore:
         if lease.key != f"{FENCED_RUN_LEASE_PREFIX}{run_id}":
             raise FencedConfigurationError("The lease does not belong to this run")
         await self.persistence.initialize()
-        now_ms = _ms(self.persistence.lease_clock())
 
         def operation(connection: sqlite3.Connection) -> str:
             connection.execute("BEGIN IMMEDIATE")
+            now_ms = _ms(self._clock(None))
             row = read_lease_row(connection, lease.key)
             if row is None or row[1] != lease.token or row[2] != lease.fencing_token:
                 raise OwnershipLostError("lease_not_held")

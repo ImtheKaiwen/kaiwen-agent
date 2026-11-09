@@ -12,6 +12,10 @@
   refusal. Unsupported configurations (Redis or in-memory leases, custom stores, a second
   database, unfenced schedulers) are refused at construction. Existing workflows and stores are
   unchanged; effects are not exactly-once. `SQLitePersistence` gains `busy_timeout_seconds`.
+  Audit corrections: lease expiry is judged at the protected transaction, not at an earlier clock
+  sample; a fenced run keeps its flag and accepts no ordinary transition or action-intent
+  finalization while RUNNING; `RuntimeRecoveryManager` gains a narrow, lease-backed authority that
+  can only block such a run and mark an EXECUTING action uncertain.
 - Add shared, host-controlled delegation admission (M6.3.3-B, ADR 0015 accepted):
   `DelegationAdmission`, `DelegationClaim`, `AdmissionDecision` and `AdmissionOutcome` in
   `kaiwen_agent.policy`. It reuses the central `PolicyEngine` (`agent.delegate`); only an

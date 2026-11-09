@@ -42,11 +42,20 @@ class Probe:
         self.cancelled: list[str] = []
         self.lose_in: set[str] = set()
         self.swallow_progress = False
+        # name -> event set once that worker is running; `lose_after` makes a worker wait for
+        # another to be running before it expires the lease, so the order is never left to chance.
+        self.started: dict[str, asyncio.Event] = {}
+        self.lose_after: dict[str, str] = {}
 
     async def work(self, task: AgentTask, context: Any) -> dict[str, Any]:
         name = str(task.metadata["logical_task_id"])
         self.ran.append(name)
+        self.started.setdefault(name, asyncio.Event()).set()
         try:
+            if name in self.lose_after:
+                await asyncio.wait_for(
+                    self.started.setdefault(self.lose_after[name], asyncio.Event()).wait(), 10
+                )
             if name in self.lose_in:
                 self.flow.clock.advance(TTL + 1)  # the lease expires while this worker runs
             if name == "hang":
@@ -208,9 +217,11 @@ def test_other_active_workers_are_cancelled_and_resources_are_released(tmp_path:
     async def scenario() -> None:
         flow, probe = build(tmp_path)
         probe.lose_in = {"a"}
+        probe.lose_after = {"a": "hang"}  # `hang` is definitely running when ownership is lost
         run = await flow.new_run()
         workflow = plan(spec("a", "w"), spec("hang", "w", resource_keys=("repo:main",)))
         await refused_with(flow, run, workflow, "lease_expired")
+        assert probe.ran.count("hang") == 1
         assert "hang" in probe.cancelled  # cooperatively cancelled, not left running
         assert (await rows(flow, run))["hang"] not in FINAL
         scheduler = flow.schedulers[-1]
@@ -385,5 +396,23 @@ def test_a_refusal_raised_by_a_worker_is_ownership_loss_not_a_task_failure(
         assert caught.value.code == "lease_superseded"
         assert probe.ran.count("denied") == 1  # never re-dispatched as a retry
         assert (await rows(flow, run))["denied"] is TaskStatus.RUNNING  # not FAILED, not READY
+
+    run_async(scenario)
+
+
+def test_a_worker_that_had_not_started_never_runs_and_holds_no_resource(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        flow, probe = build(tmp_path)
+        probe.lose_in = {"a"}
+        run = await flow.new_run()
+        # `hang` depends on `a`, so it cannot have started when ownership is lost during `a`.
+        workflow = plan(
+            spec("a", "w"), spec("hang", "w", dependencies=("a",), resource_keys=("repo:main",))
+        )
+        await refused_with(flow, run, workflow, "lease_expired")
+        assert probe.ran == ["a"] and probe.cancelled == []
+        assert not (set((await rows(flow, run)).values()) & FINAL)
+        scheduler = flow.schedulers[-1]
+        assert await scheduler.resources.try_acquire(("repo:main",), "probe")
 
     run_async(scenario)

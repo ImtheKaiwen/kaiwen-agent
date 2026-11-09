@@ -56,9 +56,11 @@ epoch inside each protected write's own transaction, for one configuration only.
   a worker, which could call the persistence layer directly.
 - Clock. Expiry is judged by `SQLitePersistence.lease_clock` (UTC wall clock, millisecond
   resolution), the single clock shared by the lease store and every fenced write, so they cannot
-  disagree. Tests inject a deterministic clock there. A clock that steps backwards can extend a
-  lease and one that steps forward can end it early; this is why the mode is limited to one local
-  database file (one host, one clock).
+  disagree. The clock is read inside each protected transaction, after the write lock is held,
+  never before waiting for it (a sample taken earlier can be arbitrarily stale when contention
+  delays the transaction); tests inject a deterministic clock there and a second connection that
+  holds the lock. A clock that steps backwards can extend a lease and one that steps forward can
+  end it early; this is why the mode is limited to one local database file (one host, one clock).
 
 ## What is enforced, and where
 
@@ -67,16 +69,30 @@ epoch inside each protected write's own transaction, for one configuration only.
   Creation, queueing, RUNNING, progress, completion, retry and cancellation records all go through
   it when the scheduler is built over `FencedTaskStore`.
 - Fenced run transitions: `save_runtime_run(..., owner_epoch=...)` for start, complete, block,
-  fail and cancel (pause shares the same code path and is not separately tested). Starting publishes the epoch and needs a strictly higher epoch than any
-  published; every other transition needs the run RUNNING under exactly this epoch. A run that was
-  started fenced (`RuntimeRunRecord.fenced`, never cleared) cannot be started again without an
-  epoch. Other runs and stores are unchanged.
+  fail and cancel (pause shares the same code path as the others). Starting publishes the epoch and
+  needs a strictly higher epoch than any published; every other transition needs the run RUNNING
+  under exactly this epoch. A run that was started fenced (`RuntimeRunRecord.fenced`) keeps that
+  flag for good: no write can clear it, and only a fenced start can set it. While such a run is
+  RUNNING, no write without an epoch is accepted (complete, fail, cancel, pause, block, or a
+  direct store update). Once it is not RUNNING (blocked, paused), operator transitions keep
+  working, because no executor holds authority, but starting it still needs an epoch. Other runs
+  and stores are unchanged.
+- Recovery authority (narrow, explicit). `RuntimeRecoveryManager` touches a fenced RUNNING run
+  only with the run's own lease, acquired as a probe (so the owner's lease is gone) and newer than
+  the published epoch, issued as a `recovery_epoch`. With it, a run write can only move the run to
+  BLOCKED and an intent write can only move EXECUTING to UNCERTAIN; recovery can never complete,
+  fail, pause or restart a run, finish an action or record a receipt. A live owner is left alone.
+  Recovering fenced runs needs the same `SQLiteLeaseStore`; with any other lease store the run is
+  left untouched (fail closed), and an operator cancel of a RUNNING fenced run must go through the
+  controller or a recovery pass.
 - Fenced action intents: `prepare_action_intent` and `transition_action_intent` take the epoch.
   PREPARED to EXECUTING, which authorizes a side-effecting handler to start, is refused for a
-  stale owner. For a fenced running run, an intent write that carries no epoch is refused, so a
-  platform tool call cannot be admitted by omission. The platform `ToolExecutor` uses
-  `FencedActionIntents` whenever its `DurableActionScope` carries an epoch, and refuses a
-  side-effecting tool whose store cannot fence.
+  stale owner. For a fenced running run every intent write without an epoch is refused, whatever
+  it does: nothing outside the executor can start a handler or record SUCCEEDED, FAILED or
+  CANCELLED, so no stale outcome becomes a receipt and an unknown outcome stays EXECUTING for
+  recovery. After recovery blocks the run, an operator reconciles UNCERTAIN actions with the
+  existing contract. The platform `ToolExecutor` uses `FencedActionIntents` whenever its
+  `DurableActionScope` carries an epoch, and refuses a side-effecting tool whose store cannot fence.
 - Scheduler. After any refusal the scheduler remembers it, writes nothing further, stops
   dispatch, cancels the other workers (including one that swallows the error), releases its
   resources and raises the original refusal. It never records a failure, a retry, a completion or
@@ -106,8 +122,8 @@ epoch inside each protected write's own transaction, for one configuration only.
    a new call id and no key runs again.
 
 Also not covered: durable approvals are not epoch-checked (an approval only permits one specific
-intent and the claim is fenced); recovery and operator paths remain deliberately unfenced and
-conditional on run status; the single-host clock assumption above; a controller whose event loop
+intent and the claim is fenced); operator paths for runs that are no longer RUNNING remain
+conditional on run status only; the single-host clock assumption above; a controller whose event loop
 is blocked longer than the lease TTL simply fails closed on its next write.
 
 ## Operational restrictions

@@ -138,6 +138,11 @@ runs. Task writes (`FencedTaskStore`), run-state transitions and action-intent w
 evaluate the lease and epoch in their own transaction and raise `OwnershipLostError` (stable
 `code`) when the lease expired, was taken over, or does not belong to this run. This holds even
 when no successor exists and when the run record still names the old owner.
+The clock is read inside each transaction after the write lock is held. A fenced run keeps its
+`fenced` flag, accepts no write without an epoch while it is RUNNING (including `complete`, `fail`,
+`cancel`, `pause`, `block` and every action-intent finalization), and is recovered only by
+`RuntimeRecoveryManager` holding the run's own lease with `SQLiteLeaseStore`, which can only block
+the run and mark an EXECUTING action uncertain.
 
 What it does not do: a worker that was already invoked keeps running and its external effects are
 not undone; an action admitted before the loss may finish, and if it cannot record its outcome it

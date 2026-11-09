@@ -25,7 +25,12 @@ from kaiwen_agent.coordination import (
 )
 from kaiwen_agent.exceptions import FencedConfigurationError, OwnershipLostError
 from kaiwen_agent.persistence import SQLitePersistence
-from kaiwen_agent.runtime import DurableRunManager, RuntimeRunStatus
+from kaiwen_agent.runtime import (
+    DurableRunManager,
+    DurableRuntimeStores,
+    RuntimeRecoveryManager,
+    RuntimeRunStatus,
+)
 from kaiwen_agent.tasks import AgentTask, TaskScheduler, TaskStatus
 from kaiwen_agent.tasks.fenced import FencedTaskStore
 from kaiwen_agent.workflow import FencedExecution, WorkflowCompiler, WorkflowController
@@ -105,6 +110,14 @@ class FencedFlow(Flow):
             tenant_id=run.tenant_id,
             user_id=run.user_id,
             session_id=run.session_id,
+        )
+
+    async def recover(self) -> Any:
+        """A recovery pass: the only way a fenced run whose owner is gone becomes BLOCKED."""
+
+        stores = DurableRuntimeStores(runs=self.store, actions=self.store, approvals=self.store)
+        return await RuntimeRecoveryManager(stores=stores, leases=self.leases).reconcile(
+            owner_id="recovery"
         )
 
     async def status(self, run: Any) -> RuntimeRunStatus:
@@ -206,9 +219,9 @@ def test_after_the_new_owner_commits_its_epoch_the_old_owner_cannot_write_anythi
         _, old = await flow.owned(run)
         flow.clock.advance(TTL + 1)
         # Recovery blocks the orphaned run, then the new owner starts it and publishes epoch 2.
-        await flow.runs.block(run_id=run.id, identity=owner(), reason="owner_lost")
+        await flow.recover()
         _, new = await flow.owned(run, owner_id="b")
-        assert new.epoch == 2
+        assert new.epoch == 3  # generation 2 was recovery's own lease, which blocked the run
         await flow.store.save_task_fenced(flow.task(run), new)
         for call, code in (
             (flow.store.save_task_fenced(flow.task(run, "task_2"), old), "lease_superseded"),
@@ -242,16 +255,20 @@ def test_a_lower_epoch_can_never_replace_a_published_higher_one(tmp_path: Path) 
         run = await flow.new_run()
         record = await flow.runs.get(run_id=run.id, identity=owner())
         assert record is not None
-        # A higher epoch (5) was already published for this run by a previous owner.
-        await flow.store.save_runtime_run(
-            record.model_copy(
-                update={
-                    "owner_fencing_token": 5,
-                    "owner_lease_key": f"runtime-run:{run.id}",
-                    "fenced": True,
-                }
-            )
+        # A higher epoch (5) was already published for this run by a previous owner. Seeded in
+        # SQL on purpose: no API may publish an epoch without holding it.
+        seeded = record.model_copy(
+            update={
+                "owner_fencing_token": 5,
+                "owner_lease_key": f"runtime-run:{run.id}",
+                "fenced": True,
+            }
         )
+        with sqlite3.connect(flow.store.path) as connection:
+            connection.execute(
+                "UPDATE runtime_runs SET run_json = ? WHERE id = ?",
+                (seeded.model_dump_json(), run.id),
+            )
         lease = await flow.leases.acquire(
             key=f"runtime-run:{run.id}", owner_id="a", ttl_seconds=TTL
         )
@@ -398,7 +415,8 @@ def test_a_fenced_run_cannot_be_started_without_an_epoch(tmp_path: Path) -> None
         flow = FencedFlow(tmp_path)
         run = await flow.new_run()
         await flow.owned(run)
-        await flow.runs.block(run_id=run.id, identity=owner(), reason="owner_lost")
+        flow.clock.advance(TTL + 1)  # the owner is gone: only then may recovery block the run
+        await flow.recover()
         # An unfenced executor (or a stale caller with a bare token) cannot continue it.
         await refused(
             flow.runs.start(run_id=run.id, identity=owner(), owner_lease_key="k", owner_fence=9),
