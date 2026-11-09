@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import inspect
 
-from kaiwen_agent.exceptions import RunOwnershipError
+from kaiwen_agent.coordination.fencing import OwnerEpoch
+from kaiwen_agent.exceptions import FencedConfigurationError, RunOwnershipError
 from kaiwen_agent.runtime.durability import (
     RuntimeRunRecord,
     RuntimeRunStatus,
@@ -24,6 +25,16 @@ class DurableRunManager:
         self._conditional_writes = (
             "expected_status" in inspect.signature(store.save_runtime_run).parameters
         )
+        self._fenced_writes = (
+            getattr(store, "fenced_execution_contract", None) == "kaiwen.fenced-execution.v1"
+            and "owner_epoch" in inspect.signature(store.save_runtime_run).parameters
+        )
+
+    @property
+    def supports_fenced_execution(self) -> bool:
+        """Whether the store declares and implements fenced (epoch-checked) run writes."""
+
+        return self._fenced_writes
 
     async def create(
         self,
@@ -82,6 +93,7 @@ class DurableRunManager:
         identity: RuntimeIdentity,
         owner_lease_key: str | None = None,
         owner_fence: int | None = None,
+        owner_epoch: OwnerEpoch | None = None,
     ) -> RuntimeRunRecord:
         return await self._transition(
             run_id=run_id,
@@ -96,7 +108,10 @@ class DurableRunManager:
             status=RuntimeRunStatus.RUNNING,
             owner_lease_key=owner_lease_key,
             owner_fence=owner_fence,
-            take_ownership=owner_lease_key is not None or owner_fence is not None,
+            owner_epoch=owner_epoch,
+            take_ownership=(
+                owner_lease_key is not None or owner_fence is not None or owner_epoch is not None
+            ),
         )
 
     async def pause(
@@ -106,6 +121,7 @@ class DurableRunManager:
         identity: RuntimeIdentity,
         safe_boundary: str,
         owner_fence: int | None = None,
+        owner_epoch: OwnerEpoch | None = None,
     ) -> RuntimeRunRecord:
         return await self._transition(
             run_id=run_id,
@@ -114,6 +130,7 @@ class DurableRunManager:
             status=RuntimeRunStatus.PAUSED,
             safe_boundary=safe_boundary,
             owner_fence=owner_fence,
+            owner_epoch=owner_epoch,
         )
 
     async def block(
@@ -123,6 +140,7 @@ class DurableRunManager:
         identity: RuntimeIdentity,
         reason: str,
         owner_fence: int | None = None,
+        owner_epoch: OwnerEpoch | None = None,
     ) -> RuntimeRunRecord:
         return await self._transition(
             run_id=run_id,
@@ -137,10 +155,16 @@ class DurableRunManager:
             status=RuntimeRunStatus.BLOCKED,
             blocked_reason=reason,
             owner_fence=owner_fence,
+            owner_epoch=owner_epoch,
         )
 
     async def cancel(
-        self, *, run_id: str, identity: RuntimeIdentity, owner_fence: int | None = None
+        self,
+        *,
+        run_id: str,
+        identity: RuntimeIdentity,
+        owner_fence: int | None = None,
+        owner_epoch: OwnerEpoch | None = None,
     ) -> RuntimeRunRecord:
         return await self._transition(
             run_id=run_id,
@@ -156,10 +180,16 @@ class DurableRunManager:
             status=RuntimeRunStatus.CANCELLED,
             terminal=True,
             owner_fence=owner_fence,
+            owner_epoch=owner_epoch,
         )
 
     async def complete(
-        self, *, run_id: str, identity: RuntimeIdentity, owner_fence: int | None = None
+        self,
+        *,
+        run_id: str,
+        identity: RuntimeIdentity,
+        owner_fence: int | None = None,
+        owner_epoch: OwnerEpoch | None = None,
     ) -> RuntimeRunRecord:
         return await self._transition(
             run_id=run_id,
@@ -168,6 +198,7 @@ class DurableRunManager:
             status=RuntimeRunStatus.COMPLETED,
             terminal=True,
             owner_fence=owner_fence,
+            owner_epoch=owner_epoch,
         )
 
     async def fail(
@@ -177,6 +208,7 @@ class DurableRunManager:
         identity: RuntimeIdentity,
         reason: str,
         owner_fence: int | None = None,
+        owner_epoch: OwnerEpoch | None = None,
     ) -> RuntimeRunRecord:
         return await self._transition(
             run_id=run_id,
@@ -193,6 +225,7 @@ class DurableRunManager:
             blocked_reason=reason,
             terminal=True,
             owner_fence=owner_fence,
+            owner_epoch=owner_epoch,
         )
 
     async def _transition(
@@ -207,8 +240,17 @@ class DurableRunManager:
         terminal: bool = False,
         owner_lease_key: str | None = None,
         owner_fence: int | None = None,
+        owner_epoch: OwnerEpoch | None = None,
         take_ownership: bool = False,
     ) -> RuntimeRunRecord:
+        if owner_epoch is not None:
+            if not self._fenced_writes:
+                raise FencedConfigurationError(
+                    "The runtime run store cannot enforce fenced run transitions"
+                )
+            # The epoch is the only authority in fenced mode; the publication below is derived
+            # from it, never from caller-supplied lease key or token arguments.
+            owner_lease_key, owner_fence = owner_epoch.lease_key, owner_epoch.epoch
         current = await self.get(run_id=run_id, identity=identity)
         if current is None:
             raise KeyError("Runtime run was not found for this owner")
@@ -223,7 +265,11 @@ class DurableRunManager:
                 "updated_at": now,
                 "completed_at": now if terminal else None,
                 **(
-                    {"owner_lease_key": owner_lease_key, "owner_fencing_token": owner_fence}
+                    {
+                        "owner_lease_key": owner_lease_key,
+                        "owner_fencing_token": owner_fence,
+                        **({"fenced": True} if owner_epoch is not None else {}),
+                    }
                     if take_ownership
                     else {}
                 ),
@@ -233,6 +279,7 @@ class DurableRunManager:
             updated,
             expected_status=current.status,
             expected_owner_fence=None if take_ownership else owner_fence,
+            owner_epoch=owner_epoch,
         )
         return updated
 
@@ -242,7 +289,17 @@ class DurableRunManager:
         *,
         expected_status: RuntimeRunStatus,
         expected_owner_fence: int | None,
+        owner_epoch: OwnerEpoch | None = None,
     ) -> None:
+        if owner_epoch is not None:
+            # No fallback: a fenced transition is either epoch-checked by the store or refused.
+            await self.store.save_runtime_run(  # type: ignore[call-arg]
+                updated,
+                expected_status=expected_status,
+                expected_owner_fence=None,
+                owner_epoch=owner_epoch,
+            )
+            return
         if self._conditional_writes:
             await self.store.save_runtime_run(
                 updated,

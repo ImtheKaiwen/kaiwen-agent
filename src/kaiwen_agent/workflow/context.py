@@ -16,6 +16,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from kaiwen_agent.context import AgentContext
+from kaiwen_agent.coordination.fencing import current_owner_epoch
 from kaiwen_agent.runtime import (
     DurableRunManager,
     RuntimeIdentity,
@@ -92,6 +93,10 @@ def trusted_action_scope(task: AgentTask, record: RuntimeRunRecord) -> DurableAc
         != (record.tenant_id, record.user_id, record.session_id)
     ):
         raise TaskIdentityError("The task is not bound to this active durable run")
+    epoch = current_owner_epoch()
+    if record.fenced and (epoch is None or epoch.run_id != record.id):
+        # A fenced run's actions need the executor's authority; there is no unfenced path.
+        raise TaskIdentityError("A fenced run needs the controller's owner epoch")
     try:
         return DurableActionScope(
             runtime_run_id=record.id,
@@ -99,6 +104,7 @@ def trusted_action_scope(task: AgentTask, record: RuntimeRunRecord) -> DurableAc
             tenant_id=record.tenant_id,
             user_id=record.user_id,
             session_id=record.session_id,
+            owner_epoch=epoch if record.fenced else None,
         )
     except ValueError as error:
         raise TaskIdentityError("The task identity is malformed") from error

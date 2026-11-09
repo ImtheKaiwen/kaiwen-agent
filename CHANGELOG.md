@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Add opt-in fenced execution over one SQLite database (ADR 0016): `SQLiteLeaseStore` (transactional
+  lease acquisition with durable, never-reset epochs in the protected database), `OwnerEpoch`,
+  `SQLitePersistence.save_task_fenced`, epoch-checked run transitions with monotonic ownership
+  publication (`RuntimeRunRecord.fenced`), epoch-checked action-intent writes including
+  PREPARED to EXECUTING, `FencedTaskStore`, `FencedActionIntents` and
+  `FencedExecution` / `WorkflowController(fenced=...)`. Stale or expired owners are refused with
+  `OwnershipLostError`; the scheduler stops, cancels its workers and records nothing after a
+  refusal. Unsupported configurations (Redis or in-memory leases, custom stores, a second
+  database, unfenced schedulers) are refused at construction. Existing workflows and stores are
+  unchanged; effects are not exactly-once. `SQLitePersistence` gains `busy_timeout_seconds`.
+  Audit corrections: lease expiry is judged at the protected transaction, not at an earlier clock
+  sample; a fenced run keeps its flag and accepts no ordinary transition or action-intent
+  finalization while RUNNING; `RuntimeRecoveryManager` gains a narrow, lease-backed authority that
+  can only block such a run and mark an EXECUTING action uncertain.
+  The published `owner_lease_key` and `owner_fencing_token` of a fenced run can no longer be
+  rewritten outside a fenced start (previously an ordinary update of an idle fenced run could).
 - Add shared, host-controlled delegation admission (M6.3.3-B, ADR 0015 accepted):
   `DelegationAdmission`, `DelegationClaim`, `AdmissionDecision` and `AdmissionOutcome` in
   `kaiwen_agent.policy`. It reuses the central `PolicyEngine` (`agent.delegate`); only an

@@ -6,6 +6,7 @@ from typing import Any
 
 from kaiwen_agent.control import ControlMessage, RunControl, TaskCancelledError
 from kaiwen_agent.events import AgentEvent, EventSink, EventType, InMemoryEventSink
+from kaiwen_agent.exceptions import RunOwnershipError
 from kaiwen_agent.resources import ResourceManager
 from kaiwen_agent.tasks.graph import TaskGraph
 from kaiwen_agent.tasks.models import AgentTask, TaskStatus
@@ -49,14 +50,36 @@ class TaskScheduler:
         self._active: dict[str, asyncio.Task[None]] = {}
         self._agent_usage: Counter[str] = Counter()
         self._not_before: dict[str, float] = {}
+        # Set once a write is refused for lost ownership. From then on nothing is written.
+        self._ownership_error: RunOwnershipError | None = None
 
     async def run(self) -> tuple[AgentTask, ...]:
         try:
             return await self._run()
-        except (asyncio.CancelledError, Exception):
+        except (asyncio.CancelledError, Exception) as error:
             # Cancellation or an internal error must never leave workers running or
             # resource locks held; unfinished tasks end as cancelled, not failed.
             await asyncio.shield(self._abort_active())
+            if self._ownership_error is not None and error is not self._ownership_error:
+                # The refusal that ended the run is the failure to report, not the cancellations
+                # this scheduler issued to stop its own workers.
+                raise self._ownership_error from None
+            raise
+
+    async def _save(self, task: AgentTask) -> None:
+        """The only write path. After ownership is lost it writes nothing, ever.
+
+        A refusal (`OwnershipLostError`) is remembered and re-raised for every later write, so a
+        cleanup or failure-recording path can never turn a fenced refusal into an unauthorized
+        write, and the original refusal is what surfaces.
+        """
+
+        if self._ownership_error is not None:
+            raise self._ownership_error
+        try:
+            await self.store.save_task(task)
+        except RunOwnershipError as error:
+            self._ownership_error = error
             raise
 
     async def _abort_active(self) -> None:
@@ -66,18 +89,23 @@ class TaskScheduler:
         if active:
             await asyncio.gather(*active, return_exceptions=True)
         self._active.clear()
+        if self._ownership_error is not None:
+            # Workers are stopped and process-local state is released, but no state may be
+            # recorded through an invalid epoch: not cancelled, not failed, not completed.
+            # Whatever was in flight stays as it was for recovery to judge.
+            return
         for task in self.graph.tasks():
             if task.terminal:
                 continue
             transition_task(task, TaskStatus.CANCELLED)
             task.error_code = task.error_code or "cancelled"
-            await self.store.save_task(task)
+            await self._save(task)
             await self._emit(task, "task.cancelled", {"reason": "scheduler_stopped"})
 
     async def _run(self) -> tuple[AgentTask, ...]:
         self.graph.validate()
         for task in self.graph.tasks():
-            await self.store.save_task(task)
+            await self._save(task)
             await self._emit(task, "task.created", {"agent_id": task.agent_id})
 
         while not self.graph.complete:
@@ -123,7 +151,7 @@ class TaskScheduler:
             await self.control.send(task_id, ControlMessage(type="cancel", created_by=created_by))
             return
         transition_task(task, TaskStatus.CANCELLED)
-        await self.store.save_task(task)
+        await self._save(task)
         await self._emit(task, "task.cancelled", {"created_by": created_by})
 
     async def pause(self, task_id: str, *, created_by: str = "user") -> None:
@@ -132,7 +160,7 @@ class TaskScheduler:
             raise ValueError("Only running tasks can be paused")
         transition_task(task, TaskStatus.PAUSED)
         await self.control.send(task_id, ControlMessage(type="pause", created_by=created_by))
-        await self.store.save_task(task)
+        await self._save(task)
         await self._emit(task, "task.paused", {"created_by": created_by})
 
     async def resume(self, task_id: str, *, created_by: str = "user") -> None:
@@ -141,7 +169,7 @@ class TaskScheduler:
             raise ValueError("Only paused tasks can be resumed")
         transition_task(task, TaskStatus.RUNNING)
         await self.control.send(task_id, ControlMessage(type="resume", created_by=created_by))
-        await self.store.save_task(task)
+        await self._save(task)
         await self._emit(task, "task.resumed", {"created_by": created_by})
 
     async def send_instruction(
@@ -159,7 +187,7 @@ class TaskScheduler:
                 task.resource_keys
             ):
                 transition_task(task, TaskStatus.READY)
-                await self.store.save_task(task)
+                await self._save(task)
 
     async def _schedule_ready(self) -> bool:
         scheduled = False
@@ -174,13 +202,13 @@ class TaskScheduler:
                 continue
             if not await self.resources.try_acquire(task.resource_keys, task.id):
                 transition_task(task, TaskStatus.WAITING_RESOURCE)
-                await self.store.save_task(task)
+                await self._save(task)
                 await self._emit(task, "resource.waiting", {"resource_keys": task.resource_keys})
                 continue
 
             self._not_before.pop(task.id, None)
             transition_task(task, TaskStatus.QUEUED)
-            await self.store.save_task(task)
+            await self._save(task)
             await self._emit(task, "task.queued", {})
             if task.resource_keys:
                 await self._emit(task, "resource.acquired", {"resource_keys": task.resource_keys})
@@ -193,7 +221,7 @@ class TaskScheduler:
         try:
             transition_task(task, TaskStatus.RUNNING)
             task.attempts += 1
-            await self.store.save_task(task)
+            await self._save(task)
             await self._emit(task, "task.started", {"attempt": task.attempts})
             worker = self.workers.get(task.agent_id)
             context = TaskExecutionContext(
@@ -210,13 +238,18 @@ class TaskScheduler:
             task.error = None
             task.error_code = None
             transition_task(task, TaskStatus.COMPLETED)
-            await self.store.save_task(task)
+            await self._save(task)
             await self._emit(task, "task.completed", {"attempts": task.attempts})
+        except RunOwnershipError as error:
+            # Authority is gone: no failure, retry or cancellation may be recorded. The main
+            # loop sees the refusal, stops dispatch and cancels the other workers.
+            self._ownership_error = self._ownership_error or error
+            raise
         except TaskCancelledError as error:
             task.error = str(error)
             task.error_code = "cancelled"
             transition_task(task, TaskStatus.CANCELLED)
-            await self.store.save_task(task)
+            await self._save(task)
             await self._emit(task, "task.cancelled", {})
         except TimeoutError as error:
             await self._handle_failure(task, error, "timeout")
@@ -239,14 +272,14 @@ class TaskScheduler:
             delay = task.retry_policy.delay_for_attempt(task.attempts)
             transition_task(task, TaskStatus.READY)
             self._not_before[task.id] = asyncio.get_running_loop().time() + delay
-            await self.store.save_task(task)
+            await self._save(task)
             await self._emit(
                 task,
                 "task.retrying",
                 {"attempt": task.attempts, "error_code": error_code, "delay": delay},
             )
             return
-        await self.store.save_task(task)
+        await self._save(task)
         await self._emit(
             task,
             "task.failed",
@@ -255,12 +288,19 @@ class TaskScheduler:
 
     async def _progress(self, task: AgentTask, progress: float, details: dict[str, Any]) -> None:
         task.progress = progress
-        await self.store.save_task(task)
+        try:
+            await self._save(task)
+        except RunOwnershipError:
+            # A worker that swallows this error must still be stopped: cancel every worker, the
+            # caller's included. `run` then reports the ownership refusal.
+            for future in list(self._active.values()):
+                future.cancel()
+            raise
         await self._emit(task, "task.progress", {"progress": progress, **details})
 
     async def _persist_all(self) -> None:
         for task in self.graph.tasks():
-            await self.store.save_task(task)
+            await self._save(task)
 
     async def _emit(
         self, task: AgentTask, event_type: EventType, payload: dict[str, object]

@@ -111,12 +111,16 @@ class Provider:
         delay: float = 0.0,
         fail: Exception | None = None,
         hang: bool = False,
+        rendezvous: asyncio.Barrier | None = None,
     ) -> None:
         self.responses = list(responses or [])
         self.text = text
         self.delay = delay
         self.fail = fail
         self.hang = hang
+        # When set, every call waits here until all parties are inside `respond` together: a
+        # deterministic proof of overlap that does not depend on how long setup takes.
+        self.rendezvous = rendezvous
         self.inputs: list[str] = []
         self.contexts: list[AgentContext] = []
         self.calls = 0
@@ -132,6 +136,8 @@ class Provider:
         try:
             if self.hang:
                 await asyncio.Event().wait()
+            if self.rendezvous is not None:
+                await asyncio.wait_for(self.rendezvous.wait(), timeout=30)
             if self.delay:
                 await asyncio.sleep(self.delay)
             if self.fail is not None:
@@ -469,7 +475,9 @@ def test_independent_reads_run_concurrently_and_writers_sharing_a_resource_seria
 ) -> None:
     async def scenario() -> None:
         flow = Flow(tmp_path)
-        readers = Provider(delay=0.2)
+        # Both readers must be inside the model call at the same moment for the barrier to open.
+        # A scheduler that serialized them would time out here instead of passing by luck.
+        readers = Provider(rendezvous=asyncio.Barrier(2))
         writers = Provider(delay=0.2)
         flow.worker("reader", flow.runtime(readers))
         flow.worker("writer", flow.runtime(writers))

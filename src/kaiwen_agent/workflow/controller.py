@@ -3,13 +3,22 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
-from contextlib import suppress
+from contextlib import AbstractContextManager, suppress
 from hashlib import sha256
 from typing import Any, Protocol
 from uuid import uuid4
 
-from kaiwen_agent.coordination import DistributedLease, LeaseStore
-from kaiwen_agent.exceptions import ActionLookupIncompleteError, RunOwnershipError
+from kaiwen_agent.coordination import (
+    DistributedLease,
+    LeaseStore,
+    OwnerEpoch,
+    bind_owner_epoch,
+)
+from kaiwen_agent.exceptions import (
+    ActionLookupIncompleteError,
+    FencedConfigurationError,
+    RunOwnershipError,
+)
 from kaiwen_agent.quality import (
     CompletionGate,
     CompletionGateResult,
@@ -31,6 +40,7 @@ from kaiwen_agent.tasks import AgentTask, TaskGraph, TaskScheduler, TaskStatus
 from kaiwen_agent.tools.durability import ActionIntentStatus, ActionIntentStore
 from kaiwen_agent.types import utc_now
 from kaiwen_agent.workflow.compiler import WorkflowCompiler, WorkflowPlanError
+from kaiwen_agent.workflow.fenced import FencedExecution
 from kaiwen_agent.workflow.models import (
     WorkflowLimits,
     WorkflowOutcome,
@@ -74,9 +84,15 @@ class _RunWriter:
     stops with `RunOwnershipError` instead.
     """
 
-    def __init__(self, runs: DurableRunManager, fence: int | None) -> None:
+    def __init__(
+        self,
+        runs: DurableRunManager,
+        fence: int | None,
+        epoch: OwnerEpoch | None = None,
+    ) -> None:
         self.runs = runs
         self.fence = fence
+        self.epoch = epoch
 
     async def start(
         self, *, run_id: str, identity: RuntimeIdentity, owner_lease_key: str | None
@@ -87,6 +103,7 @@ class _RunWriter:
                 identity=identity,
                 owner_lease_key=owner_lease_key,
                 owner_fence=self.fence,
+                owner_epoch=self.epoch,
             )
         )
 
@@ -94,24 +111,40 @@ class _RunWriter:
         self, *, run_id: str, identity: RuntimeIdentity, reason: str
     ) -> RuntimeRunRecord:
         return await self._guard(
-            self.runs.fail(run_id=run_id, identity=identity, reason=reason, owner_fence=self.fence)
+            self.runs.fail(
+                run_id=run_id,
+                identity=identity,
+                reason=reason,
+                owner_fence=self.fence,
+                owner_epoch=self.epoch,
+            )
         )
 
     async def complete(self, *, run_id: str, identity: RuntimeIdentity) -> RuntimeRunRecord:
         return await self._guard(
-            self.runs.complete(run_id=run_id, identity=identity, owner_fence=self.fence)
+            self.runs.complete(
+                run_id=run_id, identity=identity, owner_fence=self.fence, owner_epoch=self.epoch
+            )
         )
 
     async def block(
         self, *, run_id: str, identity: RuntimeIdentity, reason: str
     ) -> RuntimeRunRecord:
         return await self._guard(
-            self.runs.block(run_id=run_id, identity=identity, reason=reason, owner_fence=self.fence)
+            self.runs.block(
+                run_id=run_id,
+                identity=identity,
+                reason=reason,
+                owner_fence=self.fence,
+                owner_epoch=self.epoch,
+            )
         )
 
     async def cancel(self, *, run_id: str, identity: RuntimeIdentity) -> RuntimeRunRecord:
         return await self._guard(
-            self.runs.cancel(run_id=run_id, identity=identity, owner_fence=self.fence)
+            self.runs.cancel(
+                run_id=run_id, identity=identity, owner_fence=self.fence, owner_epoch=self.epoch
+            )
         )
 
     @staticmethod
@@ -145,9 +178,24 @@ class WorkflowController:
         fingerprint_provider: ProtectedInputFingerprintProvider | None = None,
         workspace_binding: WorkspaceBinding | None = None,
         block_unassociated_actions: bool = False,
+        fenced: FencedExecution | None = None,
     ) -> None:
         if lease_ttl_seconds <= 0:
             raise ValueError("lease_ttl_seconds must be positive")
+        if fenced is not None:
+            # Every part that writes must be the one authority; nothing is accepted by name.
+            if leases is not fenced.leases:
+                raise FencedConfigurationError(
+                    "Fenced execution requires the controller to use the fenced lease store"
+                )
+            if runs.store is not fenced.persistence or not runs.supports_fenced_execution:
+                raise FencedConfigurationError(
+                    "Fenced execution requires runs stored in the fenced database"
+                )
+            if action_intents is not None and action_intents is not fenced.persistence:
+                raise FencedConfigurationError(
+                    "Fenced execution requires action intents in the fenced database"
+                )
 
         self.runs = runs
         self.compiler = compiler
@@ -170,6 +218,7 @@ class WorkflowController:
         self.fingerprint_provider = fingerprint_provider
         # Optional. When set, a run must carry exactly this durable workspace binding.
         self.workspace_binding = workspace_binding
+        self.fenced = fenced
         # Optional, needs `action_intents`. Actions of workflow workers written before they
         # were owned by the durable run carry a per-invocation id, so no run can be proven to
         # own them. When set, a run owner with such an unresolved (executing or uncertain)
@@ -189,6 +238,7 @@ class WorkflowController:
         heartbeat: asyncio.Task[None] | None = None
         ownership = _Ownership()
         writer = _RunWriter(self.runs, None)
+        bind_scope: AbstractContextManager[None] | None = None
         if self.leases is not None:
             lease = await self.leases.acquire(
                 key=f"runtime-run:{run.id}",
@@ -199,7 +249,25 @@ class WorkflowController:
                 raise RunOwnershipError("Workflow run is owned by another executor")
             owner_task = asyncio.current_task()
             assert owner_task is not None
-            writer = _RunWriter(self.runs, lease.fencing_token)
+            epoch: OwnerEpoch | None = None
+            if self.fenced is not None:
+                try:
+                    # The epoch is issued from the lease actually acquired, re-read from the
+                    # authoritative lease row. Nothing else can produce one.
+                    epoch = await self.fenced.leases.issue_owner_epoch(
+                        lease,
+                        run_id=run.id,
+                        tenant_id=run.tenant_id,
+                        user_id=run.user_id,
+                        session_id=run.session_id,
+                    )
+                except BaseException:
+                    with suppress(Exception):
+                        await asyncio.shield(self.leases.release(lease))
+                    raise
+                bind_scope = bind_owner_epoch(epoch)
+                bind_scope.__enter__()
+            writer = _RunWriter(self.runs, lease.fencing_token, epoch)
             heartbeat = asyncio.create_task(self._heartbeat(lease, owner_task, ownership))
         try:
             return await self._execute(
@@ -232,6 +300,8 @@ class WorkflowController:
             if lease is not None and self.leases is not None and not ownership.lost:
                 with suppress(Exception):
                     await asyncio.shield(self.leases.release(lease))
+            if bind_scope is not None:
+                bind_scope.__exit__(None, None, None)
 
     async def _heartbeat(
         self, lease: DistributedLease, owner: asyncio.Task[object], ownership: _Ownership
@@ -440,10 +510,19 @@ class WorkflowController:
                     tasks=tuple(all_tasks),
                     reason=str(error),
                 )
+            scheduler = self.scheduler_factory(graph)
+            if self.fenced is not None and not self.fenced.accepts_scheduler(scheduler):
+                # Checked before the scheduler writes anything: a scheduler that is not
+                # composed over this execution's fenced task store is never run in fenced mode.
+                raise FencedConfigurationError(
+                    "The scheduler does not write through the fenced task store"
+                )
             try:
-                tasks = await self.scheduler_factory(graph).run()
+                tasks = await scheduler.run()
             except asyncio.CancelledError:
                 raise
+            except RunOwnershipError:
+                raise  # nothing is recorded on behalf of an executor that lost the run
             except Exception as error:
                 failed = await writer.fail(
                     run_id=run.id,

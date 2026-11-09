@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Protocol
@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from kaiwen_agent.coordination.fencing import OwnerEpoch
 from kaiwen_agent.types import ToolResult, utc_now
 
 
@@ -46,8 +47,18 @@ class DurableActionScope:
     tenant_id: str
     user_id: str
     session_id: str
+    # Host-owned authority of the executor that runs this task under fenced execution (ADR 0016).
+    # Set only by `workflow.trusted_action_scope` from the epoch the controller bound; never read
+    # from model output, tool arguments or context metadata, and excluded from `repr`.
+    owner_epoch: OwnerEpoch | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        epoch = self.owner_epoch
+        if epoch is not None and (
+            (epoch.run_id, epoch.tenant_id, epoch.user_id, epoch.session_id)
+            != (self.runtime_run_id, self.tenant_id, self.user_id, self.session_id)
+        ):
+            raise ValueError("Invalid durable action scope field: owner_epoch")
         for name in ("runtime_run_id", "task_id", "tenant_id", "user_id", "session_id"):
             value = getattr(self, name)
             if (
@@ -135,6 +146,82 @@ class ActionIntentStore(Protocol):
     async def list_action_intents(
         self, *, statuses: frozenset[ActionIntentStatus], limit: int = 100
     ) -> list[ActionIntentRecord]: ...
+
+
+class FencedActionIntents:
+    """An `ActionIntentStore` view whose every write carries one executor's `OwnerEpoch`.
+
+    The platform tool executor uses it inside a fenced scope, so preparing an intent, claiming it
+    (PREPARED -> EXECUTING) and recording its outcome are each checked against the authoritative
+    lease in the store's own transaction. There is no unfenced fallback: a store that does not
+    declare the fenced execution contract is refused at construction.
+    """
+
+    is_durable = True
+
+    def __init__(self, store: Any, epoch: OwnerEpoch) -> None:
+        if getattr(store, "fenced_execution_contract", None) != "kaiwen.fenced-execution.v1":
+            raise ValueError("The action intent store cannot enforce fenced execution")
+        self._store = store
+        self._epoch = epoch
+
+    async def prepare_action_intent(self, intent: ActionIntentRecord) -> ActionIntentRecord:
+        stored: ActionIntentRecord = await self._store.prepare_action_intent(
+            intent, owner_epoch=self._epoch
+        )
+        return stored
+
+    async def get_action_intent(
+        self, *, intent_id: str, tenant_id: str, user_id: str
+    ) -> ActionIntentRecord | None:
+        found: ActionIntentRecord | None = await self._store.get_action_intent(
+            intent_id=intent_id, tenant_id=tenant_id, user_id=user_id
+        )
+        return found
+
+    async def transition_action_intent(
+        self,
+        *,
+        intent_id: str,
+        tenant_id: str,
+        user_id: str,
+        expected: frozenset[ActionIntentStatus],
+        status: ActionIntentStatus,
+        result: ToolResult | None = None,
+        error_code: str | None = None,
+        external_receipt: dict[str, Any] | None = None,
+    ) -> ActionIntentRecord | None:
+        updated: ActionIntentRecord | None = await self._store.transition_action_intent(
+            intent_id=intent_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            expected=expected,
+            status=status,
+            result=result,
+            error_code=error_code,
+            external_receipt=external_receipt,
+            owner_epoch=self._epoch,
+        )
+        return updated
+
+    async def list_action_intents(
+        self, *, statuses: frozenset[ActionIntentStatus], limit: int = 100
+    ) -> list[ActionIntentRecord]:
+        listed: list[ActionIntentRecord] = await self._store.list_action_intents(
+            statuses=statuses, limit=limit
+        )
+        return listed
+
+    async def get_action_intent_by_key(
+        self, *, tenant_id: str, user_id: str, runtime_run_id: str, idempotency_key: str
+    ) -> ActionIntentRecord | None:
+        found: ActionIntentRecord | None = await self._store.get_action_intent_by_key(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            runtime_run_id=runtime_run_id,
+            idempotency_key=idempotency_key,
+        )
+        return found
 
 
 class ActionIntentRunQuery(Protocol):
