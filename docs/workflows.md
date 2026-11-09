@@ -117,8 +117,10 @@ token alone is not proof.
 Limits. A fresh evaluation is not a reservation: the guarantee comes from the run lease and
 fencing token, not from the policy check, and external side effects are not fenced by it. The
 lease checks are at an instant: the lease can be lost afterwards and the task store does not
-enforce it at the write. Replay is at-least-once: deterministic ids make one task row, not
-exactly-once execution. There
+enforce it at the write: a controller that loses the lease after its last check can still persist
+and execute the delegated child until a fenced task write exists (ADR 0015, 4.5). Replay is at-least-once: deterministic ids make one task row, not
+exactly-once execution, and a tool call re-issued under a new call id without an application
+idempotency key runs again. There
 are no durable proposals yet, so a restart re-authorizes from scratch and an identical proposal
 can be denied because the earlier delegated tasks count against the per-run limit (PR-C2).
 Delegated tasks cannot depend on the parent or on earlier cycles (PR-C3).

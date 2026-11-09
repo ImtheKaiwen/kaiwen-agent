@@ -254,7 +254,23 @@ admission path requires the compiler's allowlist and denies any other key.
   on the new owner's behalf. This is a check at an instant, not an atomic guarantee: the lease can
   still be lost after the last check, and neither the task store nor the scheduler verifies the
   lease at the write. Closing that window needs a fencing token enforced by the task store, which
-  is a separate change.
+  is a separate change. Reproduced (audit R2, strict `xfail` test): a controller whose lease is
+  replaced after its last check, with the run record unchanged, still persists and executes the
+  delegated child. Distinctions: checking a lease and renewing it are instants; the run's recorded
+  fencing token only changes when the new owner writes; the lease store cannot take part in a task
+  write; the scheduler and `TaskStore.save_task` carry no token; external side effects are not
+  protected by any of these.
+
+  Proposed amendment, not implemented and awaiting operator approval: an optional task-store
+  capability `FencedTaskWrites` whose `save_task_fenced(task, run_id, fence)` writes only if the
+  durable run record still names `fence` as its owner token and is RUNNING, checked in the same
+  SQLite transaction as the write. A scheduler built over a store that provides it passes the
+  controller's fence on every save, so a write after the new owner's first run write fails and
+  the scheduler stops before the worker body runs; dispatch is authorized by the successful
+  RUNNING write that precedes each worker call. This is the classic fencing-token model: it makes
+  the new owner's start a serialization point, it does not stop a write that lands before that
+  start, and it does not make external effects exactly-once. Until it exists, delegation should
+  not be merged as a guarantee of stale-owner exclusion.
 - Atomicity. A fresh evaluation is not a reservation. What makes the boundary safe is the run
   lease: only its holder writes the run's tasks, and the quotas counted are run-scoped, so no
   other controller can create tasks between the evaluation and the compile while the lease is
@@ -268,7 +284,9 @@ admission path requires the compiler's allowlist and denies any other key.
   (run, cycle, logical id), so a replay upserts the same row; it does not prevent a completed
   worker from running again, because the scheduler is at-least-once. Tool actions that go through
   the durable action intents are owned by the run and scoped to `run:task`, so they are not
-  repeated; external effects without independently enforced idempotency can repeat. This is not
+  repeated when the same call id or the same application idempotency key is presented. An
+  equivalent call re-issued under a new call id and no key is a different action and runs again,
+  and external effects without independently enforced idempotency can repeat. This is not
   exactly-once execution. An unresolved executing or
   uncertain action still blocks a restart before delegation is consulted. Honest limit: after a
   restart the earlier delegated tasks count against the per-run limit, so an identical proposal

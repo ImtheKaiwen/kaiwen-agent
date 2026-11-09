@@ -853,8 +853,12 @@ class WorkflowController:
                 ) is not None
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 - an unknown lease state is not ownership
-                logger.warning("Run lease could not be verified", exc_info=True)
+            except Exception as error:  # noqa: BLE001 - an unknown lease state is not ownership
+                # The class name only: a lease backend's message can carry connection secrets.
+                logger.warning(
+                    "Run lease could not be verified (lease_store_unavailable: %s)",
+                    type(error).__name__,
+                )
             if not held:
                 ownership.lost = True
                 raise RunOwnershipError("The run lease is no longer held; delegation stopped")

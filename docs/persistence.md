@@ -156,7 +156,12 @@ run they belong to and block that run when an outcome is uncertain. The host pas
 metadata, and the executor and `AgentRuntime` reject a scope that disagrees with the
 execution owner. Within a run, the idempotency identity of an action is the task plus the call
 id (or the call's idempotency key), so tasks that reuse a provider-generated call id do not
-share an intent or an approval, while a retried task cannot repeat a keyed action. Standalone
+share an intent or an approval. A rerun that issues the same call id, or the same application
+idempotency key, is answered from the durable receipt and the effect does not repeat. An
+equivalent call that the model re-issues under a new call id and no key is a different action
+and runs again: the platform cannot know it is the same external operation, so a stable
+application-level idempotency key is required for that protection. This is not exactly-once
+execution of tools. Standalone
 `AgentRuntime` and `Agent` executions keep the per-invocation scope unchanged.
 
 Support for the scope is a declared capability, not a signature: a `ToolExecutor` subclass that
