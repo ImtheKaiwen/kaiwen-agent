@@ -72,7 +72,10 @@ epoch inside each protected write's own transaction, for one configuration only.
   fail and cancel (pause shares the same code path as the others). Starting publishes the epoch and
   needs a strictly higher epoch than any published; every other transition needs the run RUNNING
   under exactly this epoch. A run that was started fenced (`RuntimeRunRecord.fenced`) keeps that
-  flag for good: no write can clear it, and only a fenced start can set it. While such a run is
+  flag for good: no write can clear it, and only a fenced start can set it. Likewise its published lease
+  key and fencing generation are never rewritten by a transition, an operator action, a recovery
+  block or a direct store update (`fenced_owner_immutable`); only a fenced start publishes a new,
+  strictly higher epoch. While such a run is
   RUNNING, no write without an epoch is accepted (complete, fail, cancel, pause, block, or a
   direct store update). Once it is not RUNNING (blocked, paused), operator transitions keep
   working, because no executor holds authority, but starting it still needs an epoch. Other runs

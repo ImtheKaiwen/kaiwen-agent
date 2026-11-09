@@ -2015,8 +2015,12 @@ def _authorize_run_write(
             raise OwnershipLostError("binding_mismatch")
         return
     _require_published(current, epoch)
-    if new.owner_fencing_token != current.owner_fencing_token or new.fenced != current.fenced:
-        raise OwnershipLostError("epoch_regressed")
+    if (new.owner_fencing_token, new.owner_lease_key) != (
+        current.owner_fencing_token,
+        current.owner_lease_key,
+    ):
+        # Only a fenced start publishes ownership; a transition never rewrites it.
+        raise OwnershipLostError("fenced_owner_immutable")
 
 
 def _authorize_recovery(
@@ -2058,9 +2062,15 @@ def _authorize_epochless_run_write(
         raise OwnershipLostError("fenced_flag_immutable")
     if existing.status is not RuntimeRunStatus.RUNNING:
         # No executor holds authority over a blocked, paused or created run, so operator
-        # transitions keep working; starting one still needs an epoch.
+        # transitions keep working; starting one still needs an epoch. Ownership metadata is
+        # never rewritten here: the published generation and lease key stay exactly as they are.
         if new.status is RuntimeRunStatus.RUNNING:
             raise OwnershipLostError("fenced_run_requires_epoch")
+        if (new.owner_fencing_token, new.owner_lease_key) != (
+            existing.owner_fencing_token,
+            existing.owner_lease_key,
+        ):
+            raise OwnershipLostError("fenced_owner_immutable")
         return
     if recovery is None:
         raise OwnershipLostError("fenced_run_requires_epoch")

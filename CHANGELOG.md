@@ -16,6 +16,8 @@
   sample; a fenced run keeps its flag and accepts no ordinary transition or action-intent
   finalization while RUNNING; `RuntimeRecoveryManager` gains a narrow, lease-backed authority that
   can only block such a run and mark an EXECUTING action uncertain.
+  The published `owner_lease_key` and `owner_fencing_token` of a fenced run can no longer be
+  rewritten outside a fenced start (previously an ordinary update of an idle fenced run could).
 - Add shared, host-controlled delegation admission (M6.3.3-B, ADR 0015 accepted):
   `DelegationAdmission`, `DelegationClaim`, `AdmissionDecision` and `AdmissionOutcome` in
   `kaiwen_agent.policy`. It reuses the central `PolicyEngine` (`agent.delegate`); only an
