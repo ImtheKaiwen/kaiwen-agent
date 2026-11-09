@@ -234,8 +234,10 @@ admission path requires the compiler's allowlist and denies any other key.
   worker authority and role, the delegator's capability ceiling and any inherited narrowing, the
   child worker's registration, allowlist and declared `allowed_capabilities`, the central policy
   with live depth, parallel and per-run counters, and the compiler's structural validation. The
-  controller then re-verifies its fencing token and that the run is still running, and only then
-  compiles. Anything other than an explicit allow blocks the run with an explicit reason
+  task inventory must be complete: a truncated listing, unreadable rows, or rows dropped for not
+  belonging to the run deny with `state_incomplete`, because a counter over an incomplete
+  inventory is not authoritative (the diagnostic Lead view may still report what it could not
+  read). The controller then verifies ownership (below) and only then compiles. Anything other than an explicit allow blocks the run with an explicit reason
   (`delegation_denied:<code>`, `delegation_approval_required:<code>`); a pending or rejected
   delegation is never a completion, never a failure and never a gate result.
 - Plan integrity. The next cycle's plan is built by the controller from the exact task tuple that
@@ -243,17 +245,31 @@ admission path requires the compiler's allowlist and denies any other key.
   compiler, the only writer of task identity, receives a `DelegationBinding` derived from the
   admission and writes `parent_id` and `delegation_depth` (parent depth plus one) on the child
   tasks; the plan has no way to set them.
+- Ownership. The run record's stored fencing token is not proof that the lease is held: the lease
+  can expire or be replaced while the record still names the old token, and the heartbeat only
+  notices at its next tick. The controller therefore asks the lease store itself (`renew`, which
+  only the current unexpired holder can pass) after the authorization and again right before the
+  delegated cycle is handed to the scheduler, and also re-checks the record token and status. A
+  failed, missing or erroring renew stops the run with `RunOwnershipError` and nothing is written
+  on the new owner's behalf. This is a check at an instant, not an atomic guarantee: the lease can
+  still be lost after the last check, and neither the task store nor the scheduler verifies the
+  lease at the write. Closing that window needs a fencing token enforced by the task store, which
+  is a separate change.
 - Atomicity. A fresh evaluation is not a reservation. What makes the boundary safe is the run
   lease: only its holder writes the run's tasks, and the quotas counted are run-scoped, so no
-  other controller can create tasks between the evaluation and the compile. Delegation therefore
+  other controller can create tasks between the evaluation and the compile while the lease is
+  held. Delegation therefore
   requires a lease store and fails at configuration without one. Limits: external side effects
   are not fenced by the run lease (the protected write boundary must enforce fencing, as before);
   custom policy rules that read state outside the run are not covered; without a durable
   lease store shared by every host the guarantee does not span hosts.
 - Recovery and idempotency. Nothing about an admission is stored, so a restart re-derives and
   re-authorizes from scratch and a replay never inherits authority. Task ids are deterministic
-  (run, cycle, logical id), so a replay upserts the same rows, and action intents stay owned by
-  the durable run and scoped to `run:task`, so no tool action repeats. An unresolved executing or
+  (run, cycle, logical id), so a replay upserts the same row; it does not prevent a completed
+  worker from running again, because the scheduler is at-least-once. Tool actions that go through
+  the durable action intents are owned by the run and scoped to `run:task`, so they are not
+  repeated; external effects without independently enforced idempotency can repeat. This is not
+  exactly-once execution. An unresolved executing or
   uncertain action still blocks a restart before delegation is consulted. Honest limit: after a
   restart the earlier delegated tasks count against the per-run limit, so an identical proposal
   can be denied (the run blocks with an explicit reason); admitting an identical proposal

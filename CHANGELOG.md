@@ -14,7 +14,10 @@
   with an explicit reason. `WorkflowCompiler.compile` gains an optional `DelegationBinding` that
   writes `parent_id` and `delegation_depth` on delegated tasks, and workflow admission now also
   checks the child worker's declared `allowed_capabilities`. Delegation requires a lease store.
-  Without `delegation` configured nothing changes. No durable proposal storage yet (PR-C2).
+  Workflow admission denies an incomplete task listing (`state_incomplete`), and the controller
+  asks the lease store whether it still holds the lease before and after delegated work is
+  authorized, because the run record's stored token does not prove it. Without `delegation`
+  configured nothing changes. No durable proposal storage yet (PR-C2).
 - Add shared, host-controlled delegation admission (M6.3.3-B, ADR 0015 accepted):
   `DelegationAdmission`, `DelegationClaim`, `AdmissionDecision` and `AdmissionOutcome` in
   `kaiwen_agent.policy`. It reuses the central `PolicyEngine` (`agent.delegate`); only an

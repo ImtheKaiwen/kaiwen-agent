@@ -78,7 +78,7 @@ _DRY_RUN_OBJECTIVE = "delegation admission dry run"
 _REASONS = {
     "invalid_trusted_state": "Delegation facts are missing or malformed",
     "state_unavailable": "Trusted workflow state could not be read",
-    "state_incomplete": "Trusted workflow state is too large to establish counters",
+    "state_incomplete": "Trusted workflow state is incomplete, so counters cannot be established",
     "run_not_found": "The workflow run was not found for this owner",
     "run_not_active": "The workflow run is not running",
     "workspace_mismatch": "The workflow run is bound to a different workspace",
@@ -302,8 +302,10 @@ class WorkflowDelegationAdmission:
         if scan_error is not None:
             _log_failure(scan_error.code, scan_error.error_type or "TaskRunPage", run.id)
             return _deny("state_unavailable")
-        if scan.truncated:
-            return _deny("state_incomplete")  # counters cannot be established: fail closed
+        if scan.truncated or scan.unreadable > 0:
+            # Counters are only authoritative over a complete inventory: unreadable rows and rows
+            # dropped for not belonging to the run could be exactly the ones that use the quota.
+            return _deny("state_incomplete")
 
         parent = next((task for task in scan.tasks if task.id == parent_task_id), None)
         if parent is None:

@@ -109,8 +109,16 @@ invalid candidate, an ineligible parent and an exhausted round or cycle limit. A
 rejected delegation is never a completion, a task failure or a gate failure, and the completion
 gate alone still decides whether the run is complete, after the delegation rounds.
 
+An incomplete task listing (truncated, unreadable rows, or rows not belonging to the run) denies
+with `state_incomplete`. Before the delegated tasks are compiled and again before they are
+scheduled, the controller asks the lease store whether it still holds the lease; the run record's
+token alone is not proof.
+
 Limits. A fresh evaluation is not a reservation: the guarantee comes from the run lease and
-fencing token, not from the policy check, and external side effects are not fenced by it. There
+fencing token, not from the policy check, and external side effects are not fenced by it. The
+lease checks are at an instant: the lease can be lost afterwards and the task store does not
+enforce it at the write. Replay is at-least-once: deterministic ids make one task row, not
+exactly-once execution. There
 are no durable proposals yet, so a restart re-authorizes from scratch and an identical proposal
 can be denied because the earlier delegated tasks count against the per-run limit (PR-C2).
 Delegated tasks cannot depend on the parent or on earlier cycles (PR-C3).

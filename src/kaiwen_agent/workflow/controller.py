@@ -69,6 +69,7 @@ class ProtectedInputFingerprintProvider(Protocol):
 
 class _Ownership:
     lost = False
+    lease: DistributedLease | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,6 +236,7 @@ class WorkflowController:
             owner_task = asyncio.current_task()
             assert owner_task is not None
             writer = _RunWriter(self.runs, lease.fencing_token)
+            ownership.lease = lease
             heartbeat = asyncio.create_task(self._heartbeat(lease, owner_task, ownership))
         try:
             return await self._execute(
@@ -482,6 +484,11 @@ class WorkflowController:
                     cycles=cycle,
                     tasks=tuple(all_tasks),
                     reason=str(error),
+                )
+            if binding is not None:
+                # Delegated work: ask the lease store again right before it is scheduled.
+                await self._verify_ownership(
+                    run=run, identity=identity, writer=writer, ownership=ownership
                 )
             try:
                 tasks = await self.scheduler_factory(graph).run()
@@ -825,10 +832,32 @@ class WorkflowController:
         writer: _RunWriter,
         ownership: _Ownership,
     ) -> None:
-        """Raise `RunOwnershipError` unless this executor still owns the running run."""
+        """Raise `RunOwnershipError` unless this executor still owns the running run.
+
+        The run record's stored fencing token is not proof that the lease is held: the lease can
+        expire or be replaced while the record still names the old token (the new owner has not
+        written yet), and the heartbeat only notices at its next tick. The lease store is
+        therefore asked directly: `renew` succeeds only for the current, unexpired holder. This
+        is a check at one instant, not an atomic guarantee: the lease can still be lost after it
+        and task writes are not fenced by the lease store.
+        """
 
         if ownership.lost:
             raise RunOwnershipError("Run ownership was lost; delegation stopped")
+        lease = ownership.lease
+        if lease is not None and self.leases is not None:
+            held = False
+            try:
+                held = (
+                    await self.leases.renew(lease, ttl_seconds=self.lease_ttl_seconds)
+                ) is not None
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - an unknown lease state is not ownership
+                logger.warning("Run lease could not be verified", exc_info=True)
+            if not held:
+                ownership.lost = True
+                raise RunOwnershipError("The run lease is no longer held; delegation stopped")
         record = await self.runs.get(run_id=run.id, identity=identity)
         if (
             record is None
