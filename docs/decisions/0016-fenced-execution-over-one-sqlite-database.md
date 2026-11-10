@@ -4,8 +4,8 @@
   ownership and fencing, together with Option C, fail-closed rejection of unsupported
   configurations). The acceptance covers this foundation only. It does not approve a merge, a
   release, Redis plus SQLite delegation, multi-host delegation, or the downstream cycle-boundary
-  integration (pull request 14), which stays blocked until this foundation is merged and the
-  integration is re-verified on top of it.
+  integration (pull request 14), which stayed blocked until this foundation was merged (squash merge
+  `14e16578e1b68ce64ae4f641eefc469a44d696f1` of pull request 15) and is re-verified on top of it.
 - Builds on: ADR 0011 (run ownership), ADR 0015 (delegation). It does not change either.
 
 ## Context
@@ -150,6 +150,8 @@ support is an optional, explicitly declared capability (`fenced_execution_contra
 
 Build the delegation integration on this foundation: require `fenced=` for delegation, compose
 the scheduler over `FencedTaskStore`, drop the extra `renew` checks that only approximated this
-guarantee, and replace the strict `xfail` reproduction with a passing regression in which the
+guarantee (the operator later allowed these checks to stay as an early, cheap refusal; the
+transactional epoch is the authority and they are not a substitute for it), and replace the strict
+`xfail` reproduction with a passing regression in which the
 lease is replaced after the last check and the stale controller neither persists nor executes
 the delegated child.

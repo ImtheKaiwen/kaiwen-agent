@@ -507,8 +507,10 @@ Each defect was reproduced with a failing test before its fix.
       authorization; a delegation-driven revision gets its own reason and the child depth is
       derived from the trusted parent; job and workflow delegation share admission checks and no
       execution path.
-- [x] M6.3.3-B shared delegation admission (draft pull request, not merged, pending independent
-      review): `DelegationAdmission` in `kaiwen_agent.policy`, `SubagentDelegator` rebuilt on it
+- [x] M6.3.3-B shared delegation admission (pull request 13, squash commit `f114404`, merged after
+      an independent audit and its R1 correction; all 10 CI jobs passed on the exact head and the
+      post-merge run on `main` succeeded): `DelegationAdmission` in `kaiwen_agent.policy`,
+      `SubagentDelegator` rebuilt on it
       with its public behavior kept (a raising policy and malformed facts now fail closed with a
       sanitized message; opt-in `resource_allowlist` for the unrestricted job-path resource
       keys), `WorkflowDelegationAdmission` for workflow proposals (authority to delegate and the
@@ -517,27 +519,42 @@ Each defect was reproduced with a failing test before its fix.
       task scan extracted into `scan_run_tasks`. Admission only: nothing is submitted, created,
       revised or run. Verified by deterministic tests (including honest characterizations of the
       point-in-time and per-instance-lock limits) and mutation checks of the key protections.
-- Not done: the cycle-boundary integration, the explicit revision reason and the final
-  authorization with fresh policy and limit checks (PR-C1), model-facing proposal tools and
-  durable idempotent proposals (PR-C2), bounded cross-cycle handoff over existing stores
-  (PR-C3), reviewer approval and team acceptance (M6.3.4). There is no atomic reservation of
-  delegation quotas: the job path serializes within one delegator instance only, and the
-  workflow admission is preliminary. The Lead view and workflow admission need a store with
-  `TaskRunQuery`; custom and in-memory task stores do not provide it yet.
+- [x] M6.3.3-C1 cycle-boundary delegation (draft pull request 14, not merged, pending independent
+      review; integrated with the fenced execution foundation): opt-in `WorkflowController(delegation=...)`, the explicit
+      `WorkflowRevisionReason.DELEGATION_REQUESTED`, a fresh final authorization at the boundary
+      after a cycle and before the completion gate, a compiler-written parent reference and depth
+      for delegated tasks, and the child worker's declared capabilities checked at admission.
+      Requires fenced execution (`fenced=`): configuration fails closed for Redis, in-memory and
+      custom stores, a second database and unfenced schedulers. The next cycle is exactly the
+      admitted task tuple and no planner is consulted; delegated task writes go through the fenced
+      task store, so a stale or expired owner is refused at the write. Verified by deterministic
+      SQLite-backed tests (restart, ownership loss at exact points, cancellation, bounds, forged
+      parents) and mutation checks of the key protections. The audit R2 `xfail` is now a passing
+      regression.
+- Not done: model-facing proposal tools and durable idempotent proposals (PR-C2), bounded
+  cross-cycle handoff over existing stores (PR-C3), reviewer approval and team acceptance
+  (M6.3.4). There is no atomic reservation of delegation quotas: delegation at the cycle
+  boundary is safe only because the run lease holder alone writes the run's tasks (enforced by
+  the fenced write transaction) and the counted quotas are run-scoped; the job path serializes within one delegator instance only.
+  After a restart, earlier delegated tasks count against the per-run limit, so an identical
+  proposal can be denied until durable proposal identity exists. The Lead view and workflow
+  admission need a store with `TaskRunQuery`; custom and in-memory task stores do not provide it
+  yet.
 
-### Fenced execution foundation (draft pull request, pending independent review)
+### Fenced execution foundation (merged)
 
-- [x] Implemented on branch `feat/fenced-execution-foundation` (ADR 0016, accepted and scoped):
+- [x] Merged as pull request 15, squash commit `14e16578e1b68ce64ae4f641eefc469a44d696f1`
+      (ADR 0016, accepted and scoped):
       `SQLiteLeaseStore` with transactional, never-reset epochs in the protected database; fenced
       task writes, run transitions with monotonic epoch publication, and action-intent writes
       (including PREPARED to EXECUTING) checked in the write's own transaction; a scheduler that
       stops, cancels its workers and writes nothing after a refusal; fail-closed rejection of
       Redis, in-memory, custom-store and second-database configurations. Verified by deterministic
-      adversarial tests and mutation checks; not merged.
+      adversarial tests and mutation checks.
 - Not done: Redis plus SQLite and multi-host delegation (not approved), fencing of arbitrary worker
   code and external effects, exactly-once effects.
-- Pull request 14 (cycle-boundary delegation) stays blocked until this foundation is merged and
-  the integration is rebuilt and re-verified on top of it.
+- Pull request 14 (cycle-boundary delegation) is integrated on top of this foundation and awaits
+  independent audit; it is not merged.
 
 ### M7 design items (not started)
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from hashlib import sha256
 
 from kaiwen_agent.runtime import RuntimeIdentity, RuntimeRunRecord
@@ -11,6 +12,23 @@ from kaiwen_agent.workflow.models import WorkflowLimits, WorkflowPlan
 
 class WorkflowPlanError(ValueError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class DelegationBinding:
+    """Host-derived lineage for the tasks of a delegated plan (ADR 0015).
+
+    Built by the controller from an admission it just ran, never from a plan or a proposal.
+    `compile` writes `parent_id` and `delegation_depth` from it, so the compiler stays the only
+    writer of task identity and counters that count delegated tasks can see them.
+    """
+
+    parent_task_id: str
+    child_depth: int
+
+    def __post_init__(self) -> None:
+        if not self.parent_task_id or self.child_depth < 1:
+            raise ValueError("A delegation binding needs a parent task and a child depth of 1+")
 
 
 class WorkflowCompiler:
@@ -38,6 +56,7 @@ class WorkflowCompiler:
         run: RuntimeRunRecord,
         identity: RuntimeIdentity,
         cycle: int,
+        delegation: DelegationBinding | None = None,
     ) -> TaskGraph:
         self._validate_identity(run, identity)
         if len(plan.tasks) > self.limits.max_tasks_per_plan:
@@ -88,6 +107,8 @@ class WorkflowCompiler:
                     user_id=identity.user_id,
                     conversation_id=identity.conversation_id,
                     trace_id=identity.trace_id or f"trace_{run.id}",
+                    parent_id=delegation.parent_task_id if delegation else None,
+                    delegation_depth=delegation.child_depth if delegation else 0,
                     dependencies=[compiled_ids[item] for item in spec.dependencies],
                     input=spec.input,
                     resource_keys=list(spec.resource_keys),

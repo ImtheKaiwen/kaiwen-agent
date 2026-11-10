@@ -47,7 +47,7 @@ import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Literal
+from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -67,7 +67,7 @@ from kaiwen_agent.runtime import (
 from kaiwen_agent.tasks import AgentTask, TaskRunQuery, TaskStatus
 from kaiwen_agent.workers import WorkerNotFoundError
 from kaiwen_agent.workflow.compiler import WorkflowCompiler, WorkflowPlanError
-from kaiwen_agent.workflow.models import WorkflowPlan, WorkflowTaskSpec
+from kaiwen_agent.workflow.models import WorkflowPlan, WorkflowRevisionRequest, WorkflowTaskSpec
 from kaiwen_agent.workflow.run_tasks import RunTaskScanError, scan_run_tasks
 
 logger = logging.getLogger(__name__)
@@ -78,7 +78,7 @@ _DRY_RUN_OBJECTIVE = "delegation admission dry run"
 _REASONS = {
     "invalid_trusted_state": "Delegation facts are missing or malformed",
     "state_unavailable": "Trusted workflow state could not be read",
-    "state_incomplete": "Trusted workflow state is too large to establish counters",
+    "state_incomplete": "Trusted workflow state is incomplete, so counters cannot be established",
     "run_not_found": "The workflow run was not found for this owner",
     "run_not_active": "The workflow run is not running",
     "workspace_mismatch": "The workflow run is bound to a different workspace",
@@ -89,6 +89,7 @@ _REASONS = {
     "delegator_role_mismatch": "The parent task's worker does not hold the authorized role",
     "worker_not_allowed": "A proposed worker is not allowlisted",
     "capability_unavailable": "A proposed capability is not available to the host",
+    "worker_capability_mismatch": "A proposed worker is not allowed the requested capabilities",
     "resource_not_allowed": "Requested resource keys are not allowlisted",
     "plan_invalid": "The proposed plan is not valid",
 }
@@ -153,6 +154,50 @@ class WorkflowAdmissionDecision(BaseModel):
     @property
     def admitted(self) -> bool:
         return self.outcome is AdmissionOutcome.ADMITTED
+
+
+@dataclass(frozen=True, slots=True)
+class DelegationCandidate:
+    """What a host delegation source hands the controller: a parent id and untrusted task specs.
+
+    There is no field for the run, the cycle, a depth, an owner, a workspace, permissions or an
+    admission result: the controller owns the first three and derives the rest. `parent_task_id`
+    must be one of the boundary's eligible parents or the controller refuses the candidate.
+    """
+
+    parent_task_id: str
+    proposal: WorkflowDelegationProposal
+
+
+class WorkflowDelegationSource(Protocol):
+    """A host-controlled source of delegation candidates, consulted at the cycle boundary.
+
+    It is called by the controller with a `DELEGATION_REQUESTED` request, never by a model or a
+    task. It may return `None`. Its answer is untrusted input and grants nothing; durable,
+    idempotent proposal storage is a later work package (ADR 0015, PR-C2).
+    """
+
+    async def propose(self, request: WorkflowRevisionRequest) -> DelegationCandidate | None: ...
+
+
+_MAX_ROUNDS = 5
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowDelegation:
+    """Opt-in delegation configuration for `WorkflowController` (disabled when absent).
+
+    `max_rounds` bounds how many delegation cycles one execution may grant; further candidates
+    block the run with an explicit reason instead of running or being ignored.
+    """
+
+    source: WorkflowDelegationSource
+    admission: WorkflowDelegationAdmission
+    max_rounds: int = 1
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.max_rounds <= _MAX_ROUNDS:
+            raise ValueError(f"max_rounds must be between 1 and {_MAX_ROUNDS}")
 
 
 class WorkflowDelegationAdmission:
@@ -257,8 +302,10 @@ class WorkflowDelegationAdmission:
         if scan_error is not None:
             _log_failure(scan_error.code, scan_error.error_type or "TaskRunPage", run.id)
             return _deny("state_unavailable")
-        if scan.truncated:
-            return _deny("state_incomplete")  # counters cannot be established: fail closed
+        if scan.truncated or scan.unreadable > 0:
+            # Counters are only authoritative over a complete inventory: unreadable rows and rows
+            # dropped for not belonging to the run could be exactly the ones that use the quota.
+            return _deny("state_incomplete")
 
         parent = next((task for task in scan.tasks if task.id == parent_task_id), None)
         if parent is None:
@@ -305,16 +352,21 @@ class WorkflowDelegationAdmission:
 
         compiler = self.compiler
         for spec in proposal.tasks:
-            known = spec.worker_id in compiler.worker_allowlist
-            if known:
+            worker: object | None = None
+            if spec.worker_id in compiler.worker_allowlist:
                 try:
-                    compiler.workers.get(spec.worker_id)
+                    worker = compiler.workers.get(spec.worker_id)
                 except WorkerNotFoundError:
-                    known = False
-            if not known:
+                    worker = None
+            if worker is None:
                 return _deny("worker_not_allowed", subject=spec.id)
             if not spec.capabilities <= compiler.effective_capabilities:
                 return _deny("capability_unavailable", subject=spec.id)
+            # An `AgentRuntimeWorker` refuses a task whose capabilities exceed its own
+            # `allowed_capabilities`, but only when it executes. Admit nothing that is doomed.
+            declared = getattr(worker, "allowed_capabilities", None)
+            if isinstance(declared, frozenset) and not spec.capabilities <= declared:
+                return _deny("worker_capability_mismatch", subject=spec.id)
             if not set(spec.resource_keys) <= compiler.resource_allowlist:
                 return _deny("resource_not_allowed", subject=spec.id)
         return None

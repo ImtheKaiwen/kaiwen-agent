@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- Add opt-in cycle-boundary delegation to `WorkflowController` (M6.3.3-C1, ADR 0015):
+  `WorkflowController(delegation=WorkflowDelegation(source, admission, max_rounds))`, a new
+  `WorkflowRevisionReason.DELEGATION_REQUESTED` (with typed `DelegationBoundary` data on
+  `WorkflowRevisionRequest`, which can carry no failure and no gate result), `DelegationCandidate`
+  and `WorkflowDelegationSource`. After a cycle with no failures and before the completion gate, a
+  host-controlled source may propose work; only a task completed in that cycle may be the parent,
+  and the proposal is freshly authorized (run, workspace, host `DelegationAuthority`, ceiling,
+  child worker, central policy with live counters, compiler) before the controller compiles
+  exactly the admitted tasks as the next cycle. Anything short of an explicit allow blocks the run
+  with an explicit reason. `WorkflowCompiler.compile` gains an optional `DelegationBinding` that
+  writes `parent_id` and `delegation_depth` on delegated tasks, and workflow admission now also
+  checks the child worker's declared `allowed_capabilities`. Delegation requires fenced execution
+  (`fenced=`, ADR 0016): Redis, in-memory or custom stores, a second database, an admission over
+  other runs or another task database, and unfenced schedulers are refused at construction, and a
+  stale or expired owner is refused at the first delegated task write.
+  Workflow admission denies an incomplete task listing (`state_incomplete`), and the controller
+  asks the lease store whether it still holds the lease before and after delegated work is
+  authorized, because the run record's stored token does not prove it. Without `delegation`
+  configured nothing changes. No durable proposal storage yet (PR-C2).
 - Add opt-in fenced execution over one SQLite database (ADR 0016): `SQLiteLeaseStore` (transactional
   lease acquisition with durable, never-reset epochs in the protected database), `OwnerEpoch`,
   `SQLitePersistence.save_task_fenced`, epoch-checked run transitions with monotonic ownership

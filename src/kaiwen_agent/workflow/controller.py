@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from contextlib import AbstractContextManager, suppress
+from dataclasses import dataclass
 from hashlib import sha256
 from typing import Any, Protocol
 from uuid import uuid4
@@ -19,6 +20,7 @@ from kaiwen_agent.exceptions import (
     FencedConfigurationError,
     RunOwnershipError,
 )
+from kaiwen_agent.policy import AdmissionOutcome
 from kaiwen_agent.quality import (
     CompletionGate,
     CompletionGateResult,
@@ -39,9 +41,12 @@ from kaiwen_agent.standards import StandardResolution
 from kaiwen_agent.tasks import AgentTask, TaskGraph, TaskScheduler, TaskStatus
 from kaiwen_agent.tools.durability import ActionIntentStatus, ActionIntentStore
 from kaiwen_agent.types import utc_now
-from kaiwen_agent.workflow.compiler import WorkflowCompiler, WorkflowPlanError
+from kaiwen_agent.workflow.compiler import DelegationBinding, WorkflowCompiler, WorkflowPlanError
+from kaiwen_agent.workflow.delegation import DelegationCandidate, WorkflowDelegation
 from kaiwen_agent.workflow.fenced import FencedExecution
 from kaiwen_agent.workflow.models import (
+    DelegationBoundary,
+    DelegationParent,
     WorkflowLimits,
     WorkflowOutcome,
     WorkflowOutcomeStatus,
@@ -74,6 +79,15 @@ class ProtectedInputFingerprintProvider(Protocol):
 
 class _Ownership:
     lost = False
+    lease: DistributedLease | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _DelegationStep:
+    """The next cycle of a delegation the controller itself just authorized."""
+
+    plan: WorkflowPlan
+    binding: DelegationBinding
 
 
 class _RunWriter:
@@ -178,6 +192,7 @@ class WorkflowController:
         fingerprint_provider: ProtectedInputFingerprintProvider | None = None,
         workspace_binding: WorkspaceBinding | None = None,
         block_unassociated_actions: bool = False,
+        delegation: WorkflowDelegation | None = None,
         fenced: FencedExecution | None = None,
     ) -> None:
         if lease_ttl_seconds <= 0:
@@ -195,6 +210,37 @@ class WorkflowController:
             if action_intents is not None and action_intents is not fenced.persistence:
                 raise FencedConfigurationError(
                     "Fenced execution requires action intents in the fenced database"
+                )
+        if delegation is not None:
+            # Delegation is opt-in and fails closed at configuration, not at run time.
+            if fenced is None:
+                raise FencedConfigurationError(
+                    "Delegation requires fenced execution (ADR 0016): a delegated task write "
+                    "must be refused by the authoritative SQLite lease when the owner is stale, "
+                    "which neither a Redis lease nor an in-memory or custom store can prove"
+                )
+            admission = delegation.admission
+            if admission.compiler is not compiler:
+                raise ValueError("Delegation admission must use this controller's compiler")
+            if admission.runs is not runs:
+                raise FencedConfigurationError(
+                    "Delegation admission must read the same durable runs as the controller"
+                )
+            if (
+                admission.tasks is not fenced.persistence
+                and admission.tasks is not fenced.task_store
+            ):
+                raise FencedConfigurationError(
+                    "Delegation admission must read tasks from the fenced database"
+                )
+            if admission.parent_statuses != frozenset({TaskStatus.COMPLETED}):
+                raise ValueError(
+                    "Delegation admission must accept only completed parents: the controller "
+                    "delegates at the boundary after a cycle, never from a running task"
+                )
+            if admission.expected_workspace != workspace_binding:
+                raise ValueError(
+                    "Delegation admission must expect the controller's workspace binding"
                 )
 
         self.runs = runs
@@ -224,6 +270,8 @@ class WorkflowController:
         # own them. When set, a run owner with such an unresolved (executing or uncertain)
         # action cannot start work until an operator resolves it. See docs/persistence.md.
         self.block_unassociated_actions = block_unassociated_actions
+        # Optional and off by default. Without it the controller behaves exactly as before.
+        self.delegation = delegation
 
     async def execute(
         self,
@@ -268,6 +316,7 @@ class WorkflowController:
                 bind_scope = bind_owner_epoch(epoch)
                 bind_scope.__enter__()
             writer = _RunWriter(self.runs, lease.fencing_token, epoch)
+            ownership.lease = lease
             heartbeat = asyncio.create_task(self._heartbeat(lease, owner_task, ownership))
         try:
             return await self._execute(
@@ -278,6 +327,7 @@ class WorkflowController:
                 protected_input_fingerprint=protected_input_fingerprint,
                 owner_lease_key=lease.key if lease is not None else None,
                 writer=writer,
+                ownership=ownership,
             )
         except asyncio.CancelledError:
             if ownership.lost:
@@ -436,6 +486,7 @@ class WorkflowController:
         protected_input_fingerprint: str,
         owner_lease_key: str | None = None,
         writer: _RunWriter,
+        ownership: _Ownership,
     ) -> WorkflowOutcome:
         if run.status not in {
             RuntimeRunStatus.CREATED,
@@ -487,15 +538,21 @@ class WorkflowController:
                 )
         current_plan = plan
         all_tasks: list[AgentTask] = []
+        # Delegation state, local to this execution: nothing here survives a restart, so a
+        # replay re-derives and re-authorizes everything instead of trusting an earlier answer.
+        pending_binding: DelegationBinding | None = None
+        delegation_rounds = 0
         latest_quality: CompletionGateResult | None = None
         repair_tracker = RepairTracker(self.repair_limits)
         for cycle in range(1, self.limits.max_cycles + 1):
+            binding, pending_binding = pending_binding, None
             try:
                 graph = self.compiler.compile(
                     current_plan,
                     run=current_run,
                     identity=identity,
                     cycle=cycle,
+                    delegation=binding,
                 )
             except WorkflowPlanError as error:
                 failed = await writer.fail(
@@ -509,6 +566,13 @@ class WorkflowController:
                     cycles=cycle,
                     tasks=tuple(all_tasks),
                     reason=str(error),
+                )
+            if binding is not None:
+                # Delegated work: ask the lease store again right before it is scheduled. This is
+                # an early, cheap refusal; the authoritative check is the epoch enforced inside
+                # every fenced task write transaction (ADR 0016).
+                await self._verify_ownership(
+                    run=run, identity=identity, writer=writer, ownership=ownership
                 )
             scheduler = self.scheduler_factory(graph)
             if self.fenced is not None and not self.fenced.accepts_scheduler(scheduler):
@@ -584,6 +648,26 @@ class WorkflowController:
                     tasks=tuple(all_tasks),
                     reason="task_execution_failed",
                 )
+
+            if self.delegation is not None:
+                step = await self._delegation_boundary(
+                    run=run,
+                    identity=identity,
+                    writer=writer,
+                    ownership=ownership,
+                    cycle=cycle,
+                    plan=current_plan,
+                    tasks=tasks,
+                    all_tasks=all_tasks,
+                    rounds=delegation_rounds,
+                )
+                if isinstance(step, WorkflowOutcome):
+                    return step
+                if step is not None:
+                    current_plan = step.plan
+                    pending_binding = step.binding
+                    delegation_rounds += 1
+                    continue
 
             gate_fingerprint = protected_input_fingerprint
             if self.fingerprint_provider is not None:
@@ -723,6 +807,161 @@ class WorkflowController:
             quality=latest_quality,
             reason="workflow_cycle_limit",
         )
+
+    async def _delegation_boundary(
+        self,
+        *,
+        run: RuntimeRunRecord,
+        identity: RuntimeIdentity,
+        writer: _RunWriter,
+        ownership: _Ownership,
+        cycle: int,
+        plan: WorkflowPlan,
+        tasks: tuple[AgentTask, ...],
+        all_tasks: list[AgentTask],
+        rounds: int,
+    ) -> _DelegationStep | WorkflowOutcome | None:
+        """The one place a delegation can become executable (ADR 0015, 4.2).
+
+        Reached only after a cycle whose tasks all ended without failure and before the
+        completion gate. Returns `None` when the source has no candidate (the gate then judges
+        completion as before), the authorized next cycle, or a BLOCKED outcome with an explicit
+        reason. A candidate is never ignored and never treated as completion: anything short of a
+        fresh, explicit allow blocks the run.
+
+        The authorization here is a fresh evaluation, not a stored answer, and it is only as
+        atomic as the run lease: the controller holds the lease and re-verifies its fencing token
+        immediately after the evaluation and before anything is compiled, so no other writer can
+        create this run's tasks in between. It does not make external side effects fenced.
+        """
+
+        assert self.delegation is not None
+        config = self.delegation
+        parents = tuple(
+            DelegationParent(
+                task_id=task.id,
+                logical_task_id=str(task.metadata.get("logical_task_id", task.id)),
+                worker_id=task.agent_id,
+                depth=task.delegation_depth,
+            )
+            for task in tasks
+            if task.status is TaskStatus.COMPLETED
+        )
+        request = WorkflowRevisionRequest(
+            run_id=run.id,
+            cycle=cycle,
+            reason=WorkflowRevisionReason.DELEGATION_REQUESTED,
+            prior_plan=plan,
+            delegation=DelegationBoundary(
+                eligible_parents=parents, rounds_used=rounds, rounds_allowed=config.max_rounds
+            ),
+        )
+
+        def blocked(reason: str) -> Coroutine[Any, Any, WorkflowOutcome]:
+            return self._blocked(
+                writer=writer,
+                run=run,
+                identity=identity,
+                cycle=cycle,
+                tasks=all_tasks,
+                quality=None,
+                reason=reason,
+            )
+
+        failure: str | None = None
+        candidate: object = None
+        try:
+            candidate = await config.source.propose(request)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - fail closed; the message is never used
+            failure = type(error).__name__
+        if failure is not None:  # handled outside the handler so nothing is chained or logged
+            logger.warning("delegation source failure error_type=%s run=%s", failure, run.id)
+            return await blocked("delegation_source_failed")
+        if candidate is None:
+            return None
+        if not isinstance(candidate, DelegationCandidate):
+            return await blocked("delegation_invalid_candidate")
+        if rounds >= config.max_rounds:
+            return await blocked("delegation_round_limit")
+        if cycle >= self.limits.max_cycles:
+            return await blocked("delegation_cycle_limit")
+        if candidate.parent_task_id not in {parent.task_id for parent in parents}:
+            # Only a task that completed in the cycle that just ended may delegate. Task ids
+            # carry their cycle, so a parent is eligible at exactly one boundary: a replayed
+            # candidate cannot be admitted twice within an execution.
+            return await blocked("delegation_parent_not_eligible")
+
+        decision = await config.admission.evaluate(
+            run_id=run.id,
+            identity=identity,
+            parent_task_id=candidate.parent_task_id,
+            proposal=candidate.proposal,
+        )
+        if decision.outcome is AdmissionOutcome.APPROVAL_REQUIRED:
+            return await blocked(f"delegation_approval_required:{decision.code}")
+        if not decision.admitted:
+            return await blocked(f"delegation_denied:{decision.code}")
+        if decision.child_depth is None:
+            return await blocked("delegation_invalid_decision")
+        # Still the owner? This is the last check before the delegated plan is compiled.
+        await self._verify_ownership(run=run, identity=identity, writer=writer, ownership=ownership)
+        return _DelegationStep(
+            # The plan is the admitted task tuple itself: no planner can substitute or add to it.
+            plan=WorkflowPlan(
+                version=plan.version + 1, objective=plan.objective, tasks=candidate.proposal.tasks
+            ),
+            binding=DelegationBinding(
+                parent_task_id=candidate.parent_task_id, child_depth=decision.child_depth
+            ),
+        )
+
+    async def _verify_ownership(
+        self,
+        *,
+        run: RuntimeRunRecord,
+        identity: RuntimeIdentity,
+        writer: _RunWriter,
+        ownership: _Ownership,
+    ) -> None:
+        """Raise `RunOwnershipError` unless this executor still owns the running run.
+
+        The run record's stored fencing token is not proof that the lease is held: the lease can
+        expire or be replaced while the record still names the old token (the new owner has not
+        written yet), and the heartbeat only notices at its next tick. The lease store is
+        therefore asked directly: `renew` succeeds only for the current, unexpired holder. This
+        is a check at one instant, not an atomic guarantee: the lease can still be lost after it
+        and task writes are not fenced by the lease store.
+        """
+
+        if ownership.lost:
+            raise RunOwnershipError("Run ownership was lost; delegation stopped")
+        lease = ownership.lease
+        if lease is not None and self.leases is not None:
+            held = False
+            try:
+                held = (
+                    await self.leases.renew(lease, ttl_seconds=self.lease_ttl_seconds)
+                ) is not None
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001 - an unknown lease state is not ownership
+                # The class name only: a lease backend's message can carry connection secrets.
+                logger.warning(
+                    "Run lease could not be verified (lease_store_unavailable: %s)",
+                    type(error).__name__,
+                )
+            if not held:
+                ownership.lost = True
+                raise RunOwnershipError("The run lease is no longer held; delegation stopped")
+        record = await self.runs.get(run_id=run.id, identity=identity)
+        if (
+            record is None
+            or record.status is not RuntimeRunStatus.RUNNING
+            or (writer.fence is not None and record.owner_fencing_token != writer.fence)
+        ):
+            raise RunOwnershipError("The run changed under another owner; delegation stopped")
 
     async def _fresh_fingerprint(self, run: RuntimeRunRecord, identity: RuntimeIdentity) -> str:
         assert self.fingerprint_provider is not None
