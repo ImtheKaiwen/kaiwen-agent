@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import json
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import replace
 from hashlib import sha256
 from typing import Any, ClassVar, Literal
@@ -17,8 +18,10 @@ from kaiwen_agent.exceptions import (
     ActionOutcomeUncertainError,
     ApprovalDeniedError,
     ApprovalRequiredError,
+    FencedConfigurationError,
     IdempotencyConflictError,
     PermissionDeniedError,
+    RunOwnershipError,
     ToolArgumentsError,
     ToolExecutionError,
     ToolTimeoutError,
@@ -39,6 +42,7 @@ from kaiwen_agent.tools.durability import (
     ActionIntentStatus,
     ActionIntentStore,
     DurableActionScope,
+    FencedActionIntents,
 )
 from kaiwen_agent.tools.idempotency import IdempotencyStore, InMemoryIdempotencyStore
 from kaiwen_agent.types import ToolCall, ToolResult
@@ -92,8 +96,23 @@ class ToolExecutor:
         # actions up by durable run) and names the idempotency namespace: one task of one
         # run, so tasks that reuse a provider-generated call id never share an intent.
         owner_run_id = execution_scope
+        action_store: ActionIntentStore | None = self.action_intent_store
         if action_scope is not None:
             _check_action_scope(action_scope, context)
+            if action_scope.owner_epoch is not None:
+                # Fenced scope: side effects are admitted only through epoch-checked intents.
+                # A tool that can have an effect with no fenced durable store is refused rather
+                # than run with a protection it does not have.
+                try:
+                    action_store = FencedActionIntents(
+                        self.action_intent_store, action_scope.owner_epoch
+                    )
+                except ValueError:
+                    if definition.side_effect != "none":
+                        raise FencedConfigurationError(
+                            "A fenced scope needs an action intent store that enforces fencing"
+                        ) from None
+                    action_store = None
             owner_run_id = action_scope.runtime_run_id
             execution_scope = action_scope.execution_identity
             if call.idempotency_key is not None:
@@ -200,6 +219,7 @@ class ToolExecutor:
                 arguments_checksum=arguments_checksum,
                 idempotency_identity=idempotency_identity,
                 action_intent=action_intent,
+                action_store=action_store,
             )
 
         if flight_key is None:
@@ -326,8 +346,8 @@ class ToolExecutor:
         arguments_checksum: str,
         idempotency_identity: str,
         action_intent: ActionIntentRecord | None,
+        action_store: ActionIntentStore | None,
     ) -> ToolResult:
-        action_store = self.action_intent_store
         if action_intent is not None:
             assert action_store is not None
             existing_intent = await action_store.get_action_intent(
@@ -522,16 +542,22 @@ class ToolExecutor:
                     assert action_store is not None
                     # The handler may have produced an external effect before it was
                     # interrupted, so the outcome is unknown and must not be replayed.
-                    await asyncio.shield(
-                        action_store.transition_action_intent(
-                            intent_id=action_intent.id,
-                            tenant_id=action_intent.tenant_id,
-                            user_id=action_intent.user_id,
-                            expected=frozenset({ActionIntentStatus.EXECUTING}),
-                            status=ActionIntentStatus.UNCERTAIN,
-                            error_code="cancelled_in_flight",
+                    with suppress(RunOwnershipError):
+                        # No authority to record it: the intent stays EXECUTING for recovery.
+                        await asyncio.shield(
+                            action_store.transition_action_intent(
+                                intent_id=action_intent.id,
+                                tenant_id=action_intent.tenant_id,
+                                user_id=action_intent.user_id,
+                                expected=frozenset({ActionIntentStatus.EXECUTING}),
+                                status=ActionIntentStatus.UNCERTAIN,
+                                error_code="cancelled_in_flight",
+                            )
                         )
-                    )
+                raise
+            except RunOwnershipError:
+                # Authority was lost: never retry the handler and never record an outcome the
+                # executor can no longer commit. An EXECUTING intent stays EXECUTING.
                 raise
             except ActionOutcomeUncertainError as error:
                 last_error = error

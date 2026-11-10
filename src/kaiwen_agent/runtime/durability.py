@@ -5,12 +5,12 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from kaiwen_agent.coordination import LeaseStore
+from kaiwen_agent.coordination import DistributedLease, LeaseStore, OwnerEpoch
 from kaiwen_agent.runtime.models import AutonomyLevel, RunMode
 from kaiwen_agent.runtime.profile import RuntimeVersionPins
 from kaiwen_agent.tools.durability import (
@@ -73,6 +73,10 @@ class RuntimeRunRecord(BaseModel):
     owner_lease_key: str | None = Field(default=None, min_length=1, max_length=300)
     # Fencing token of the lease under which the current owner started the run.
     owner_fencing_token: int | None = Field(default=None, ge=1)
+    # True once an executor started the run under fenced execution (ADR 0016). It is never
+    # cleared: a fenced run cannot be continued by an unfenced executor, so fenced mode does not
+    # silently downgrade. Records written before fenced execution load as False.
+    fenced: bool = False
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
     completed_at: datetime | None = None
@@ -190,32 +194,50 @@ class RuntimeRecoveryManager:
                 limit=limit,
             )
             for intent in intents:
-                updated = await self.stores.actions.transition_action_intent(
-                    intent_id=intent.id,
-                    tenant_id=intent.tenant_id,
-                    user_id=intent.user_id,
-                    expected=frozenset({ActionIntentStatus.EXECUTING}),
-                    status=ActionIntentStatus.UNCERTAIN,
-                    error_code="process_interrupted",
-                )
-                if updated is None:
-                    continue
-                uncertain.append(intent.id)
                 run = await self.stores.runs.get_runtime_run(
                     run_id=intent.runtime_run_id,
                     tenant_id=intent.tenant_id,
                     user_id=intent.user_id,
                 )
-                if run is None:
-                    unassociated.append(intent.id)
-                if run is not None and run.status in {
-                    RuntimeRunStatus.CREATED,
-                    RuntimeRunStatus.RUNNING,
-                    RuntimeRunStatus.PAUSED,
-                }:
-                    with suppress(RuntimeRunConflictError):
-                        await self._save_blocked(run, f"uncertain_action:{intent.id}")
-                        blocked.add(run.id)
+                probe: DistributedLease | None = None
+                authority: OwnerEpoch | None = None
+                if run is not None and run.fenced and run.status is RuntimeRunStatus.RUNNING:
+                    # A fenced run is only touched with proof its owner is gone: the run's own
+                    # lease, newer than the owner's. A live owner is left alone.
+                    probe, authority = await self._recovery_authority(run, owner_id)
+                    if authority is None:
+                        continue
+                try:
+                    kwargs: dict[str, Any] = {}
+                    if authority is not None:
+                        kwargs["recovery_epoch"] = authority
+                    updated = await self.stores.actions.transition_action_intent(
+                        intent_id=intent.id,
+                        tenant_id=intent.tenant_id,
+                        user_id=intent.user_id,
+                        expected=frozenset({ActionIntentStatus.EXECUTING}),
+                        status=ActionIntentStatus.UNCERTAIN,
+                        error_code="process_interrupted",
+                        **kwargs,
+                    )
+                    if updated is None:
+                        continue
+                    uncertain.append(intent.id)
+                    if run is None:
+                        unassociated.append(intent.id)
+                    if run is not None and run.status in {
+                        RuntimeRunStatus.CREATED,
+                        RuntimeRunStatus.RUNNING,
+                        RuntimeRunStatus.PAUSED,
+                    }:
+                        with suppress(RuntimeRunConflictError):
+                            await self._save_blocked(
+                                run, f"uncertain_action:{intent.id}", recovery=authority
+                            )
+                            blocked.add(run.id)
+                finally:
+                    if probe is not None:
+                        await self.leases.release(probe)
             owner_lost = await self._block_unowned_runs(owner_id=owner_id, limit=limit)
             return RecoveryReport(
                 uncertain_action_ids=tuple(uncertain),
@@ -260,7 +282,39 @@ class RuntimeRecoveryManager:
             complete=len(page) < limit,
         )
 
-    async def _save_blocked(self, run: RuntimeRunRecord, reason: str) -> None:
+    async def _recovery_authority(
+        self, run: RuntimeRunRecord, owner_id: str
+    ) -> tuple[DistributedLease | None, OwnerEpoch | None]:
+        """The run's lease and an epoch for it, if recovery can prove the owner is gone.
+
+        Needs a lease store that can issue epochs (`SQLiteLeaseStore`); anything else, a live
+        owner, or any failure yields no authority, and the run is left alone (fail closed).
+        """
+
+        issue = getattr(self.leases, "issue_owner_epoch", None)
+        if run.owner_lease_key is None or issue is None:
+            return None, None
+        probe = await self.leases.acquire(
+            key=run.owner_lease_key, owner_id=owner_id, ttl_seconds=self.lease_ttl_seconds
+        )
+        if probe is None:
+            return None, None
+        try:
+            epoch: OwnerEpoch = await issue(
+                probe,
+                run_id=run.id,
+                tenant_id=run.tenant_id,
+                user_id=run.user_id,
+                session_id=run.session_id,
+            )
+        except Exception:  # noqa: BLE001 - no proof of authority: do not touch the run
+            await self.leases.release(probe)
+            return None, None
+        return probe, epoch
+
+    async def _save_blocked(
+        self, run: RuntimeRunRecord, reason: str, recovery: OwnerEpoch | None = None
+    ) -> None:
         """Block a run only if its stored status and owner still match the snapshot."""
 
         blocked = run.model_copy(
@@ -273,10 +327,12 @@ class RuntimeRecoveryManager:
         if not _supports_conditional_writes(self.stores.runs):
             await self.stores.runs.save_runtime_run(blocked)
             return
+        extra: dict[str, Any] = {} if recovery is None else {"recovery_epoch": recovery}
         await self.stores.runs.save_runtime_run(
             blocked,
             expected_status=run.status,
             expected_owner_fence=run.owner_fencing_token,
+            **extra,
         )
 
     async def _block_unowned_runs(self, *, owner_id: str, limit: int) -> list[str]:
@@ -305,7 +361,21 @@ class RuntimeRecoveryManager:
             if probe is None:
                 continue
             try:
-                await self._save_blocked(run, "owner_lost")
+                authority: OwnerEpoch | None = None
+                if run.fenced:
+                    # The probe lease is the proof; a fenced run is blocked only with an epoch
+                    # issued from it, and only by a lease store that can issue one.
+                    issue = getattr(self.leases, "issue_owner_epoch", None)
+                    if issue is None:
+                        continue
+                    authority = await issue(
+                        probe,
+                        run_id=run.id,
+                        tenant_id=run.tenant_id,
+                        user_id=run.user_id,
+                        session_id=run.session_id,
+                    )
+                await self._save_blocked(run, "owner_lost", recovery=authority)
                 owner_lost.append(run.id)
             except RuntimeRunConflictError:
                 pass  # the run changed state or owner after the snapshot; leave it alone

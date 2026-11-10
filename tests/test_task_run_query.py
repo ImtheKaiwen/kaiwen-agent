@@ -117,7 +117,7 @@ def test_filtering_happens_in_sql_before_any_row_is_materialized(
         foreign = await make_run(store, user="user-2")
         for index in range(12):
             await store.save_task(make_task(mine.id, f"mine{index:02d}"))
-        for index in range(300):
+        for index in range(60):
             await store.save_task(make_task(foreign.id, f"theirs{index:03d}", user="user-2"))
 
         original = AgentTask.model_validate_json
@@ -130,7 +130,7 @@ def test_filtering_happens_in_sql_before_any_row_is_materialized(
         monkeypatch.setattr(AgentTask, "model_validate_json", staticmethod(counting))
         page = await listed(store, mine, limit=5)
         assert len(page.tasks) == 5 and page.next_after_id is not None
-        # Only the requested page was materialized, none of the 300 foreign rows.
+        # Only the requested page was materialized, none of the 60 foreign rows.
         assert len(materialized) == 5
 
     run_async(scenario)

@@ -25,6 +25,7 @@ from kaiwen_agent.workflow.delegation import (
     WorkflowDelegationProposal,
     WorkflowDelegationSource,
 )
+from kaiwen_agent.workflow.fenced import FencedExecution
 from kaiwen_agent.workflow.lead_view import (
     LeadApprovalRef,
     LeadTaskView,
@@ -55,6 +56,7 @@ from kaiwen_agent.workflow.task_context import (
 )
 
 __all__ = [
+    "FencedExecution",
     "AgentRuntimeWorker",
     "DelegationAuthority",
     "DelegationBinding",

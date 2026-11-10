@@ -251,34 +251,25 @@ admission path requires the compiler's allowlist and denies any other key.
   only the current unexpired holder can pass) after the authorization and again right before the
   delegated cycle is handed to the scheduler, and also re-checks the record token and status. A
   failed, missing or erroring renew stops the run with `RunOwnershipError` and nothing is written
-  on the new owner's behalf. This is a check at an instant, not an atomic guarantee: the lease can
-  still be lost after the last check, and neither the task store nor the scheduler verifies the
-  lease at the write. Closing that window needs a fencing token enforced by the task store, which
-  is a separate change. Reproduced (audit R2, strict `xfail` test): a controller whose lease is
-  replaced after its last check, with the run record unchanged, still persists and executes the
-  delegated child. Distinctions: checking a lease and renewing it are instants; the run's recorded
-  fencing token only changes when the new owner writes; the lease store cannot take part in a task
-  write; the scheduler and `TaskStore.save_task` carry no token; external side effects are not
-  protected by any of these.
-
-  Proposed amendment, not implemented and awaiting operator approval: an optional task-store
-  capability `FencedTaskWrites` whose `save_task_fenced(task, run_id, fence)` writes only if the
-  durable run record still names `fence` as its owner token and is RUNNING, checked in the same
-  SQLite transaction as the write. A scheduler built over a store that provides it passes the
-  controller's fence on every save, so a write after the new owner's first run write fails and
-  the scheduler stops before the worker body runs; dispatch is authorized by the successful
-  RUNNING write that precedes each worker call. This is the classic fencing-token model: it makes
-  the new owner's start a serialization point, it does not stop a write that lands before that
-  start, and it does not make external effects exactly-once. Until it exists, delegation should
-  not be merged as a guarantee of stale-owner exclusion.
+  on the new owner's behalf. These checks are at an instant and are only an early refusal. The
+  authority is ADR 0016 (implemented in pull request 15): delegation requires
+  `WorkflowController(fenced=...)`, the scheduler must be composed over the fenced task store, and
+  every task write re-reads the authoritative SQLite lease row inside its own transaction, so a
+  controller whose lease is replaced or expired after its last check is refused at the first
+  protected write (`OwnershipLostError`, a `RunOwnershipError`) and neither persists nor schedules
+  the delegated child. The audit R2 reproduction, formerly a strict `xfail`, is a passing
+  regression. Not guaranteed: a task or external operation already authorized before the loss may
+  have effects afterwards, effects are not exactly-once, and arbitrary worker code can still
+  reach the underlying store.
 - Atomicity. A fresh evaluation is not a reservation. What makes the boundary safe is the run
   lease: only its holder writes the run's tasks, and the quotas counted are run-scoped, so no
   other controller can create tasks between the evaluation and the compile while the lease is
-  held. Delegation therefore
-  requires a lease store and fails at configuration without one. Limits: external side effects
-  are not fenced by the run lease (the protected write boundary must enforce fencing, as before);
-  custom policy rules that read state outside the run are not covered; without a durable
-  lease store shared by every host the guarantee does not span hosts.
+  held. Delegation therefore requires fenced execution and fails at configuration without it:
+  an in-memory or Redis lease, a custom or in-memory task store, a second database, an admission
+  over other runs or another task database, or a scheduler not composed over the fenced task
+  store are all refused. Limits: external side effects are not fenced by the run lease (the
+  protected write boundary must enforce fencing, as before); custom policy rules that read state
+  outside the run are not covered; the guarantee does not span hosts (one local SQLite database).
 - Recovery and idempotency. Nothing about an admission is stored, so a restart re-derives and
   re-authorizes from scratch and a replay never inherits authority. Task ids are deterministic
   (run, cycle, logical id), so a replay upserts the same row; it does not prevent a completed
@@ -332,7 +323,7 @@ cross-run sharing or persistence system are not part of M6.3.3 and are not desig
   plan revision or scheduler call.
 - PR-C1 (M6.3.3-C1): controller integration at the cycle boundary, the explicit revision reason,
   host derivation of delegated task depth, and the final authorization with fresh policy and
-  limit checks (section 4.5). Opt-in, requires a lease store, no durable proposals.
+  limit checks (section 4.5). Opt-in, requires fenced execution (ADR 0016), no durable proposals.
 - PR-C2: model-facing proposal tools and durable, idempotent proposal storage.
 - PR-C3: bounded cross-cycle handoff over the existing stores.
 - M6.3.4: reviewer approval and team acceptance, including any approval workflow for

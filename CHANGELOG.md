@@ -13,11 +13,30 @@
   exactly the admitted tasks as the next cycle. Anything short of an explicit allow blocks the run
   with an explicit reason. `WorkflowCompiler.compile` gains an optional `DelegationBinding` that
   writes `parent_id` and `delegation_depth` on delegated tasks, and workflow admission now also
-  checks the child worker's declared `allowed_capabilities`. Delegation requires a lease store.
+  checks the child worker's declared `allowed_capabilities`. Delegation requires fenced execution
+  (`fenced=`, ADR 0016): Redis, in-memory or custom stores, a second database, an admission over
+  other runs or another task database, and unfenced schedulers are refused at construction, and a
+  stale or expired owner is refused at the first delegated task write.
   Workflow admission denies an incomplete task listing (`state_incomplete`), and the controller
   asks the lease store whether it still holds the lease before and after delegated work is
   authorized, because the run record's stored token does not prove it. Without `delegation`
   configured nothing changes. No durable proposal storage yet (PR-C2).
+- Add opt-in fenced execution over one SQLite database (ADR 0016): `SQLiteLeaseStore` (transactional
+  lease acquisition with durable, never-reset epochs in the protected database), `OwnerEpoch`,
+  `SQLitePersistence.save_task_fenced`, epoch-checked run transitions with monotonic ownership
+  publication (`RuntimeRunRecord.fenced`), epoch-checked action-intent writes including
+  PREPARED to EXECUTING, `FencedTaskStore`, `FencedActionIntents` and
+  `FencedExecution` / `WorkflowController(fenced=...)`. Stale or expired owners are refused with
+  `OwnershipLostError`; the scheduler stops, cancels its workers and records nothing after a
+  refusal. Unsupported configurations (Redis or in-memory leases, custom stores, a second
+  database, unfenced schedulers) are refused at construction. Existing workflows and stores are
+  unchanged; effects are not exactly-once. `SQLitePersistence` gains `busy_timeout_seconds`.
+  Audit corrections: lease expiry is judged at the protected transaction, not at an earlier clock
+  sample; a fenced run keeps its flag and accepts no ordinary transition or action-intent
+  finalization while RUNNING; `RuntimeRecoveryManager` gains a narrow, lease-backed authority that
+  can only block such a run and mark an EXECUTING action uncertain.
+  The published `owner_lease_key` and `owner_fencing_token` of a fenced run can no longer be
+  rewritten outside a fenced start (previously an ordinary update of an idle fenced run could).
 - Add shared, host-controlled delegation admission (M6.3.3-B, ADR 0015 accepted):
   `DelegationAdmission`, `DelegationClaim`, `AdmissionDecision` and `AdmissionOutcome` in
   `kaiwen_agent.policy`. It reuses the central `PolicyEngine` (`agent.delegate`); only an

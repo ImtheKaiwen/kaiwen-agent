@@ -89,7 +89,10 @@ only the completion gate decides whether a requirement is satisfied.
 
 `WorkflowController(delegation=WorkflowDelegation(source=..., admission=..., max_rounds=...))`
 lets a host-controlled source propose more work after a cycle (ADR 0015). It is off by default
-and changes nothing when absent. It needs a lease store; configuration fails without one, with
+and changes nothing when absent. It needs fenced execution (`WorkflowController(fenced=FencedExecution(...))`, ADR 0016: one
+SQLite database for leases, runs, tasks and action intents); configuration fails with a
+`FencedConfigurationError` without it, with Redis, in-memory or custom lease and task stores, with
+an admission over other runs or another task database, with an unfenced scheduler, and with
 an admission built from a different compiler, with parent statuses other than completed, or with
 a workspace binding other than the controller's.
 
@@ -100,7 +103,7 @@ nothing, in which case the gate judges completion exactly as before. A candidate
 that completed in that cycle, and it is then freshly authorized: run and workspace, the parent's
 worker in the host-owned `DelegationAuthority` mapping, the capability ceiling, the child worker,
 the central policy with live depth and quota counters, and the compiler. The controller re-verifies
-its fencing token and compiles the admitted tasks, and only those, as the next cycle, with the
+its lease and compiles the admitted tasks, and only those, as the next cycle, with the
 parent reference and depth written by the compiler. A revision planner is never consulted.
 
 Anything but an explicit allow blocks the run with `delegation_denied:<code>` or
@@ -112,13 +115,15 @@ gate alone still decides whether the run is complete, after the delegation round
 An incomplete task listing (truncated, unreadable rows, or rows not belonging to the run) denies
 with `state_incomplete`. Before the delegated tasks are compiled and again before they are
 scheduled, the controller asks the lease store whether it still holds the lease; the run record's
-token alone is not proof.
+token alone is not proof. That is an early refusal. The authority is the owner epoch checked inside
+every fenced task write, so a controller that lost the lease after its last check is refused at the
+first delegated task write and persists and schedules nothing.
 
-Limits. A fresh evaluation is not a reservation: the guarantee comes from the run lease and
-fencing token, not from the policy check, and external side effects are not fenced by it. The
-lease checks are at an instant: the lease can be lost afterwards and the task store does not
-enforce it at the write: a controller that loses the lease after its last check can still persist
-and execute the delegated child until a fenced task write exists (ADR 0015, 4.5). Replay is at-least-once: deterministic ids make one task row, not
+Limits. A fresh evaluation is not a reservation: the guarantee comes from the run lease and the
+epoch enforced in the write transaction, not from the policy check, and external side effects are
+not fenced by it. A task or tool call already authorized before the lease was lost may still have
+effects afterwards. The guarantee is one local SQLite database, not multiple hosts, and not a
+guard on arbitrary worker code. Replay is at-least-once: deterministic ids make one task row, not
 exactly-once execution, and a tool call re-issued under a new call id without an application
 idempotency key runs again. There
 are no durable proposals yet, so a restart re-authorizes from scratch and an identical proposal

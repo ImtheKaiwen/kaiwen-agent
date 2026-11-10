@@ -1,6 +1,7 @@
 """M6.3.3-C1: cycle-boundary delegation in `WorkflowController` (ADR 0015).
 
-Real SQLite, a real `TaskScheduler`, real lease fencing and the real controller. The delegation
+Real SQLite, a real `TaskScheduler` over the fenced task store, a real `SQLiteLeaseStore` and the
+real controller (delegation requires fenced execution, ADR 0016). The delegation
 source and the gate are scripted so every outcome is deterministic. What is pinned:
 
 - delegation is opt-in and changes nothing when absent;
@@ -10,7 +11,8 @@ source and the gate are scripted so every outcome is deterministic. What is pinn
   the run and never masquerades as a task or gate failure;
 - the completion gate alone still judges completion, after the delegation rounds;
 - replays re-authorize from scratch. Admission is not an atomic reservation: the guarantee comes
-  from the run lease and fencing token, and durable proposal idempotency is PR-C2.
+  from the owner epoch enforced inside every protected write (ADR 0016), and durable proposal
+  idempotency is PR-C2.
 
 Every wait is bounded or event-driven; nothing here depends on timing.
 """
@@ -27,8 +29,9 @@ import pytest
 from pydantic import ValidationError
 
 from kaiwen_agent.control import RunControl
-from kaiwen_agent.coordination import InMemoryLeaseStore
-from kaiwen_agent.exceptions import RunOwnershipError
+from kaiwen_agent.coordination import InMemoryLeaseStore, SQLiteLeaseStore
+from kaiwen_agent.exceptions import FencedConfigurationError, RunOwnershipError
+from kaiwen_agent.persistence import SQLitePersistence
 from kaiwen_agent.policy import (
     DelegationAdmission,
     DelegationPolicy,
@@ -37,7 +40,7 @@ from kaiwen_agent.policy import (
     PolicyRegistry,
 )
 from kaiwen_agent.quality import CompletionGateResult, CompletionGateStatus
-from kaiwen_agent.runtime import RuntimeRunStatus, WorkspaceBinding
+from kaiwen_agent.runtime import DurableRunManager, RuntimeRunStatus, WorkspaceBinding
 from kaiwen_agent.standards import StandardResolution
 from kaiwen_agent.tasks import AgentTask, TaskScheduler, TaskStatus
 from kaiwen_agent.tools.durability import ActionIntentStatus
@@ -46,6 +49,7 @@ from kaiwen_agent.workflow import (
     DelegationAuthority,
     DelegationBoundary,
     DelegationCandidate,
+    FencedExecution,
     WorkflowCompiler,
     WorkflowController,
     WorkflowDelegation,
@@ -58,11 +62,12 @@ from kaiwen_agent.workflow import (
     WorkflowRevisionRequest,
     WorkflowTaskSpec,
 )
-from tests.test_agent_runtime_worker import Flow, owner
+from tests.test_agent_runtime_worker import owner
 from tests.test_agent_runtime_worker import plan as make_plan
 from tests.test_agent_runtime_worker import spec as lead_spec
 from tests.test_delegation_job_path import SECRET, Rule
 from tests.test_durable_action_scope import legacy_intent
+from tests.test_fenced_writes import FencedFlow
 from tests.test_workflow_delegation_admission import proposal
 from tests.test_workflow_delegation_admission import spec as child_spec
 
@@ -162,15 +167,22 @@ class Harness:
         max_rounds: int = 1,
         binding: WorkspaceBinding | None = None,
         planner: Any = None,
+        lease_class: type[SQLiteLeaseStore] = SQLiteLeaseStore,
     ) -> None:
-        self.flow = Flow(tmp_path)
+        self.flow = FencedFlow(tmp_path)
+        if lease_class is not SQLiteLeaseStore:
+            self.flow.leases = lease_class(self.flow.store)
+            self.flow.fenced = FencedExecution(persistence=self.flow.store, leases=self.flow.leases)
         self.store = self.flow.store
         self.source = source or Source()
         self.events: list[str] = []
         self.executed: list[AgentTask] = []
         self.graphs: list[Any] = []
         self.gate = SpyGate(self)
-        self.leases = InMemoryLeaseStore()
+        self.leases = self.flow.leases
+        self.runtime_reads: dict[int, Any] = {}
+        # logical task id -> awaited inside that worker, to lose ownership at an exact point
+        self.on_run: dict[str, Callable[[], Awaitable[None]]] = {}
         self.max_rounds = max_rounds
         self.binding = binding
         self.planner = planner
@@ -196,6 +208,8 @@ class Harness:
             logical = str(task.metadata.get("logical_task_id"))
             self.events.append(f"run:{logical}")
             self.executed.append(task)
+            if logical in self.on_run:
+                await self.on_run[logical]()
             if logical == "boom":
                 raise RuntimeError("worker failed")
             return {"summary": f"{logical} done"}
@@ -224,7 +238,7 @@ class Harness:
         return TaskScheduler(
             graph=graph,
             workers=self.flow.workers,
-            store=self.store,
+            store=self.flow.fenced.task_store,
             control=RunControl(checkpoints=self.store),
             max_concurrency=2,
         )
@@ -234,6 +248,7 @@ class Harness:
         *,
         delegators: dict[str, DelegationAuthority] | None = None,
         tasks: Any = None,
+        swap_after_build: bool = True,
         **overrides: Any,
     ) -> WorkflowDelegationAdmission:
         settings: dict[str, Any] = {
@@ -241,14 +256,23 @@ class Harness:
                 policy_engine=PolicyEngine(registry=PolicyRegistry(self.rules))
             ),
             "runs": self.flow.runs,
-            "tasks": tasks if tasks is not None else self.store,
+            "tasks": self.flow.fenced.task_store,
             "compiler": self.compiler,
             "delegators": self.delegators if delegators is None else delegators,
             "parent_statuses": frozenset({TaskStatus.COMPLETED}),
             "expected_workspace": self.binding,
         }
+        if tasks is not None and not swap_after_build:
+            settings["tasks"] = tasks
         settings.update(overrides)
-        return WorkflowDelegationAdmission(**settings)
+        built = WorkflowDelegationAdmission(**settings)
+        if tasks is not None and swap_after_build:
+            # A read path that misbehaves at run time (a tampered or failing listing). The
+            # controller only accepts the fenced store at configuration, so `controller()` swaps
+            # this in after construction: it changes what admission reads, never where anything
+            # is written.
+            self.runtime_reads[id(built)] = tasks
+        return built
 
     def controller(
         self, *, admission: WorkflowDelegationAdmission | None = None, **options: Any
@@ -260,6 +284,7 @@ class Harness:
             "completion_gate": self.gate,
             "revision_planner": self.planner,
             "leases": self.leases,
+            "fenced": self.flow.fenced,
             "lease_owner_id": "controller-1",
             "action_intents": self.store,
             "workspace_binding": self.binding,
@@ -270,7 +295,11 @@ class Harness:
             ),
         }
         settings.update(options)
-        return WorkflowController(**settings)
+        built = WorkflowController(**settings)
+        delegation = settings["delegation"]
+        if delegation is not None and id(delegation.admission) in self.runtime_reads:
+            delegation.admission.tasks = self.runtime_reads[id(delegation.admission)]
+        return built
 
     async def new_run(self) -> Any:
         return await self.flow.new_run(self.binding)
@@ -857,8 +886,20 @@ def test_delegation_is_refused_at_configuration_when_it_cannot_be_made_safe(
     def build(**options: Any) -> WorkflowController:
         return harness.controller(**options)
 
-    with pytest.raises(ValueError, match="lease store"):
+    # Delegation needs the authoritative SQLite fencing; every other composition is refused.
+    with pytest.raises(FencedConfigurationError, match="requires fenced execution"):
+        build(fenced=None)
+    with pytest.raises(FencedConfigurationError, match="fenced lease store"):
         build(leases=None)
+    with pytest.raises(FencedConfigurationError, match="fenced lease store"):
+        build(leases=InMemoryLeaseStore())
+    with pytest.raises(FencedConfigurationError):
+        FencedExecution(persistence=harness.store, leases=InMemoryLeaseStore())  # type: ignore[arg-type]
+    with pytest.raises(FencedConfigurationError, match="same durable runs"):
+        build(admission=harness.admission(runs=DurableRunManager(harness.store)))
+    elsewhere = SQLitePersistence(tmp_path / "elsewhere.sqlite3")
+    with pytest.raises(FencedConfigurationError, match="fenced database"):
+        build(admission=harness.admission(tasks=elsewhere, swap_after_build=False))
     other = WorkflowCompiler(
         workers=harness.flow.workers,
         worker_allowlist=frozenset({"lead", "coder"}),
@@ -893,13 +934,14 @@ def test_a_controller_that_lost_the_run_stops_before_any_delegated_task_exists(
         run = await harness.new_run()
 
         async def steal(request: WorkflowRevisionRequest) -> DelegationCandidate:
-            record = await harness.flow.runs.get(run_id=run.id, identity=owner())
-            assert record is not None and record.owner_fencing_token is not None
-            # Another executor takes the run over: a newer fencing token is now the owner's.
-            await harness.store.save_runtime_run(
-                record.model_copy(update={"owner_fencing_token": record.owner_fencing_token + 100}),
-                expected_status=RuntimeRunStatus.RUNNING,
+            # Another executor takes the lease over (the first one's has expired): a newer
+            # epoch is now the owner's. A direct run write is refused for a fenced run, so the
+            # takeover can only happen through the lease authority.
+            harness.flow.clock.advance(3600)
+            taken = await harness.leases.acquire(
+                key=f"runtime-run:{run.id}", owner_id="controller-2", ttl_seconds=30
             )
+            assert taken is not None and taken.fencing_token == 2
             return propose_for("lead")(request)
 
         harness.source = Source(steal)

@@ -6,30 +6,31 @@
 - The run record's stored fencing token does not prove the lease is still held: the lease can be
   replaced while the record still names the old token. The controller asks the lease store itself
   (renew, which only the current holder can pass) after authorization and again right before the
-  delegated tasks are scheduled. This narrows the window; it is not an atomic guarantee, and the
-  tests state the remaining limit instead of hiding it.
+  delegated tasks are scheduled. That is an early refusal, not the guarantee: the authoritative
+  check is the owner epoch inside every fenced task write (ADR 0016), pinned in
+  `test_workflow_delegation_r2.py`.
 - Replay is at-least-once. Deterministic ids give one task row, not exactly-once execution.
 
-Lease loss is simulated with a controlled lease store (no sleeps): a second executor takes the
-lease with a clock past expiry while the heartbeat (30 s TTL, first tick at 10 s) has not fired.
+Lease loss is simulated with a real `SQLiteLeaseStore` on the injected clock (no sleeps): a second
+executor takes the lease once the clock is past expiry while the heartbeat (30 s TTL, first tick
+at 10 s) has not fired.
 """
 
 from __future__ import annotations
 
 import asyncio
-from datetime import timedelta
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from kaiwen_agent.coordination import DistributedLease, InMemoryLeaseStore
+from kaiwen_agent.coordination import DistributedLease, SQLiteLeaseStore
 from kaiwen_agent.exceptions import RunOwnershipError
 from kaiwen_agent.policy import DelegationPolicy
 from kaiwen_agent.quality import CompletionGateStatus
 from kaiwen_agent.runtime import RuntimeRunStatus
 from kaiwen_agent.tasks import AgentTask, TaskRunPage
-from kaiwen_agent.types import utc_now
 from kaiwen_agent.workflow import WorkflowOutcomeStatus
 from tests.test_agent_runtime_worker import owner
 from tests.test_delegation_job_path import SECRET
@@ -127,43 +128,32 @@ def test_a_healthy_listing_still_admits_and_an_empty_one_is_not_incomplete(
 # ------------------------------------------------------------------ real lease ownership
 
 
-class ReplaceableLeases(InMemoryLeaseStore):
-    """The reference lease store plus a deterministic way for a second executor to take over."""
+class ReplaceableLeases(SQLiteLeaseStore):
+    """The SQLite lease authority plus a deterministic way for a second executor to take over."""
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, persistence: Any) -> None:
+        super().__init__(persistence)
         self.taken: list[DistributedLease] = []
         self.fail_renew = False
+        # Awaited right after a successful `renew`: the point after the controller's last check.
+        self.after_renew: Callable[[], Awaitable[None]] | None = None
 
     async def takeover(self, key: str) -> DistributedLease:
-        # Observed past expiry, exactly as a second executor would see an expired lease.
-        lease = await self.acquire(
-            key=key,
-            owner_id="controller-2",
-            ttl_seconds=30,
-            now=utc_now() + timedelta(seconds=3600),
-        )
+        # The clock moves past expiry, exactly as a second executor would see an expired lease.
+        self.persistence.lease_clock.advance(3600)
+        lease = await self.acquire(key=key, owner_id="controller-2", ttl_seconds=30)
         assert lease is not None
         self.taken.append(lease)
         return lease
 
-    def takeover_now(self, key: str) -> None:
-        """The same takeover without awaiting, for a synchronous hook (the compiler)."""
-
-        current = self._leases[key]
-        self._fences[key] = current.fencing_token + 1
-        self._leases[key] = current.model_copy(
-            update={
-                "owner_id": "controller-2",
-                "token": "lease_taken",
-                "fencing_token": current.fencing_token + 1,
-            }
-        )
-
     async def renew(self, lease: DistributedLease, **options: Any) -> DistributedLease | None:
         if self.fail_renew:
             raise RuntimeError(SECRET)
-        return await super().renew(lease, **options)
+        renewed = await super().renew(lease, **options)
+        if renewed is not None and self.after_renew is not None:
+            hook, self.after_renew = self.after_renew, None
+            await hook()
+        return renewed
 
 
 async def record_token(harness: Harness, run: Any) -> int | None:
@@ -173,9 +163,9 @@ async def record_token(harness: Harness, run: Any) -> int | None:
 
 
 def lease_harness(tmp_path: Path, **options: Any) -> tuple[Harness, ReplaceableLeases]:
-    harness = Harness(tmp_path, **options)
-    leases = ReplaceableLeases()
-    harness.leases = leases
+    harness = Harness(tmp_path, lease_class=ReplaceableLeases, **options)
+    leases = harness.leases
+    assert isinstance(leases, ReplaceableLeases)
     return harness, leases
 
 
@@ -257,7 +247,8 @@ def test_lease_loss_after_authorization_but_before_scheduling_runs_nothing(
         def compile_then_lose(*args: Any, **kwargs: Any) -> Any:
             graph = real_compile(*args, **kwargs)
             if kwargs.get("delegation") is not None:
-                leases.takeover_now(f"runtime-run:{run.id}")
+                # The loss happens right after compilation; the next lease check sees it.
+                leases.persistence.lease_clock.advance(3600)
             return graph
 
         harness.compiler.compile = compile_then_lose  # type: ignore[method-assign]
