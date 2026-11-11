@@ -180,6 +180,22 @@ dropped. The source writes nothing; the controller still runs the fresh final ad
 authority, ceilings, central policy with live counters, compiler) and a stored record is never an
 authorization.
 
+Composition (checked when the controller is built). A `DurableLeadProposalSource` must read tasks
+from the controller's own fenced database (`fenced.persistence` or `fenced.task_store`, by object
+identity), use the controller's own `DurableRunManager`, and expect the controller's workspace
+binding. Every Lead worker (one built with `lead=`) must be listed in `lead_workers` and use the
+same `LeadToolConfig` as the source, so no Lead commits proposals that nobody reads or that the
+reader would reject. A worker built with `lead=` must have registered the `LeadTools` objects
+themselves and hold the `lead.view` / `lead.propose` permissions. Incompatible configurations are
+refused before any work runs. A custom `WorkflowDelegationSource` keeps the host-controlled
+contract and is not inspected.
+
+Element bounds. Besides the counts (10 criteria, 10 dependencies, 10 capabilities, 5 resource
+keys), each member is bounded: criteria 1 to 500 characters, dependencies a task id of at most
+200 characters, capabilities a label of at most 100 characters, resource keys at most 200
+characters. The same model validates a committed record when it is read, which also checks the
+canonical form, 8,000 bytes per task (canonical JSON escapes non-ASCII text) and the record size.
+
 Limits. The digest detects truncation and accidental corruption; it is not a signature, and a
 writer already trusted to write tasks can forge a consistent record (the existing trusted-write
 boundary, ADR 0015). Idempotent proposals are not exactly-once execution: a restart re-runs the

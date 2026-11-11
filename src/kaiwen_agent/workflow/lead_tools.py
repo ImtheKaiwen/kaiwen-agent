@@ -38,7 +38,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
 from types import MappingProxyType
-from typing import Any
+from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -69,6 +69,14 @@ MAX_VIEW_PAGE = 50
 MAX_VIEW_OFFSET = 500
 _ID = r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$"
 _ROLE = r"^[a-z0-9][a-z0-9_.-]{0,63}$"
+# Element-level limits, conservative against `WorkflowCompiler` (task ids are bounded to 200 and
+# patterned; capability and resource labels are free text there, bounded here).
+_LABEL = r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,99}$"
+_RESOURCE = r"^[A-Za-z0-9][A-Za-z0-9_.:/@-]{0,199}$"
+Dependency = Annotated[str, Field(min_length=1, max_length=200, pattern=_ID)]
+Capability = Annotated[str, Field(min_length=1, max_length=100, pattern=_LABEL)]
+ResourceKey = Annotated[str, Field(min_length=1, max_length=200, pattern=_RESOURCE)]
+Criterion = Annotated[str, Field(min_length=1, max_length=500)]
 _MAX_TASK_BYTES = 8_000
 _MAX_RECORD_BYTES = 128_000
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -110,10 +118,10 @@ class ProposedTask(BaseModel):
     name: str = Field(min_length=1, max_length=300)
     description: str = Field(default="", max_length=2_000)
     role: str = Field(pattern=_ROLE)
-    acceptance_criteria: tuple[str, ...] = Field(default=(), max_length=10)
-    dependencies: tuple[str, ...] = Field(default=(), max_length=10)
-    capabilities: tuple[str, ...] = Field(default=(), max_length=10)
-    resource_keys: tuple[str, ...] = Field(default=(), max_length=5)
+    acceptance_criteria: tuple[Criterion, ...] = Field(default=(), max_length=10)
+    dependencies: tuple[Dependency, ...] = Field(default=(), max_length=10)
+    capabilities: tuple[Capability, ...] = Field(default=(), max_length=10)
+    resource_keys: tuple[ResourceKey, ...] = Field(default=(), max_length=5)
 
 
 class ProposeTaskArguments(ProposedTask):
@@ -347,8 +355,14 @@ class LeadTools:
     def __init__(self, *, config: LeadToolConfig, assembler: LeadViewAssembler | None = None):
         self.config = config
         self.assembler = assembler
+        # Built once: a worker proves it registered exactly these objects (identity), so the
+        # staging handler and the finalization always share one configuration.
+        self._definitions = self._build()
 
     def definitions(self) -> tuple[ToolDefinition, ...]:
+        return self._definitions
+
+    def _build(self) -> tuple[ToolDefinition, ...]:
         found: list[ToolDefinition] = []
         if self.assembler is not None:
             found.append(
@@ -570,6 +584,8 @@ class DurableLeadProposalSource:
             raise LeadProposalError("record_invalid") from None
         if _canonical(canonical_task(task)) != _canonical(item):
             raise LeadProposalError("record_not_canonical")
+        if len(_canonical(item).encode()) > _MAX_TASK_BYTES:
+            raise LeadProposalError("task_too_large")
         binding = self.config.roles.get(task.role)
         if binding is None:
             raise LeadProposalError("unknown_role")

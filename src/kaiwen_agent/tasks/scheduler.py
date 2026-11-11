@@ -144,11 +144,14 @@ class TaskScheduler:
         # A worker marks its task COMPLETED in memory before it saves the row, so the graph can
         # read complete while a final write is still in flight. Return only once every worker
         # has finished, so whatever is returned is what the store holds.
-        if self._active:
-            done, _ = await asyncio.wait(self._active.values())
+        # The first failure (a refused write) surfaces at once; `run` then stops the others.
+        while self._active:
+            done, _ = await asyncio.wait(self._active.values(), return_when=asyncio.FIRST_EXCEPTION)
             for completed in done:
                 await completed
-            self._active = {}
+            self._active = {
+                task_id: future for task_id, future in self._active.items() if not future.done()
+            }
 
         return self.graph.tasks()
 

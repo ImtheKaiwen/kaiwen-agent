@@ -128,6 +128,17 @@ class AgentRuntimeWorker:
             registered = {definition.name for definition in lead.definitions()}
             if not registered <= set(tools):
                 raise WorkerConfigurationError("A Lead worker must be given every Lead tool")
+            for definition in lead.definitions():
+                # The registry must hold this Lead's own tool objects, not a look-alike with
+                # another configuration, and the worker must hold the permission they require.
+                if runtime.registry.get(definition.name) is not definition:
+                    raise WorkerConfigurationError(
+                        f"Registered tool {definition.name} is not this worker's Lead tool"
+                    )
+                if not definition.permissions <= set(permissions):
+                    raise WorkerConfigurationError(
+                        f"The worker lacks the permission for {definition.name}"
+                    )
         if not evidence_tool_names <= set(tools):
             raise WorkerConfigurationError("Evidence tools must be among the worker's tools")
         reserved = _RESERVED_METADATA & set(runtime.metadata)

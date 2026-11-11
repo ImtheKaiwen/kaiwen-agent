@@ -21,7 +21,7 @@ import pytest
 from pydantic import ValidationError
 
 from kaiwen_agent.context import AgentContext
-from kaiwen_agent.exceptions import RunOwnershipError
+from kaiwen_agent.exceptions import FencedConfigurationError, RunOwnershipError
 from kaiwen_agent.policy import (
     DelegationAdmission,
     DelegationPolicy,
@@ -539,6 +539,81 @@ def test_proposal_identity_depends_on_trusted_context_and_content(tmp_path: Path
     assert lt.canonical_task(reordered) == lt.canonical_task(again)
 
 
+ELEMENT_LIMITS = [
+    ("capabilities", "c" * 101),
+    ("capabilities", "bad label"),
+    ("resource_keys", "r" * 201),
+    ("resource_keys", "bad key"),
+    ("dependencies", "d" * 201),
+    ("dependencies", "-leading"),
+    ("acceptance_criteria", "x" * 501),
+    ("acceptance_criteria", ""),
+]
+
+
+@pytest.mark.parametrize(("field", "value"), ELEMENT_LIMITS)
+def test_every_individual_element_is_bounded(field: str, value: str) -> None:
+    base = {"id": "a", "name": "A", "role": "coder"}
+    with pytest.raises(ValidationError):
+        lt.ProposeTaskArguments.model_validate({**base, field: [value]})
+    lt.ProposeTaskArguments.model_validate({**base, field: ["ok"]})  # the control is valid
+
+
+def test_the_limits_are_in_the_provider_tool_schema_and_the_adapter_accepts_it(
+    tmp_path: Path,
+) -> None:
+    from kaiwen_agent.models.openai_tools import serialize_openai_tool
+
+    for definition in LeadHarness(tmp_path).tools.definitions():
+        wire = serialize_openai_tool(definition)  # no provider call: pure serialization
+        assert isinstance(wire["strict"], bool)
+        assert wire["parameters"]["additionalProperties"] is False
+    propose = next(
+        d for d in LeadHarness(tmp_path / "x").tools.definitions() if d.name == "lead.propose_task"
+    )
+    properties = serialize_openai_tool(propose)["parameters"]["properties"]
+    for field, limit in (
+        ("capabilities", 100),
+        ("resource_keys", 200),
+        ("dependencies", 200),
+        ("acceptance_criteria", 500),
+    ):
+        items = properties[field]["items"]
+        assert items["maxLength"] == limit and items["minLength"] == 1
+        assert properties[field]["maxItems"] <= 10
+    assert properties["name"]["maxLength"] == 300 and properties["description"]["maxLength"] == 2000
+
+
+def test_limits_stay_compatible_with_the_workflow_compiler(tmp_path: Path) -> None:
+    """A maximal valid proposal compiles: the tool limits never exceed the compiler's."""
+
+    async def scenario() -> None:
+        harness = LeadHarness(tmp_path)
+        full = lt.ProposedTask(
+            id="i" * 200,
+            name="n" * 300,
+            description="d" * 2000,
+            role="coder",
+            acceptance_criteria=tuple("c" * 500 for _ in range(10)),
+            capabilities=("logs.read",),
+            resource_keys=("repo:main",),
+        )
+        request, _ = await seed_lead(harness, tasks=[lt.canonical_task(full)])
+        candidate = await harness.source().propose(request)
+        assert candidate is not None
+        run = await harness.flow.runs.get(run_id=request.run_id, identity=owner())
+        assert run is not None
+        harness.compiler.compile(_plan(candidate), run=run, identity=owner(), cycle=2)
+
+    run_async(scenario)
+
+
+def _plan(candidate: Any) -> Any:
+    from kaiwen_agent.workflow import WorkflowPlan
+
+    return WorkflowPlan(objective="x", tasks=candidate.proposal.tasks)
+
+
 def test_the_tool_arguments_have_no_field_that_carries_authority() -> None:
     for forged in ("worker_id", "parent_task_id", "run_id", "tenant_id", "depth", "permissions"):
         with pytest.raises(ValidationError):
@@ -764,6 +839,110 @@ def test_ownership_lost_at_dispatch_records_no_delegated_completion(tmp_path: Pa
         assert tasks["a"].status is not TaskStatus.COMPLETED and harness.gate.calls == 0
 
     run_async(scenario)
+
+
+# ------------------------------------------------- the source must read the authoritative store
+
+
+async def _foreign_store_with_forged_lead(harness: LeadHarness, run: Any) -> Any:
+    """A different task store holding a matching, completed Lead row with other proposals."""
+
+    from kaiwen_agent.tasks import InMemoryTaskStore
+    from kaiwen_agent.workflow.compiler import _task_id
+
+    foreign = InMemoryTaskStore()
+    lead_id = _task_id(run.id, 1, "lead")
+    body = lt.build_record(
+        run_id=run.id,
+        parent_task_id=lead_id,
+        tenant_id="tenant-1",
+        user_id="user-1",
+        session_id="session-1",
+        workspace_id=None,
+        tasks=[lt.canonical_task(lt.ProposedTask(id="evil", name="Evil", role="coder"))],
+        config=harness.config,
+    )
+    forged = _task(run.id, "lead", status=TaskStatus.COMPLETED).model_copy(
+        update={"id": lead_id, "agent_id": "lead", "output": {lt.PROPOSALS_OUTPUT_KEY: body}}
+    )
+    await foreign.save_task(forged)
+    return foreign
+
+
+def test_a_source_over_another_task_store_cannot_feed_the_controller(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        harness = LeadHarness(
+            tmp_path, scripts={"lead": [done()]}
+        )  # the real Lead proposes nothing
+        run = await harness.flow.new_run()
+        foreign = await _foreign_store_with_forged_lead(harness, run)
+        with pytest.raises(FencedConfigurationError, match="authoritative"):
+            harness.controller(source=harness.source(tasks=foreign))
+        assert harness.ran == []  # refused at construction, before any work
+
+    run_async(scenario)
+
+
+def test_a_source_over_other_runs_or_another_workspace_is_refused_at_construction(
+    tmp_path: Path,
+) -> None:
+    from kaiwen_agent.runtime import DurableRunManager
+
+    harness = LeadHarness(tmp_path, binding=BINDING)
+    other_runs = DurableRunManager(harness.flow.store)  # same database, a different manager
+    with pytest.raises(FencedConfigurationError, match="authoritative"):
+        harness.controller(source=harness.source(runs=other_runs))
+    other = WorkspaceBinding(workspace_id="ws-1", root="main", policy_checksum="policy-2")
+    with pytest.raises(ValueError, match="workspace"):
+        harness.controller(source=harness.source(expected_workspace=other))
+    with pytest.raises(ValueError, match="workspace"):
+        harness.controller(source=harness.source(expected_workspace=None))
+
+
+def test_a_lead_worker_the_source_does_not_read_is_refused(tmp_path: Path) -> None:
+    harness = LeadHarness(tmp_path)  # worker "lead" has Lead tools
+    with pytest.raises(FencedConfigurationError, match="not read"):
+        harness.controller(source=harness.source(lead_workers=frozenset({"coder"})))
+
+
+def test_a_lead_worker_with_another_tool_configuration_is_refused(tmp_path: Path) -> None:
+    harness = LeadHarness(tmp_path)
+    other = LeadToolConfig(
+        roles={"coder": LeadRoleBinding("coder", "coder", frozenset())},
+        resource_allowlist=frozenset({"repo:main"}),
+    )
+    with pytest.raises(FencedConfigurationError, match="differs"):
+        harness.controller(source=harness.source(config=other))
+
+
+def test_a_lookalike_registered_tool_or_a_missing_permission_is_refused(tmp_path: Path) -> None:
+    harness = LeadHarness(tmp_path)
+    same_config = LeadTools(config=harness.config, assembler=harness.assembler)
+    runtime = harness.flow.runtime(
+        Script({}), tools=harness.tools.definitions(), permissions=PERMISSIONS
+    )
+    names = tuple(d.name for d in same_config.definitions())
+    common: dict[str, Any] = {
+        "runtime": runtime,
+        "runs": harness.flow.runs,
+        "task_store": harness.flow.store,
+        "role": "x",
+        "tool_names": names,
+    }
+    # The registry holds another LeadTools' objects: its staging would use another sink config.
+    with pytest.raises(WorkerConfigurationError, match="not this worker's"):
+        AgentRuntimeWorker(**common, permissions=PERMISSIONS, lead=same_config)
+    with pytest.raises(WorkerConfigurationError, match="lacks the permission"):
+        AgentRuntimeWorker(**common, permissions=frozenset({"lead.view"}), lead=harness.tools)
+    AgentRuntimeWorker(**common, permissions=PERMISSIONS, lead=harness.tools)  # the control
+
+
+def test_the_authoritative_composition_is_accepted_with_either_fenced_handle(
+    tmp_path: Path,
+) -> None:
+    harness = LeadHarness(tmp_path)
+    harness.controller(source=harness.source(tasks=harness.flow.fenced.persistence))
+    harness.controller(source=harness.source(tasks=harness.flow.fenced.task_store))
 
 
 # ------------------------------------------------------- the controller still authorizes
@@ -1041,6 +1220,21 @@ TAMPERS: list[tuple[str, dict[str, Any], str]] = [
     ("resource", {"tasks": [_task_dict(resource_keys=["repo:x"])]}, "resource_not_allowed"),
     ("dup_deps", {"tasks": _two(dependencies=["a", "a"])}, "record_not_canonical"),
     ("extra", {"tasks": [_task_dict(worker_id="root")]}, "record_invalid"),
+    ("long_capability", {"tasks": [_task_dict(capabilities=["c" * 101])]}, "record_invalid"),
+    ("long_resource", {"tasks": [_task_dict(resource_keys=["r" * 201])]}, "record_invalid"),
+    ("long_dependency", {"tasks": [_task_dict(dependencies=["d" * 201])]}, "record_invalid"),
+    ("long_criterion", {"tasks": [_task_dict(acceptance_criteria=["x" * 501])]}, "record_invalid"),
+    ("empty_criterion", {"tasks": [_task_dict(acceptance_criteria=[""])]}, "record_invalid"),
+    ("bad_label", {"tasks": [_task_dict(capabilities=["has space"])]}, "record_invalid"),
+    ("wrong_type", {"tasks": [_task_dict(name=7)]}, "record_invalid"),
+    ("not_a_task", {"tasks": ["oops"]}, "record_invalid"),
+    (
+        "unsorted",
+        {"tasks": [_task_dict(capabilities=["logs.read", "a.b"])]},
+        "record_not_canonical",
+    ),
+    ("task_bytes", {"tasks": [_task_dict(acceptance_criteria=["é" * 500] * 10)]}, "task_too_large"),
+    ("record_bytes", {"mutate": lambda r: r.update(padding="p" * 130_000)}, "record_too_large"),
     ("version", {"mutate": lambda r: r.update(version=2)}, "record_invalid"),
     ("shape", {"record": "not a record"}, "record_invalid"),
     ("missing", {"record": None}, "record_missing"),

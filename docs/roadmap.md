@@ -544,7 +544,11 @@ Each defect was reproduced with a failing test before its fix.
       unchanged. Verified by deterministic SQLite-backed tests and mutation checks; no external
       model was run. Reproduced and fixed on the way (failing test first): `TaskScheduler.run`
       could return while a concurrent task's final save was in flight, so a store re-read saw a
-      stale row; it now drains active workers before returning.
+      stale row; it now drains active workers before returning. Audit R1 corrections: the
+      controller refuses a durable proposal source that does not read its own authoritative
+      fenced database, run manager and workspace (a source over another store fed delegation
+      content in a reproduction), Lead workers unread by the source and configuration
+      mismatches; every proposal element is length-bounded on staging and on read.
 - Not done: bounded cross-cycle handoff over existing stores (PR-C3), reviewer approval and team acceptance
   (M6.3.4). There is no atomic reservation of delegation quotas: delegation at the cycle
   boundary is safe only because the run lease holder alone writes the run's tasks (enforced by
