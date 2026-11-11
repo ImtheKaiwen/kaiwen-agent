@@ -35,6 +35,7 @@ from kaiwen_agent.artifacts import (
 from kaiwen_agent.context_engine import ContextBuildRequest, ContextItem, ContextKind
 from kaiwen_agent.runtime import RuntimeIdentity, RuntimeRunRecord, WorkspaceBinding
 from kaiwen_agent.tasks import AgentTask, TaskRunQuery, TaskStatus, TaskStore
+from kaiwen_agent.tasks.fenced import FencedTaskStore
 from kaiwen_agent.workflow.compiler import compiled_task_id
 from kaiwen_agent.workflow.run_tasks import RunTaskScanError, belongs_to_run, scan_run_tasks
 
@@ -266,6 +267,13 @@ class TaskContextAssembler:
     ) -> None:
         if not 1 <= max_handoffs <= 20:
             raise ValueError("max_handoffs must be between 1 and 20")
+        if cross_cycle is not None and not _same_authority(cross_cycle.tasks, store):
+            # Earlier-cycle content decides what a task is told, so it must come from the
+            # task store this assembler (and so the worker) reads and writes, not from
+            # another object that merely satisfies the protocol and returns matching ids.
+            raise ValueError(
+                "Cross-cycle handoffs must read the assembler's own authoritative task store"
+            )
         self.cross_cycle = cross_cycle
         self.store = store
         self.artifacts = artifacts
@@ -426,13 +434,18 @@ class TaskContextAssembler:
                 or row.delegation_depth != parent.delegation_depth
             ):
                 continue
-            if _identified_cycle(row, run) != parent_cycle:
-                # Claims to be a sibling but its id is not derived from that cycle (or its
-                # metadata is malformed): a forged or corrupted row is never a source.
+            row_cycle = _identified_cycle(row, run)
+            if row_cycle is None:
+                # Sits where a sibling would, but its cycle and logical id are not proven by its
+                # id (forged or corrupted): the host cannot trust the selection.
                 rejected += 1
                 continue
+            if row_cycle != parent_cycle:
+                continue  # a valid task of another delegation round: not a source, not rejected
             if row.status is TaskStatus.COMPLETED:
                 cohort.append(row)
+        if rejected:
+            return unavailable("source_identity_invalid", rejected)
         ordered: list[tuple[AgentTask, Literal["parent", "cohort", "grandparent"]]] = [
             (parent, "parent"),
             *((row, "cohort") for row in sorted(cohort, key=lambda item: item.id)),
@@ -440,11 +453,14 @@ class TaskContextAssembler:
         if grandparent is not None and grandparent.status is TaskStatus.COMPLETED:
             ordered.append((grandparent, "grandparent"))
         selected = ordered[: config.max_sources]
+        # A selected source whose output record is missing or not a mapping cannot be handed
+        # off. Showing the others as the set would misreport it, so nothing is shown. (A valid
+        # empty record is a valid handoff; a dropped reference is counted, not a missing source.)
+        missing = sum(1 for source, _ in selected if not isinstance(source.output, dict))
+        if missing:
+            return unavailable("source_output_missing", missing)
         handoffs: list[TaskHandoff] = []
         for source, relation in selected:
-            if not isinstance(source.output, dict):
-                rejected += 1
-                continue
             handoff = await self._handoff(source, run)
             handoffs.append(
                 handoff.model_copy(
@@ -465,7 +481,7 @@ class TaskContextAssembler:
             reason="source_bound" if omitted else None,
             selected=len(handoffs),
             omitted=omitted,
-            rejected=rejected,
+            rejected=0,
         )
         return tuple(handoffs), summary
 
@@ -572,6 +588,27 @@ class TaskContextAssembler:
             and payload.get("origin") in self.trusted_evidence_origins
             and payload.get("run_id") == run.id
         )
+
+
+def _same_authority(source: object, store: object) -> bool:
+    """Whether `source` is the very store the assembler reads, or its fenced wrapper.
+
+    Identity only: a matching protocol, ids or attribute never counts. The one accepted relation
+    besides `is` is the platform's own `FencedTaskStore`, which wraps exactly one persistence
+    object: it and that object (or two wrappers of it) are the same authoritative storage.
+    """
+
+    if source is store:
+        return True
+    if isinstance(source, FencedTaskStore) and source.persistence is store:
+        return True
+    if isinstance(store, FencedTaskStore) and store.persistence is source:
+        return True
+    return (
+        isinstance(source, FencedTaskStore)
+        and isinstance(store, FencedTaskStore)
+        and source.persistence is store.persistence
+    )
 
 
 def _identified_cycle(task: AgentTask | None, run: RuntimeRunRecord) -> int | None:

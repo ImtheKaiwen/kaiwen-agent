@@ -12,7 +12,12 @@
   evidence references are re-verified with the existing rules. `TaskContextPackage` gains a
   `cross_cycle` summary (`complete`, `truncated`, `unavailable` with a stable reason,
   `not_applicable`); no graph edge, table, transcript, permission or capability is added, and the
-  default behavior is unchanged.
+  default behavior is unchanged. Audit R1: the cross-cycle source must be the assembler's own
+  task store (or the `FencedTaskStore` wrapping it), refused at construction in both the
+  assembler and `AgentRuntimeWorker`; a selected source without an output record, or an
+  unprovable row in the lineage position, now makes the summary `unavailable`
+  (`source_output_missing`, `source_identity_invalid`) instead of `complete`, and a valid task of
+  another delegation round is no longer counted as rejected.
 - Add model-facing Lead tools and durable delegation proposals (M6.3.3-C2, ADR 0015): registered
   `lead.view` (bounded, paginated Lead coordination view) and `lead.propose_task` tools built by
   `LeadTools` over host `LeadToolConfig` role bindings; `AgentRuntimeWorker(lead=...)` allocates a

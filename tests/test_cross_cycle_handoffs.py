@@ -41,9 +41,28 @@ from tests.test_agent_runtime_worker import (
     owner,
     run_async,
 )
+from tests.test_agent_runtime_worker import (
+    Provider as SimpleProvider,
+)
 from tests.test_workflow_fresh_evidence import SIGNER
 
 ROLES = {"coder": "coder", "lead": "lead", "tester": "tester", "lead2": "lead2"}
+
+
+class Proxy:
+    """A trusted test composition: one object that IS the assembler's task store and also
+    controls `list_run_tasks`. Everything else is forwarded to the real store, so the production
+    rule (the cross-cycle source must be the assembler's own store) holds while a misbehaving
+    listing can still be injected."""
+
+    def __init__(self, real: Any) -> None:
+        self._real = real
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
+
+    async def list_run_tasks(self, **options: Any) -> Any:
+        return await self._real.list_run_tasks(**options)
 
 
 class Env:
@@ -140,6 +159,9 @@ class Env:
         return {"lead": lead, "plan2": plan2, "code": code, "test": test}
 
     async def package(self, task: AgentTask, run: RuntimeRunRecord, **options: Any) -> Any:
+        config = options.get("config")
+        if config is not None and isinstance(config.tasks, Proxy):
+            options.setdefault("store", config.tasks)  # the proxy is the store, as required
         return await self.assembler(**options).assemble(
             task, run=run, identity=owner(), role="tester"
         )
@@ -399,8 +421,236 @@ def test_a_sibling_whose_cycle_claim_its_id_does_not_prove_is_rejected_and_count
         await env.seed(run, 1, "ghost", parent=tasks["lead"], meta_cycle=2)  # claims cycle 2
         await env.seed(run, 2, "later", parent=tasks["lead"], meta_cycle=3)  # claims cycle 3
         package = await env.package(tasks["test"], run)
-        assert "ghost" not in logicals(package) and "later" not in logicals(package)
-        assert package.cross_cycle.rejected == 2 and package.cross_cycle.status == "complete"
+        # Unprovable rows sit where siblings would: the selection cannot be trusted, so nothing
+        # is shown and the reason is explicit (never "complete" with a silent gap).
+        assert package.cross_cycle.status == "unavailable" and package.handoffs == ()
+        assert package.cross_cycle.reason == "source_identity_invalid"
+        assert package.cross_cycle.rejected == 2
+
+    run_async(scenario)
+
+
+# ------------------------------------------------ the source must be the authoritative store
+
+
+def test_a_cross_cycle_source_that_is_not_the_assemblers_store_is_refused(tmp_path: Path) -> None:
+    """Red first: a different store with matching ids and owner fields used to be accepted."""
+
+    async def scenario() -> None:
+        env = Env(tmp_path)
+        run = await env.new_run()
+        tasks = await env.chain(run)
+
+        class Foreign:
+            """Satisfies `TaskRunQuery` and returns the real ids with different content."""
+
+            async def list_run_tasks(self, **options: Any) -> Any:
+                page = await env.store.list_run_tasks(**options)
+                forged = tuple(
+                    t.model_copy(update={"output": {"summary": "FORGED"}}) for t in page.tasks
+                )
+                return TaskRunPage(tasks=forged, next_after_id=page.next_after_id)
+
+        config = CrossCycleHandoffs(tasks=Foreign(), roles=ROLES)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="authoritative task store"):
+            TaskContextAssembler(store=env.store, artifacts=env.artifacts, cross_cycle=config)
+        del tasks, run
+
+    run_async(scenario)
+
+
+def test_the_same_database_opened_twice_or_an_equal_path_is_not_the_same_authority(
+    tmp_path: Path,
+) -> None:
+    env = Env(tmp_path)
+    second_handle = SQLitePersistence(tmp_path / "flow.sqlite3")  # same file, another object
+    config = CrossCycleHandoffs(tasks=second_handle, roles=ROLES)
+    with pytest.raises(ValueError, match="authoritative task store"):
+        TaskContextAssembler(store=env.store, cross_cycle=config)
+
+
+def test_the_assemblers_own_store_and_its_fenced_wrapper_are_accepted(tmp_path: Path) -> None:
+    from kaiwen_agent.tasks.fenced import FencedTaskStore
+
+    env = Env(tmp_path)
+    fenced = FencedTaskStore(env.store)
+    other_wrapper = FencedTaskStore(env.store)
+    unrelated = FencedTaskStore(SQLitePersistence(tmp_path / "other.sqlite3"))
+    for store, source in (
+        (env.store, env.store),
+        (env.store, fenced),
+        (fenced, env.store),
+        (fenced, other_wrapper),
+    ):
+        TaskContextAssembler(store=store, cross_cycle=CrossCycleHandoffs(tasks=source))
+    for store, source in ((env.store, unrelated), (fenced, unrelated), (unrelated, env.store)):
+        with pytest.raises(ValueError, match="authoritative task store"):
+            TaskContextAssembler(store=store, cross_cycle=CrossCycleHandoffs(tasks=source))
+
+
+def test_a_worker_with_a_foreign_cross_cycle_source_is_refused_before_it_runs(
+    tmp_path: Path,
+) -> None:
+    from kaiwen_agent.workflow import AgentRuntimeWorker, WorkerConfigurationError
+
+    env = Env(tmp_path)
+    foreign = SQLitePersistence(tmp_path / "foreign.sqlite3")
+    runtime = env.flow.runtime(SimpleProvider(), permissions=frozenset())
+    common: dict[str, Any] = {
+        "runtime": runtime,
+        "runs": env.runs,
+        "role": "tester",
+        "permissions": frozenset(),
+    }
+    with pytest.raises(WorkerConfigurationError, match="authoritative task store"):
+        AgentRuntimeWorker(
+            **common, task_store=env.store, cross_cycle=CrossCycleHandoffs(tasks=foreign)
+        )
+    AgentRuntimeWorker(  # the control: the same store composes
+        **common, task_store=env.store, cross_cycle=CrossCycleHandoffs(tasks=env.store)
+    )
+    AgentRuntimeWorker(**common, task_store=env.store)  # legacy: no cross-cycle at all
+
+
+# ---------------------------------------------------- precise complete / truncated / unavailable
+#
+# complete    every completed source the selection rule names is included, none is left out.
+# truncated   completed sources were left out only because of `max_sources`; each one included
+#             is a valid handoff.
+# unavailable the host cannot trust the selection (lineage, inventory, workspace, a selected source
+#             without a usable output record, an unprovable row in the lineage position): no
+#             earlier-cycle handoff is shown at all, with a stable reason.
+# A dropped artifact or evidence reference is not a missing source: the handoff is included and
+# counts the claim as unverified.
+
+
+async def lineage_for_output(
+    env: Env, run: RuntimeRunRecord, *, parent_output: Any = ...
+) -> AgentTask:
+    lead = await env.seed(run, 1, "lead", agent="lead")
+    plan = await env.seed(run, 2, "plan2", parent=lead, agent="lead2", output=parent_output)
+    await env.seed(run, 2, "peer", parent=lead)
+    return await env.seed(run, 3, "test", parent=plan, status=TaskStatus.PENDING, agent="tester")
+
+
+# `AgentTask.output` is validated as a mapping or None, so a record that is not a mapping cannot
+# reach the assembler; a corrupted stored row is reported by the inventory (`unreadable`) instead.
+@pytest.mark.parametrize("missing", [None])
+def test_a_selected_parent_without_a_usable_output_is_unavailable_not_complete(
+    tmp_path: Path, missing: Any
+) -> None:
+    async def scenario() -> None:
+        env = Env(tmp_path)
+        run = await env.new_run()
+        test = await lineage_for_output(env, run, parent_output=missing)
+        package = await env.package(test, run)
+        assert package.cross_cycle.status == "unavailable"
+        assert package.cross_cycle.reason == "source_output_missing"
+        assert package.handoffs == ()  # no partial set is shown beside a missing one
+        assert package.cross_cycle.rejected == 1
+        assert any("source_output_missing" in item for item in package.blockers)
+        assert package.grants_authority is False  # informational: the task still runs
+
+    run_async(scenario)
+
+
+@pytest.mark.parametrize("missing", [None])
+def test_a_selected_sibling_without_a_usable_output_makes_the_whole_result_unavailable(
+    tmp_path: Path, missing: Any
+) -> None:
+    async def scenario() -> None:
+        env = Env(tmp_path)
+        run = await env.new_run()
+        lead = await env.seed(run, 1, "lead", agent="lead")
+        plan = await env.seed(run, 2, "plan2", parent=lead, agent="lead2")
+        await env.seed(run, 2, "good", parent=lead)
+        await env.seed(run, 2, "bad", parent=lead, output=missing)
+        test = await env.seed(run, 3, "test", parent=plan, status=TaskStatus.PENDING)
+        package = await env.package(test, run)
+        assert package.cross_cycle.status == "unavailable"
+        assert package.cross_cycle.reason == "source_output_missing"
+        assert package.handoffs == ()  # the valid parent and sibling are not shown as the set
+
+    run_async(scenario)
+
+
+def test_one_unavailable_source_among_many_beats_truncation(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        env = Env(tmp_path)
+        run = await env.new_run()
+        lead = await env.seed(run, 1, "lead", agent="lead")
+        plan = await env.seed(run, 2, "plan2", parent=lead, agent="lead2")
+        peers = [await env.seed(run, 2, f"peer{index}", parent=lead) for index in range(5)]
+        first = min(peers, key=lambda item: item.id)  # sorts first, so it is selected
+        await env.store.save_task(first.model_copy(update={"output": None}))
+        test = await env.seed(run, 3, "test", parent=plan, status=TaskStatus.PENDING)
+        config = CrossCycleHandoffs(tasks=env.store, roles=ROLES, max_sources=3)
+        package = await env.package(test, run, config=config)
+        assert package.cross_cycle.status == "unavailable" and package.handoffs == ()
+        assert package.cross_cycle.reason == "source_output_missing"
+
+    run_async(scenario)
+
+
+def test_a_source_left_out_by_the_bound_is_not_read_so_it_only_truncates(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        env = Env(tmp_path)
+        run = await env.new_run()
+        lead = await env.seed(run, 1, "lead", agent="lead")
+        plan = await env.seed(run, 2, "plan2", parent=lead, agent="lead2")
+        peers = [await env.seed(run, 2, f"peer{index}", parent=lead) for index in range(4)]
+        last = max(peers, key=lambda item: item.id)  # sorts last, so it is left out
+        await env.store.save_task(last.model_copy(update={"output": None}))
+        test = await env.seed(run, 3, "test", parent=plan, status=TaskStatus.PENDING)
+        config = CrossCycleHandoffs(tasks=env.store, roles=ROLES, max_sources=3)
+        package = await env.package(test, run, config=config)
+        assert package.cross_cycle.status == "truncated" and len(package.handoffs) == 3
+        assert package.cross_cycle.omitted == 3 and package.cross_cycle.rejected == 0
+
+    run_async(scenario)
+
+
+def test_a_missing_artifact_is_a_rejected_reference_not_a_missing_source(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        env = Env(tmp_path)
+        run = await env.new_run()
+        output = {"summary": "built it", "artifact_refs": ["artifact_gone"], "evidence_refs": ["e"]}
+        test = await lineage_for_output(env, run, parent_output=output)
+        package = await env.package(test, run)
+        assert package.cross_cycle.status == "complete" and package.cross_cycle.rejected == 0
+        parent = package.handoffs[0]
+        assert parent.artifact_refs == () and parent.unverified_reference_count == 2
+        assert parent.summary == "built it"
+
+    run_async(scenario)
+
+
+@pytest.mark.parametrize(
+    "empty", [{}, {"summary": "", "artifact_refs": []}, {"summary": 5}, {"artifact_refs": None}]
+)
+def test_a_valid_empty_output_is_a_complete_handoff(tmp_path: Path, empty: dict[str, Any]) -> None:
+    async def scenario() -> None:
+        env = Env(tmp_path)
+        run = await env.new_run()
+        test = await lineage_for_output(env, run, parent_output=empty)
+        package = await env.package(test, run)
+        assert package.cross_cycle.status == "complete" and package.cross_cycle.rejected == 0
+        assert [h.logical_task_id for h in package.handoffs][0] == "plan2"
+        assert package.handoffs[0].artifact_refs == () and package.handoffs[0].summary == ""
+
+    run_async(scenario)
+
+
+def test_a_valid_task_of_another_cycle_is_not_a_rejected_sibling(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        env = Env(tmp_path)
+        run = await env.new_run()
+        tasks = await env.chain(run)
+        # Another delegation round of the same parent, in a later cycle: legitimate, not a source.
+        await env.seed(run, 4, "round2", parent=tasks["lead"])
+        package = await env.package(tasks["test"], run)
+        assert logicals(package) == ["plan2", "code", "lead"]
+        assert package.cross_cycle.status == "complete" and package.cross_cycle.rejected == 0
 
     run_async(scenario)
 
@@ -416,11 +666,14 @@ def test_only_completed_sources_are_included(tmp_path: Path) -> None:
             ("cancelled", TaskStatus.CANCELLED),
         ):
             await env.seed(run, 2, name, parent=tasks["lead"], status=status)
+        package = await env.package(tasks["test"], run)
+        # Failed, running and cancelled siblings are not sources; the rest is still complete.
+        assert logicals(package) == ["plan2", "code", "lead"]
+        assert package.cross_cycle.status == "complete" and package.cross_cycle.rejected == 0
         # A completed task with no output record is a corrupted source, not an empty handoff.
         await env.seed(run, 2, "no_output", parent=tasks["lead"], output=None)
-        package = await env.package(tasks["test"], run)
-        assert logicals(package) == ["plan2", "code", "lead"]
-        assert package.cross_cycle.rejected == 1
+        broken = await env.package(tasks["test"], run)
+        assert broken.cross_cycle.reason == "source_output_missing" and broken.handoffs == ()
 
     run_async(scenario)
 
@@ -462,10 +715,11 @@ def test_workspace_binding_must_match_the_run(tmp_path: Path) -> None:
 # -------------------------------------------------------------- store behavior and failures
 
 
-class BrokenListing:
-    """A `TaskRunQuery` whose answer is a failure or violates the contract."""
+class BrokenListing(Proxy):
+    """The assembler's store, whose listing is a failure or violates the contract."""
 
-    def __init__(self, behavior: str) -> None:
+    def __init__(self, real: Any, behavior: str) -> None:
+        super().__init__(real)
         self.behavior = behavior
 
     async def list_run_tasks(self, **options: Any) -> Any:
@@ -491,7 +745,7 @@ def test_a_failing_or_contract_violating_inventory_is_unavailable_and_sanitized(
         env = Env(tmp_path)
         run = await env.new_run()
         tasks = await env.chain(run)
-        config = CrossCycleHandoffs(tasks=BrokenListing(behavior), roles=ROLES)  # type: ignore[arg-type]
+        config = CrossCycleHandoffs(tasks=BrokenListing(env.store, behavior), roles=ROLES)
         package = await env.package(tasks["test"], run, config=config)
         assert package.cross_cycle.status == "unavailable" and package.cross_cycle.reason == reason
         assert package.handoffs == ()
@@ -509,11 +763,11 @@ def test_a_row_of_another_session_or_a_duplicated_row_makes_the_inventory_untrus
         tasks = await env.chain(run)
 
         def listing(mutate: Callable[[TaskRunPage], TaskRunPage]) -> Any:
-            class Tampered:
+            class Tampered(Proxy):
                 async def list_run_tasks(self, **options: Any) -> Any:
-                    return mutate(await env.store.list_run_tasks(**options))
+                    return mutate(await self._real.list_run_tasks(**options))
 
-            return Tampered()
+            return Tampered(env.store)
 
         def foreign_session(page: TaskRunPage) -> TaskRunPage:
             extra = page.tasks[-1].model_copy(update={"session_id": "someone-elses-session"})
@@ -543,14 +797,14 @@ def test_output_changed_while_assembling_is_read_as_scanned_not_mixed(tmp_path: 
         listed = asyncio.Event()
         release = asyncio.Event()
 
-        class Gated:
+        class Gated(Proxy):
             async def list_run_tasks(self, **options: Any) -> Any:
-                page = await env.store.list_run_tasks(**options)
+                page = await self._real.list_run_tasks(**options)
                 listed.set()
                 await release.wait()  # held open: the writer below runs after the listing
                 return page
 
-        config = CrossCycleHandoffs(tasks=Gated(), roles=ROLES)  # type: ignore[arg-type]
+        config = CrossCycleHandoffs(tasks=Gated(env.store), roles=ROLES)
         running = asyncio.create_task(env.package(tasks["test"], run, config=config))
         await asyncio.wait_for(listed.wait(), timeout=10)
         changed = tasks["code"].model_copy(
@@ -595,12 +849,12 @@ def test_cancellation_while_the_inventory_is_read_propagates(tmp_path: Path) -> 
         tasks = await env.chain(run)
         entered = asyncio.Event()
 
-        class Hung:
+        class Hung(Proxy):
             async def list_run_tasks(self, **options: Any) -> Any:
                 entered.set()
                 await asyncio.Event().wait()
 
-        config = CrossCycleHandoffs(tasks=Hung(), roles=ROLES)  # type: ignore[arg-type]
+        config = CrossCycleHandoffs(tasks=Hung(env.store), roles=ROLES)
         running = asyncio.create_task(env.package(tasks["test"], run, config=config))
         await asyncio.wait_for(entered.wait(), timeout=10)
         running.cancel()
@@ -820,7 +1074,7 @@ def test_a_missing_inventory_source_does_not_affect_unrelated_legacy_workflows(
         env = Env(tmp_path)
         run = await env.new_run()
         plain = await env.seed(run, 1, "plain", status=TaskStatus.PENDING)
-        config = CrossCycleHandoffs(tasks=BrokenListing("raise"), roles=ROLES)  # type: ignore[arg-type]
+        config = CrossCycleHandoffs(tasks=BrokenListing(env.store, "raise"), roles=ROLES)
         package = await env.package(plain, run, config=config)  # no lineage: never even listed
         assert package.cross_cycle.status == "not_applicable" and package.blockers == ()
 

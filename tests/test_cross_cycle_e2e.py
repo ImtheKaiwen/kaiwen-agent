@@ -35,11 +35,12 @@ from kaiwen_agent.realtime import (
     InMemoryConversationStore,
 )
 from kaiwen_agent.standards import StandardResolution
-from kaiwen_agent.tasks import AgentTask, TaskStatus
+from kaiwen_agent.tasks import AgentTask, TaskRunPage, TaskStatus
 from kaiwen_agent.tools.durability import ActionIntentStatus
 from kaiwen_agent.types import ModelResponse, ToolCall
 from kaiwen_agent.workers import FunctionWorker
 from kaiwen_agent.workflow import (
+    AgentRuntimeWorker,
     CrossCycleHandoffs,
     DelegationAuthority,
     DurableLeadProposalSource,
@@ -47,6 +48,7 @@ from kaiwen_agent.workflow import (
     LeadToolConfig,
     LeadTools,
     LeadViewAssembler,
+    WorkerConfigurationError,
     WorkflowCompiler,
     WorkflowController,
     WorkflowDelegation,
@@ -57,6 +59,7 @@ from kaiwen_agent.workflow import (
 from tests.test_agent_runtime_worker import _artifact_context, _evidence, owner
 from tests.test_agent_runtime_worker import plan as make_plan
 from tests.test_agent_runtime_worker import spec as lead_spec
+from tests.test_cross_cycle_handoffs import Proxy
 from tests.test_durable_action_scope import legacy_intent
 from tests.test_fenced_writes import FencedFlow
 from tests.test_lead_tools import (
@@ -120,6 +123,7 @@ class ChainHarness:
         scripts: dict[str, list[Any]] | None = None,
         cross_cycle: bool = True,
         query_wrapper: Any = None,
+        foreign_source: Any = None,
     ) -> None:
         self.flow = FencedFlow(tmp_path)
         self.gate = SpyGate()
@@ -150,22 +154,33 @@ class ChainHarness:
                 allowed_capabilities=caps,
                 lead=self.tools,
             )
+        # A trusted composition: a wrapper is both the worker's task store and the cross-cycle
+        # source (one object). Without one, the worker reads the persistence and the cross-cycle
+        # source is its fenced wrapper, which the assembler accepts as the same authority.
         queries: Any = self.flow.fenced.task_store
+        worker_store: Any = self.flow.store
         if query_wrapper is not None:
             queries = query_wrapper(queries)
+            worker_store = queries
+        if foreign_source is not None:
+            queries = foreign_source(queries)  # a different object than the worker's store
         self.cross = CrossCycleHandoffs(
             tasks=queries,
             roles={"lead": "lead", "lead2": "lead2", "coder": "coder", "tester": "tester"},
         )
-        self.flow.worker(
-            "tester",
-            self.flow.runtime(self.provider, permissions=frozenset()),
+        self.tester = AgentRuntimeWorker(
+            runtime=self.flow.runtime(self.provider, permissions=frozenset()),
+            runs=self.flow.runs,
+            task_store=worker_store,
+            role="tester",
             permissions=frozenset(),
             artifacts=self.artifacts,
             evidence_signer=SIGNER,
             conversations=self.conversations,
             cross_cycle=self.cross if cross_cycle else None,
         )
+        self.flow.workers.register("tester", self.tester)
+        self.flow.registered.add("tester")
 
         async def code(task: AgentTask, context: Any) -> dict[str, Any]:
             self.ran.append(str(task.metadata["logical_task_id"]))
@@ -316,6 +331,30 @@ def test_a_tester_in_cycle_three_receives_bounded_provenance_from_earlier_cycles
     run_async(scenario)
 
 
+def test_a_foreign_cross_cycle_source_cannot_feed_the_real_flow(tmp_path: Path) -> None:
+    """Red first. Before the fix this exact composition ran: the run completed and the tester's
+    prompt contained the forged summary (observed: completed, forged text present, real absent)."""
+
+    def foreign(real: Any) -> Any:
+        class Forging:
+            async def list_run_tasks(self, **options: Any) -> Any:
+                page = await real.list_run_tasks(**options)
+                rows = tuple(
+                    t.model_copy(update={"output": {**(t.output or {}), "summary": "FORGED"}})
+                    if t.metadata.get("logical_task_id") == "code"
+                    else t
+                    for t in page.tasks
+                )
+                return TaskRunPage(
+                    tasks=rows, next_after_id=page.next_after_id, unreadable=page.unreadable
+                )
+
+        return Forging()
+
+    with pytest.raises(WorkerConfigurationError, match="authoritative task store"):
+        ChainHarness(tmp_path, foreign_source=foreign)
+
+
 def test_the_gate_still_refuses_even_with_authentic_handoffs(tmp_path: Path) -> None:
     async def scenario() -> None:
         harness = ChainHarness(tmp_path)
@@ -392,7 +431,7 @@ def test_a_lease_lost_while_the_context_is_assembled_commits_nothing(tmp_path: P
         harness: ChainHarness | None = None
 
         def wrap(queries: Any) -> Any:
-            class Expiring:
+            class Expiring(Proxy):
                 async def list_run_tasks(self, **options: Any) -> Any:
                     page = await queries.list_run_tasks(**options)
                     if any(t.metadata.get("logical_task_id") == "plan2" for t in page.tasks):
@@ -400,7 +439,7 @@ def test_a_lease_lost_while_the_context_is_assembled_commits_nothing(tmp_path: P
                         harness.flow.clock.advance(3600)  # the lease expires mid-assembly
                     return page
 
-            return Expiring()
+            return Expiring(queries)
 
         harness = ChainHarness(tmp_path, query_wrapper=wrap)
         run = await harness.flow.new_run()
@@ -418,7 +457,7 @@ def test_cancelling_the_run_while_the_inventory_is_read_completes_nothing(tmp_pa
         entered = asyncio.Event()
 
         def wrap(queries: Any) -> Any:
-            class Hanging:
+            class Hanging(Proxy):
                 async def list_run_tasks(self, **options: Any) -> Any:
                     page = await queries.list_run_tasks(**options)
                     if any(t.metadata.get("logical_task_id") == "plan2" for t in page.tasks):
@@ -426,7 +465,7 @@ def test_cancelling_the_run_while_the_inventory_is_read_completes_nothing(tmp_pa
                         await asyncio.Event().wait()
                     return page
 
-            return Hanging()
+            return Hanging(queries)
 
         harness = ChainHarness(tmp_path, query_wrapper=wrap)
         run = await harness.flow.new_run()
@@ -447,11 +486,11 @@ def test_a_failing_inventory_does_not_fail_the_task_it_is_reported_as_unavailabl
 ) -> None:
     async def scenario() -> None:
         def wrap(queries: Any) -> Any:
-            class Failing:
+            class Failing(Proxy):
                 async def list_run_tasks(self, **options: Any) -> Any:
                     raise RuntimeError("sqlite://user:secret@host/db")
 
-            return Failing()
+            return Failing(queries)
 
         harness = ChainHarness(tmp_path, query_wrapper=wrap)
         run = await harness.flow.new_run()

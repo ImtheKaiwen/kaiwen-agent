@@ -203,13 +203,16 @@ class AgentRuntimeWorker:
         self.services = dict(services or {})
         self.context_budget = context_budget or ContextBudget()
         self.max_summary_chars = max_summary_chars
-        self.assembler = TaskContextAssembler(
-            store=task_store,
-            artifacts=artifacts,
-            fingerprints=fingerprints,
-            cross_cycle=cross_cycle,
-            evidence_signer=workspace_signer or evidence_signer,
-        )
+        try:
+            self.assembler = TaskContextAssembler(
+                store=task_store,
+                artifacts=artifacts,
+                fingerprints=fingerprints,
+                cross_cycle=cross_cycle,
+                evidence_signer=workspace_signer or evidence_signer,
+            )
+        except ValueError as error:  # e.g. cross-cycle reads another task store
+            raise WorkerConfigurationError(str(error)) from error
 
     async def execute(self, task: AgentTask, context: TaskExecutionContext) -> dict[str, Any]:
         if not task.capabilities <= self.allowed_capabilities:

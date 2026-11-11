@@ -561,6 +561,10 @@ Each defect was reproduced with a failing test before its fix.
       Anything the host cannot establish is reported as `unavailable` with a stable reason. No
       graph edge, table, transcript, permission or capability is added. Verified by a real
       three-cycle SQLite flow, adversarial tests and mutation checks; no external model was run.
+      Audit R1 corrections: the source must be the assembler's own authoritative task store
+      (a protocol-conforming foreign store with matching ids fed forged handoffs in a
+      reproduction), and a missing selected output or an unprovable lineage row makes the
+      result `unavailable` rather than `complete`.
 - Not done: reviewer approval and team acceptance
   (M6.3.4). There is no atomic reservation of delegation quotas: delegation at the cycle
   boundary is safe only because the run lease holder alone writes the run's tasks (enforced by

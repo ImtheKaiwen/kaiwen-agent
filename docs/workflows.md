@@ -215,7 +215,12 @@ expected_workspace=..., max_sources=4, max_scan_tasks=200))`, or `AgentRuntimeWo
 cross_cycle=...)` (with `evidence_signer=` when there is no authorized workspace to supply it). The
 store must have the optional `TaskRunQuery` capability (the fenced SQLite store does); an in-memory
 or custom store without it is refused at construction, and `max_sources` (1 to 10) and
-`max_scan_tasks` (1 to 500) are validated.
+`max_scan_tasks` (1 to 500) are validated. The source must also be the assembler's own
+authoritative task store: the same object, or the platform's `FencedTaskStore` and the one
+persistence it wraps. Matching ids, protocol conformance, a path or a capability flag never
+count, and another handle on the same file is another object. Both `TaskContextAssembler` and
+`AgentRuntimeWorker` (as `WorkerConfigurationError`) refuse anything else at construction, before
+any earlier-cycle content can be read.
 
 Eligible sources. Only a task with delegation lineage (a compiler-written `parent_id` and a depth of
 at least one) receives anything; other tasks, and workflows without the option, are unchanged. The
@@ -233,12 +238,19 @@ Provenance. Each handoff is a `TaskHandoff` marked `origin="prior_cycle"` with t
 logical id, cycle, worker id (from the stored task), `relation` (`parent`, `cohort`,
 `grandparent`) and the role the host maps to that worker (never the role the task claims). The
 summary is clipped, model-authored and rendered under an "untrusted data" header; blockers are
-carried; follow-up suggestions of an earlier cycle are not. The package's `cross_cycle` summary says
-`complete`, `truncated` (with the number left out), `unavailable` (with a stable reason:
-`inventory_incomplete`, `inventory_unavailable`, `inventory_invalid`, `parent_not_found`,
-`parent_not_earlier`, `parent_not_completed`, `lineage_broken`, `lineage_incomplete`,
-`task_identity_invalid`, `workspace_mismatch`) or `not_applicable`, and an unavailable result also
-adds a blocker line, so a missing or partial history cannot be mistaken for a complete one. The
+carried; follow-up suggestions of an earlier cycle are not. The package's `cross_cycle` summary says:
+`complete` (every completed source the rule names is included and none is left out);
+`truncated` (completed sources were left out only by `max_sources`, with the number left out,
+and every included source is a valid handoff); `unavailable` (the host cannot trust the
+selection, so no earlier-cycle handoff is shown at all; stable reasons: `inventory_incomplete`,
+`inventory_unavailable`, `inventory_invalid`, `parent_not_found`, `parent_not_earlier`,
+`parent_not_completed`, `lineage_broken`, `lineage_incomplete`, `task_identity_invalid`,
+`workspace_mismatch`, `source_identity_invalid` for a row in the lineage position whose cycle
+its id does not prove, and `source_output_missing` for a selected completed source without an
+output record); or `not_applicable`. A selected source with no output record never leaves a
+partial set marked complete. A valid empty record is a valid handoff, a valid task of another
+delegation round is simply not a source, and a dropped artifact or evidence reference is counted
+as unverified without making the source missing. An unavailable result also adds a blocker line, so a missing or partial history cannot be mistaken for a complete one. The
 host never silently picks a partial set: an inventory that is truncated by the scan bound, has
 unreadable or foreign rows or violates the listing contract yields `unavailable`.
 
