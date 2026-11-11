@@ -90,4 +90,6 @@ Implementation boundaries:
 - Workspace verification is still point-in-time and not atomic (ADR 0013). Provider-backed
   evidence proves the state that was hashed, not that no one wrote afterwards.
 - The Lead coordination view, delegation tools, reviewer approval and team acceptance are
-  not implemented here.
+  not implemented here. (Clarification, M6.3.3-C3: earlier-cycle handoffs reuse the same handoff
+  contract and reference checks, selected from the run's stored lineage; private context is
+  still never shared.)

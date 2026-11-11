@@ -127,7 +127,8 @@ guard on arbitrary worker code. Replay is at-least-once: deterministic ids make 
 exactly-once execution, and a tool call re-issued under a new call id without an application
 idempotency key runs again. A restart re-authorizes from scratch (there is no durable cycle
 cursor), and an identical proposal can be denied because the earlier delegated tasks count against
-the per-run limit. Delegated tasks cannot depend on the parent or on earlier cycles (PR-C3).
+the per-run limit. Delegated tasks cannot depend on the parent or on earlier cycles; earlier-cycle
+context reaches them only as informational handoffs (see the last section before Recovery scope).
 
 ## Lead tools and durable proposals (opt-in, M6.3.3-C2)
 
@@ -203,6 +204,62 @@ Lead (at least once, under the same deterministic task ids) and re-authorizes. N
 reserved, no workflow cursor resumes a run, and only a Lead completed in the cycle that just
 ended can be a parent. Records are limited to 50 tasks, 8,000 bytes per task and 128,000 bytes in
 all.
+
+## Earlier-cycle handoffs (opt-in, M6.3.3-C3)
+
+A task compiled in cycle N has no graph edge to an earlier cycle and gets none: the compiler still
+refuses foreign-cycle dependencies. Instead the host can hand it bounded, informational context from
+earlier cycles of the same durable run:
+`TaskContextAssembler(..., cross_cycle=CrossCycleHandoffs(tasks=<TaskRunQuery store>, roles=...,
+expected_workspace=..., max_sources=4, max_scan_tasks=200))`, or `AgentRuntimeWorker(...,
+cross_cycle=...)` (with `evidence_signer=` when there is no authorized workspace to supply it). The
+store must have the optional `TaskRunQuery` capability (the fenced SQLite store does); an in-memory
+or custom store without it is refused at construction, and `max_sources` (1 to 10) and
+`max_scan_tasks` (1 to 500) are validated.
+
+Eligible sources. Only a task with delegation lineage (a compiler-written `parent_id` and a depth of
+at least one) receives anything; other tasks, and workflows without the option, are unchanged. The
+sources, in this order, are: the delegation parent; the other completed tasks of the parent's
+delegation round (same parent, same depth, same cycle) in task-id order; the parent's own parent.
+The list is cut at `max_sources`. Ordering is by task id, never by a timestamp, and the model
+supplies no source id. Every source must belong to the run's tenant, user, session and durable run,
+carry an id the compiler derives from its stored run, cycle and logical id (so forged cycle or
+logical-id metadata is rejected), be in a strictly earlier cycle than the receiver, and be COMPLETED
+with an output record. Lineage must be consistent (depth steps of one, cycles strictly decreasing).
+Failed or unfinished siblings are not sources; a sibling whose cycle claim its id does not prove is
+rejected and counted.
+
+Provenance. Each handoff is a `TaskHandoff` marked `origin="prior_cycle"` with the source task id,
+logical id, cycle, worker id (from the stored task), `relation` (`parent`, `cohort`,
+`grandparent`) and the role the host maps to that worker (never the role the task claims). The
+summary is clipped, model-authored and rendered under an "untrusted data" header; blockers are
+carried; follow-up suggestions of an earlier cycle are not. The package's `cross_cycle` summary says
+`complete`, `truncated` (with the number left out), `unavailable` (with a stable reason:
+`inventory_incomplete`, `inventory_unavailable`, `inventory_invalid`, `parent_not_found`,
+`parent_not_earlier`, `parent_not_completed`, `lineage_broken`, `lineage_incomplete`,
+`task_identity_invalid`, `workspace_mismatch`) or `not_applicable`, and an unavailable result also
+adds a blocker line, so a missing or partial history cannot be mistaken for a complete one. The
+host never silently picks a partial set: an inventory that is truncated by the scan bound, has
+unreadable or foreign rows or violates the listing contract yields `unavailable`.
+
+Verification and budget. Artifact references are re-read through the existing owner- and
+run-scoped `ArtifactManager` rules; evidence references additionally need the existing
+`EvidenceSigner` signature, trusted origin label and a payload naming this run. Dropped claims are
+counted. Authentication is not acceptance: the package says so, shows the host's own current
+fingerprint (never one a task claimed), and only the completion gate decides. Earlier-cycle items
+rank below the required task items and below same-graph dependency handoffs in the existing
+`ContextBuilder` budget. Work is one bounded scan plus the reference checks; there are no
+per-source task lookups.
+
+Guarantees and limits. Read-only: nothing is written, no ownership is taken and a stale owner is
+still stopped by the fenced write that follows, as before. A failing inventory does not fail the
+task: the context is informational and reports itself unavailable, while cancellation is never
+swallowed. The read is point in time, not a snapshot: rows are listed once and artifacts and the
+fingerprint are read afterwards, so a source row changed in between is seen on the next assembly.
+A replay or retry rebuilds the same handoffs from storage (deterministic ids); an artifact store
+that does not survive a restart makes its references drop and be counted. Not provided: cross-run
+sharing, transcripts, a cycle cursor, resume, permissions or capabilities from history, or any
+statement that earlier evidence satisfies a requirement for the current workspace state.
 
 ## Recovery scope
 

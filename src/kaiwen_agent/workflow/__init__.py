@@ -58,6 +58,8 @@ from kaiwen_agent.workflow.models import (
     WorkflowTaskSpec,
 )
 from kaiwen_agent.workflow.task_context import (
+    CrossCycleHandoffs,
+    CrossCycleSummary,
     TaskContextAssembler,
     TaskContextPackage,
     TaskContextSource,
@@ -66,6 +68,8 @@ from kaiwen_agent.workflow.task_context import (
 )
 
 __all__ = [
+    "CrossCycleHandoffs",
+    "CrossCycleSummary",
     "DurableLeadProposalSource",
     "LEAD_PROPOSE_TOOL",
     "LEAD_VIEW_TOOL",

@@ -533,8 +533,9 @@ Each defect was reproduced with a failing test before its fix.
       SQLite-backed tests (restart, ownership loss at exact points, cancellation, bounds, forged
       parents) and mutation checks of the key protections. The audit R2 `xfail` is now a passing
       regression.
-- [~] M6.3.3-C2 model-facing Lead tools and durable delegation proposals (draft pull request,
-      pending independent audit): registered `lead.view` (bounded, paginated `LeadView`) and
+- [x] M6.3.3-C2 model-facing Lead tools and durable delegation proposals (pull request 16,
+      squash commit `371e0b4e36b5539673c99d947d7c402a84a9fe40`, merged after independent
+      audit and its R1 corrections; the post-merge CI run on `main` succeeded): registered `lead.view` (bounded, paginated `LeadView`) and
       `lead.propose_task` tools over a trusted per-execution `LeadToolSession`; proposals are staged
       in an execution-local sink and finalized only by a successful Lead execution into the Lead
       task's own output (`output["delegation_proposals"]`), which the existing scheduler persists
@@ -549,7 +550,18 @@ Each defect was reproduced with a failing test before its fix.
       fenced database, run manager and workspace (a source over another store fed delegation
       content in a reproduction), Lead workers unread by the source and configuration
       mismatches; every proposal element is length-bounded on staging and on read.
-- Not done: bounded cross-cycle handoff over existing stores (PR-C3), reviewer approval and team acceptance
+- [~] M6.3.3-C3 bounded cross-cycle task handoffs (draft pull request, pending independent
+      audit): opt-in `CrossCycleHandoffs` on `TaskContextAssembler` (and
+      `AgentRuntimeWorker(cross_cycle=...)`). A task with a compiler-written delegation parent
+      receives informational handoffs from its parent, the parent's completed delegation-round
+      siblings and the grandparent, selected by the host from one bounded run-scoped scan of the
+      stored tasks (deterministic task-id order, at most `max_sources`), each source proven by
+      its compiler-derived id, run, owner, strictly earlier cycle and COMPLETED status, with
+      artifact and evidence references re-verified by the existing owner/run/signature rules.
+      Anything the host cannot establish is reported as `unavailable` with a stable reason. No
+      graph edge, table, transcript, permission or capability is added. Verified by a real
+      three-cycle SQLite flow, adversarial tests and mutation checks; no external model was run.
+- Not done: reviewer approval and team acceptance
   (M6.3.4). There is no atomic reservation of delegation quotas: delegation at the cycle
   boundary is safe only because the run lease holder alone writes the run's tasks (enforced by
   the fenced write transaction) and the counted quotas are run-scoped; the job path serializes within one delegator instance only.

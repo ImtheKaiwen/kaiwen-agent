@@ -138,6 +138,15 @@ class WorkflowCompiler:
             raise WorkflowPlanError("Runtime identity does not own the workflow run")
 
 
-def _task_id(run_id: str, cycle: int, logical_id: str) -> str:
+def compiled_task_id(run_id: str, cycle: int, logical_id: str) -> str:
+    """The deterministic id the compiler gives a task: a function of run, cycle and logical id.
+
+    Readers use it to check that a stored task's claimed cycle and logical id are the ones its id
+    was derived from, so forged metadata on a row cannot move it to another cycle.
+    """
+
     material = f"{run_id}\x1f{cycle}\x1f{logical_id}"
     return f"task_{sha256(material.encode()).hexdigest()}"
+
+
+_task_id = compiled_task_id

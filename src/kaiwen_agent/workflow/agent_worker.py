@@ -55,6 +55,8 @@ from kaiwen_agent.workflow.lead_tools import (
     LeadToolSession,
 )
 from kaiwen_agent.workflow.task_context import (
+    CrossCycleHandoffs,
+    EvidenceAuthenticator,
     TaskContextAssembler,
     TaskContextSource,
     private_conversation_id,
@@ -110,6 +112,8 @@ class AgentRuntimeWorker:
         context_budget: ContextBudget | None = None,
         max_summary_chars: int = 4_000,
         lead: LeadTools | None = None,
+        cross_cycle: CrossCycleHandoffs | None = None,
+        evidence_signer: EvidenceAuthenticator | None = None,
     ) -> None:
         if not role or not role.strip():
             raise WorkerConfigurationError("A worker needs a role")
@@ -171,6 +175,19 @@ class AgentRuntimeWorker:
             configured = runtime.metadata.get("workspace_id")
             if configured is not None and configured != workspace.binding.workspace_id:
                 raise WorkerConfigurationError("Runtime metadata names a different workspace")
+        workspace_signer = (
+            getattr(getattr(workspace, "pipeline", None), "signer", None)
+            if workspace is not None
+            else None
+        )
+        if (
+            evidence_signer is not None
+            and workspace_signer is not None
+            and evidence_signer is not workspace_signer
+        ):
+            raise WorkerConfigurationError(
+                "The evidence signer differs from the authorized workspace's signer"
+            )
         self.lead = lead
         self.runtime = runtime
         self.runs = runs
@@ -190,11 +207,8 @@ class AgentRuntimeWorker:
             store=task_store,
             artifacts=artifacts,
             fingerprints=fingerprints,
-            evidence_signer=(
-                getattr(getattr(workspace, "pipeline", None), "signer", None)
-                if workspace is not None
-                else None
-            ),
+            cross_cycle=cross_cycle,
+            evidence_signer=workspace_signer or evidence_signer,
         )
 
     async def execute(self, task: AgentTask, context: TaskExecutionContext) -> dict[str, Any]:
