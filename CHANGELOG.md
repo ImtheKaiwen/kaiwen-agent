@@ -12,6 +12,9 @@
   record at the cycle boundary. Proposal identity ignores the tool-call id; identical proposals
   are idempotent and changed content under one logical id is rejected. The controller's fresh
   final admission is unchanged. Additive and opt-in: workers without `lead=` behave as before.
+  Also fixes `TaskScheduler.run`, which could return while another task's final save was still
+  in flight (a worker marks its task COMPLETED in memory before saving), so a reader of the
+  store saw a stale row; it now returns only after every worker has finished.
 - Add opt-in cycle-boundary delegation to `WorkflowController` (M6.3.3-C1, ADR 0015):
   `WorkflowController(delegation=WorkflowDelegation(source, admission, max_rounds))`, a new
   `WorkflowRevisionReason.DELEGATION_REQUESTED` (with typed `DelegationBoundary` data on

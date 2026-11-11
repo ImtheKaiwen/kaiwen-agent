@@ -542,7 +542,9 @@ Each defect was reproduced with a failing test before its fix.
       the cycle boundary, validates identity, bounds, host role bindings and digest, and hands the
       controller an untrusted `DelegationCandidate`. The controller's fresh final admission is
       unchanged. Verified by deterministic SQLite-backed tests and mutation checks; no external
-      model was run.
+      model was run. Reproduced and fixed on the way (failing test first): `TaskScheduler.run`
+      could return while a concurrent task's final save was in flight, so a store re-read saw a
+      stale row; it now drains active workers before returning.
 - Not done: bounded cross-cycle handoff over existing stores (PR-C3), reviewer approval and team acceptance
   (M6.3.4). There is no atomic reservation of delegation quotas: delegation at the cycle
   boundary is safe only because the run lease holder alone writes the run's tasks (enforced by

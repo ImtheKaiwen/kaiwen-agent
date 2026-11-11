@@ -141,6 +141,15 @@ class TaskScheduler:
                     continue
                 raise SchedulerStalledError("No runnable tasks and no active workers")
 
+        # A worker marks its task COMPLETED in memory before it saves the row, so the graph can
+        # read complete while a final write is still in flight. Return only once every worker
+        # has finished, so whatever is returned is what the store holds.
+        if self._active:
+            done, _ = await asyncio.wait(self._active.values())
+            for completed in done:
+                await completed
+            self._active = {}
+
         return self.graph.tasks()
 
     async def cancel(self, task_id: str, *, created_by: str = "user") -> None:

@@ -33,6 +33,7 @@ from kaiwen_agent.quality import CompletionGateResult, CompletionGateStatus
 from kaiwen_agent.runtime import WorkspaceBinding
 from kaiwen_agent.standards import StandardResolution
 from kaiwen_agent.tasks import AgentTask, TaskStatus
+from kaiwen_agent.tools.durability import ActionIntentStatus
 from kaiwen_agent.types import ModelResponse, ToolCall, ToolResult
 from kaiwen_agent.workers import FunctionWorker
 from kaiwen_agent.workflow import (
@@ -63,6 +64,7 @@ from tests.test_agent_runtime_worker import Provider, owner
 from tests.test_agent_runtime_worker import plan as make_plan
 from tests.test_agent_runtime_worker import spec as lead_spec
 from tests.test_delegation_job_path import Rule
+from tests.test_durable_action_scope import legacy_intent
 from tests.test_fenced_writes import FencedFlow
 
 TIMEOUT = 40
@@ -860,6 +862,22 @@ def test_a_replay_reruns_the_lead_with_stable_ids_and_authorizes_afresh(tmp_path
         assert outcome.status is WorkflowOutcomeStatus.COMPLETED
         # At-least-once: the Lead ran again; its output is rewritten under the same task id.
         assert harness.ran == ["a"] and set(await harness.stored(run)) == {"lead", "a"}
+
+    run_async(scenario)
+
+
+def test_an_unresolved_action_of_the_run_blocks_before_the_lead_runs(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        harness = LeadHarness(tmp_path, scripts={"lead": [proposal_call("c1"), done()]})
+        run = await harness.flow.new_run()
+        await legacy_intent(
+            harness.flow.store,
+            status=ActionIntentStatus.EXECUTING,
+            intent_id="intent_orphan",
+            run_id=run.id,
+        )
+        blocked(await harness.execute(run), "uncertain_action:intent_orphan")
+        assert harness.provider.calls == 0 and harness.ran == []  # PR #11 guard unchanged
 
     run_async(scenario)
 
