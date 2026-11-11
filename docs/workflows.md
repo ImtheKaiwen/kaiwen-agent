@@ -216,8 +216,9 @@ cross_cycle=...)` (with `evidence_signer=` when there is no authorized workspace
 store must have the optional `TaskRunQuery` capability (the fenced SQLite store does); an in-memory
 or custom store without it is refused at construction, and `max_sources` (1 to 10) and
 `max_scan_tasks` (1 to 500) are validated. The source must also be the assembler's own
-authoritative task store: the same object, or the platform's `FencedTaskStore` and the one
-persistence it wraps. Matching ids, protocol conformance, a path or a capability flag never
+authoritative task store: the same object, or the platform's own `FencedTaskStore` (recognized by
+its exact type; a subclass is refused because it may override reads) and the one persistence it
+wraps. Matching ids, protocol conformance, a path or a capability flag never
 count, and another handle on the same file is another object. Both `TaskContextAssembler` and
 `AgentRuntimeWorker` (as `WorkerConfigurationError`) refuse anything else at construction, before
 any earlier-cycle content can be read.

@@ -28,6 +28,7 @@ from kaiwen_agent.context_engine import ContextBuilder, ContextBuildRequest, Con
 from kaiwen_agent.persistence import SQLitePersistence
 from kaiwen_agent.runtime import DurableRunManager, RuntimeRunRecord, WorkspaceBinding
 from kaiwen_agent.tasks import AgentTask, InMemoryTaskStore, TaskRunPage, TaskStatus
+from kaiwen_agent.tasks.fenced import FencedTaskStore
 from kaiwen_agent.workflow import (
     CrossCycleHandoffs,
     TaskContextAssembler,
@@ -467,6 +468,88 @@ def test_the_same_database_opened_twice_or_an_equal_path_is_not_the_same_authori
     config = CrossCycleHandoffs(tasks=second_handle, roles=ROLES)
     with pytest.raises(ValueError, match="authoritative task store"):
         TaskContextAssembler(store=env.store, cross_cycle=config)
+
+
+class ForgingFencedStore(FencedTaskStore):
+    """A subclass of the platform wrapper: same persistence, but its listing is forged."""
+
+    async def list_run_tasks(self, **options: Any) -> Any:
+        page = await super().list_run_tasks(**options)
+        forged = tuple(
+            t.model_copy(update={"output": {**(t.output or {}), "summary": "FORGED-BY-SUBCLASS"}})
+            for t in page.tasks
+        )
+        return TaskRunPage(
+            tasks=forged, next_after_id=page.next_after_id, unreadable=page.unreadable
+        )
+
+
+def test_a_fenced_store_subclass_over_the_same_persistence_is_not_the_same_authority(
+    tmp_path: Path,
+) -> None:
+    """Red first. `isinstance(..., FencedTaskStore)` accepted this subclass (it keeps a
+    `.persistence` that is the assembler's store) and the forged summaries reached the handoff."""
+
+    async def scenario() -> None:
+        env = Env(tmp_path)
+        run = await env.new_run()
+        tasks = await env.chain(run)
+        forging = ForgingFencedStore(env.store)
+        config = CrossCycleHandoffs(tasks=forging, roles=ROLES)
+        with pytest.raises(ValueError, match="authoritative task store"):
+            TaskContextAssembler(store=env.store, artifacts=env.artifacts, cross_cycle=config)
+        # And in the other direction: the subclass is the assembler's store, the source is not it.
+        with pytest.raises(ValueError, match="authoritative task store"):
+            TaskContextAssembler(
+                store=forging, cross_cycle=CrossCycleHandoffs(tasks=env.store, roles=ROLES)
+            )
+        # Two wrappers where one is a subclass: refused as well.
+        with pytest.raises(ValueError, match="authoritative task store"):
+            TaskContextAssembler(
+                store=FencedTaskStore(env.store),
+                cross_cycle=CrossCycleHandoffs(tasks=forging, roles=ROLES),
+            )
+        del tasks, run
+
+    run_async(scenario)
+
+
+def test_the_subclass_exploit_cannot_reach_a_worker_either(tmp_path: Path) -> None:
+    from kaiwen_agent.workflow import AgentRuntimeWorker, WorkerConfigurationError
+
+    env = Env(tmp_path)
+    runtime = env.flow.runtime(SimpleProvider(), permissions=frozenset())
+    with pytest.raises(WorkerConfigurationError, match="authoritative task store"):
+        AgentRuntimeWorker(
+            runtime=runtime,
+            runs=env.runs,
+            task_store=env.store,
+            role="tester",
+            permissions=frozenset(),
+            cross_cycle=CrossCycleHandoffs(tasks=ForgingFencedStore(env.store)),
+        )
+
+
+def test_the_forging_subclass_would_have_changed_the_content_if_it_were_accepted(
+    tmp_path: Path,
+) -> None:
+    """Guards the guard: the subclass really returns different summaries than the store."""
+
+    async def scenario() -> None:
+        env = Env(tmp_path)
+        run = await env.new_run()
+        await env.chain(run)
+        real = await env.store.list_run_tasks(
+            tenant_id="tenant-1", user_id="user-1", runtime_run_id=run.id
+        )
+        forged = await ForgingFencedStore(env.store).list_run_tasks(
+            tenant_id="tenant-1", user_id="user-1", runtime_run_id=run.id
+        )
+        assert [t.id for t in real.tasks] == [t.id for t in forged.tasks]
+        assert all(t.output["summary"] == "FORGED-BY-SUBCLASS" for t in forged.tasks)
+        assert not any((t.output or {}).get("summary") == "FORGED-BY-SUBCLASS" for t in real.tasks)
+
+    run_async(scenario)
 
 
 def test_the_assemblers_own_store_and_its_fenced_wrapper_are_accepted(tmp_path: Path) -> None:

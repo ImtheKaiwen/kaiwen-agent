@@ -591,24 +591,30 @@ class TaskContextAssembler:
 
 
 def _same_authority(source: object, store: object) -> bool:
-    """Whether `source` is the very store the assembler reads, or its fenced wrapper.
+    """Whether `source` is the very store the assembler reads, or the platform's fenced wrapper.
 
     Identity only: a matching protocol, ids or attribute never counts. The one accepted relation
-    besides `is` is the platform's own `FencedTaskStore`, which wraps exactly one persistence
-    object: it and that object (or two wrappers of it) are the same authoritative storage.
+    besides `is` is the platform's own `FencedTaskStore`, which reads straight through to the one
+    persistence object it wraps. It is recognized by its exact type: a subclass may override
+    `list_run_tasks` (or any read) while keeping a `persistence` reference, so it is treated like
+    any other foreign object. `FencedTaskStore` is therefore not an extension point here.
     """
 
     if source is store:
         return True
-    if isinstance(source, FencedTaskStore) and source.persistence is store:
+    if _is_platform_fenced(source) and source.persistence is store:  # type: ignore[attr-defined]
         return True
-    if isinstance(store, FencedTaskStore) and store.persistence is source:
+    if _is_platform_fenced(store) and store.persistence is source:  # type: ignore[attr-defined]
         return True
     return (
-        isinstance(source, FencedTaskStore)
-        and isinstance(store, FencedTaskStore)
-        and source.persistence is store.persistence
+        _is_platform_fenced(source)
+        and _is_platform_fenced(store)
+        and source.persistence is store.persistence  # type: ignore[attr-defined]
     )
+
+
+def _is_platform_fenced(candidate: object) -> bool:
+    return type(candidate) is FencedTaskStore
 
 
 def _identified_cycle(task: AgentTask | None, run: RuntimeRunRecord) -> int | None:
