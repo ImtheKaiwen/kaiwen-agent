@@ -147,6 +147,6 @@ itself records for its own audit trail.
   caller's delegated tasks in this run; the job path counts across runs.
 
 Not part of this layer yet: the cycle-boundary integration with an explicit revision reason
-and the final authorization (PR-C1), model-facing proposal tools and durable idempotent
-proposals (PR-C2), bounded cross-cycle handoff (PR-C3), reviewer approval and team acceptance
+and the final authorization (PR-C1, merged), model-facing proposal tools and durable
+proposals (PR-C2, see `docs/workflows.md`), bounded cross-cycle handoff (PR-C3), reviewer approval and team acceptance
 (M6.3.4), isolated parallel writers or worktree merging.

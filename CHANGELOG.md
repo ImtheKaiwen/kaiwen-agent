@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Add model-facing Lead tools and durable delegation proposals (M6.3.3-C2, ADR 0015): registered
+  `lead.view` (bounded, paginated Lead coordination view) and `lead.propose_task` tools built by
+  `LeadTools` over host `LeadToolConfig` role bindings; `AgentRuntimeWorker(lead=...)` allocates a
+  fresh execution-local proposal sink per execution and, after a successful run, returns the
+  canonical, digested proposal set in the Lead task's output so the existing scheduler commits it
+  atomically with COMPLETED (through the fenced task store in fenced mode);
+  `DurableLeadProposalSource` is a `WorkflowDelegationSource` that re-reads and validates that
+  record at the cycle boundary. Proposal identity ignores the tool-call id; identical proposals
+  are idempotent and changed content under one logical id is rejected. The controller's fresh
+  final admission is unchanged. Additive and opt-in: workers without `lead=` behave as before.
+  Also fixes `TaskScheduler.run`, which could return while another task's final save was still
+  in flight (a worker marks its task COMPLETED in memory before saving), so a reader of the
+  store saw a stale row; it now returns only after every worker has finished, and a refused
+  final write surfaces at once instead of waiting for another hung write.
+  Audit R1: `WorkflowController` refuses a `DurableLeadProposalSource` over another task store,
+  run manager or workspace, a Lead worker the source does not read, or a Lead tool configuration
+  that differs from the source's; `AgentRuntimeWorker` requires its own registered Lead tool
+  objects and permissions; every element of a proposal is length-bounded, on staging and on read.
 - Add opt-in cycle-boundary delegation to `WorkflowController` (M6.3.3-C1, ADR 0015):
   `WorkflowController(delegation=WorkflowDelegation(source, admission, max_rounds))`, a new
   `WorkflowRevisionReason.DELEGATION_REQUESTED` (with typed `DelegationBoundary` data on

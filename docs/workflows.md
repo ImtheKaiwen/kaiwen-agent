@@ -125,10 +125,84 @@ not fenced by it. A task or tool call already authorized before the lease was lo
 effects afterwards. The guarantee is one local SQLite database, not multiple hosts, and not a
 guard on arbitrary worker code. Replay is at-least-once: deterministic ids make one task row, not
 exactly-once execution, and a tool call re-issued under a new call id without an application
-idempotency key runs again. There
-are no durable proposals yet, so a restart re-authorizes from scratch and an identical proposal
-can be denied because the earlier delegated tasks count against the per-run limit (PR-C2).
-Delegated tasks cannot depend on the parent or on earlier cycles (PR-C3).
+idempotency key runs again. A restart re-authorizes from scratch (there is no durable cycle
+cursor), and an identical proposal can be denied because the earlier delegated tasks count against
+the per-run limit. Delegated tasks cannot depend on the parent or on earlier cycles (PR-C3).
+
+## Lead tools and durable proposals (opt-in, M6.3.3-C2)
+
+A Lead agent coordinates through two registered tools and gains no authority from them. The host
+builds `LeadTools(config=LeadToolConfig(roles=..., resource_allowlist=..., max_tasks=...),
+assembler=LeadViewAssembler(...))`, registers `tools.definitions()` in the Lead runtime, grants
+the permissions `lead.view` and `lead.propose`, and builds the Lead as
+`AgentRuntimeWorker(..., tool_names=[...], lead=tools)`. Lead tool names without `lead=` (or a
+partial tool set with it) are refused at construction.
+
+- `lead.view(offset, limit)`: one page (at most 50 tasks) of the existing `LeadView`. Run, owner,
+  session and workspace come from the worker's per-execution `LeadToolSession`, which is built from
+  the verified durable run; the arguments carry no such field and the tool refuses an execution
+  whose identity differs from the session's. Names and summaries stay labelled `untrusted_*`,
+  evidence is only authenticated, never judged, and sources that could not be read are reported
+  as unavailable, not empty. It creates nothing and reserves nothing.
+- `lead.propose_task(id, name, description, role, acceptance_criteria, dependencies,
+  capabilities, resource_keys)`: strict schema, extra fields rejected, every field bounded. The
+  host maps `role` to a worker id and a capability ceiling (`LeadRoleBinding`); a role, capability
+  or resource outside that binding, an unknown or forward dependency, a count above `max_tasks` or
+  an oversized task is returned to the model as `rejected` with a stable code and is not staged.
+  Dependencies may only name tasks already proposed in the same set.
+
+Proposal identity is `sha256(run, parent task, tenant, user, session, workspace, canonical task)`;
+the tool-call id is not part of it, and the canonical form is order-insensitive for sets. An
+identical proposal is idempotent (`duplicate: true`); the same logical id with other content is
+`rejected` (`logical_id_conflict`) and the first stays.
+
+Commit boundary. Staging writes to an execution-local sink only, and the tool reports
+`committed: false`. After a successful run the worker seals the sink and returns the canonical set
+as `output["delegation_proposals"]` (version, run, parent, owner, workspace, count, tasks, digest).
+The scheduler then persists that output with the COMPLETED status in one task write, through the
+fenced task store in fenced mode, so an expired or replaced owner cannot commit it. A failed,
+cancelled or crashed Lead never finalizes a set. A fresh sink is built for every execution,
+including retries and concurrent executions of one worker. If a tool result reported during this
+execution names a staged proposal that is not in this execution's sink (a cached success from an
+earlier attempt), the finalization fails with `staged_proposal_missing` instead of committing a set
+without it.
+
+`DurableLeadProposalSource(tasks, runs, config, lead_workers, expected_workspace)` is the
+`WorkflowDelegationSource`. For each eligible parent that is a Lead worker it re-reads the task
+from storage and requires: completed in the current cycle, the same run, owner and session as the
+verified durable run, the expected workspace, a present record (a Lead without one is
+`record_missing`, never read as "no proposal"), a matching digest, a count equal to the listed
+tasks, unique logical ids, canonical content, and the host's current role, capability and
+resource bindings. Any failure raises `LeadProposalError` with a stable code, which the controller
+reports as `delegation_source_failed`. An empty record is a real "no proposal". Two Lead parents
+with proposals in one boundary are refused (`multiple_proposal_sets`) rather than one being
+dropped. The source writes nothing; the controller still runs the fresh final admission (host
+authority, ceilings, central policy with live counters, compiler) and a stored record is never an
+authorization.
+
+Composition (checked when the controller is built). A `DurableLeadProposalSource` must read tasks
+from the controller's own fenced database (`fenced.persistence` or `fenced.task_store`, by object
+identity), use the controller's own `DurableRunManager`, and expect the controller's workspace
+binding. Every Lead worker (one built with `lead=`) must be listed in `lead_workers` and use the
+same `LeadToolConfig` as the source, so no Lead commits proposals that nobody reads or that the
+reader would reject. A worker built with `lead=` must have registered the `LeadTools` objects
+themselves and hold the `lead.view` / `lead.propose` permissions. Incompatible configurations are
+refused before any work runs. A custom `WorkflowDelegationSource` keeps the host-controlled
+contract and is not inspected.
+
+Element bounds. Besides the counts (10 criteria, 10 dependencies, 10 capabilities, 5 resource
+keys), each member is bounded: criteria 1 to 500 characters, dependencies a task id of at most
+200 characters, capabilities a label of at most 100 characters, resource keys at most 200
+characters. The same model validates a committed record when it is read, which also checks the
+canonical form, 8,000 bytes per task (canonical JSON escapes non-ASCII text) and the record size.
+
+Limits. The digest detects truncation and accidental corruption; it is not a signature, and a
+writer already trusted to write tasks can forge a consistent record (the existing trusted-write
+boundary, ADR 0015). Idempotent proposals are not exactly-once execution: a restart re-runs the
+Lead (at least once, under the same deterministic task ids) and re-authorizes. No quota is
+reserved, no workflow cursor resumes a run, and only a Lead completed in the cycle that just
+ended can be a parent. Records are limited to 50 tasks, 8,000 bytes per task and 128,000 bytes in
+all.
 
 ## Recovery scope
 

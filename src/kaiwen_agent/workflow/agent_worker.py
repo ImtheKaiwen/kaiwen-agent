@@ -47,6 +47,13 @@ from kaiwen_agent.workflow.context import (
     trusted_task_run,
 )
 from kaiwen_agent.workflow.controller import ProtectedInputFingerprintProvider
+from kaiwen_agent.workflow.lead_tools import (
+    LEAD_SESSION_SERVICE,
+    LEAD_TOOL_NAMES,
+    PROPOSALS_OUTPUT_KEY,
+    LeadTools,
+    LeadToolSession,
+)
 from kaiwen_agent.workflow.task_context import (
     TaskContextAssembler,
     TaskContextSource,
@@ -102,6 +109,7 @@ class AgentRuntimeWorker:
         services: Mapping[str, Any] | None = None,
         context_budget: ContextBudget | None = None,
         max_summary_chars: int = 4_000,
+        lead: LeadTools | None = None,
     ) -> None:
         if not role or not role.strip():
             raise WorkerConfigurationError("A worker needs a role")
@@ -113,6 +121,24 @@ class AgentRuntimeWorker:
                 runtime.registry.get(name)
             except ToolNotFoundError as error:
                 raise WorkerConfigurationError(f"Unknown tool for worker: {name}") from error
+        if (LEAD_TOOL_NAMES & set(tools)) and lead is None:
+            # The Lead tools need a per-execution session that only `lead=` can supply.
+            raise WorkerConfigurationError("Lead tools need the worker to be built with lead=")
+        if lead is not None:
+            registered = {definition.name for definition in lead.definitions()}
+            if not registered <= set(tools):
+                raise WorkerConfigurationError("A Lead worker must be given every Lead tool")
+            for definition in lead.definitions():
+                # The registry must hold this Lead's own tool objects, not a look-alike with
+                # another configuration, and the worker must hold the permission they require.
+                if runtime.registry.get(definition.name) is not definition:
+                    raise WorkerConfigurationError(
+                        f"Registered tool {definition.name} is not this worker's Lead tool"
+                    )
+                if not definition.permissions <= set(permissions):
+                    raise WorkerConfigurationError(
+                        f"The worker lacks the permission for {definition.name}"
+                    )
         if not evidence_tool_names <= set(tools):
             raise WorkerConfigurationError("Evidence tools must be among the worker's tools")
         reserved = _RESERVED_METADATA & set(runtime.metadata)
@@ -145,6 +171,7 @@ class AgentRuntimeWorker:
             configured = runtime.metadata.get("workspace_id")
             if configured is not None and configured != workspace.binding.workspace_id:
                 raise WorkerConfigurationError("Runtime metadata names a different workspace")
+        self.lead = lead
         self.runtime = runtime
         self.runs = runs
         self.role = role.strip()
@@ -216,11 +243,32 @@ class AgentRuntimeWorker:
         prompt = await self._render(package, identity)
         await context.report_progress(0.1, details={"phase": "started", "role": self.role})
         await context.checkpoint(state={"phase": "started", "role": self.role, "task": task.id})
-        result = await self._run(prompt, identity, trusted_action_scope(task, record))
+        # A fresh sink per execution: nothing staged by an earlier or concurrent execution (or a
+        # cached tool response) can reach this one, and nothing is shared through `self.services`.
+        session: LeadToolSession | None = None
+        services: Mapping[str, Any] = self.services
+        if self.lead is not None:
+            session = LeadToolSession(
+                run_id=record.id,
+                parent_task_id=task.id,
+                tenant_id=record.tenant_id,
+                user_id=record.user_id,
+                session_id=record.session_id,
+                conversation_id=record.conversation_id,
+                workspace_id=workspace_id,
+            )
+            services = {**self.services, LEAD_SESSION_SERVICE: session}
+        result = await self._run(prompt, identity, trusted_action_scope(task, record), services)
         await context.checkpoint(state={"phase": "finished", "role": self.role, "task": task.id})
         await context.report_progress(1.0, details={"phase": "finished", "role": self.role})
         await self._remember(task, identity, result)
-        return self._output(task, record.id, result)
+        output = self._output(task, record.id, result)
+        if session is not None and self.lead is not None:
+            # Finalized only after a successful run; the scheduler commits it with COMPLETED.
+            output[PROPOSALS_OUTPUT_KEY] = session.finalize(
+                result.tool_results, config=self.lead.config
+            )
+        return output
 
     async def _render(self, package: Any, identity: RuntimeIdentity) -> str:
         assert identity.tenant_id is not None and identity.user_id is not None
@@ -240,7 +288,11 @@ class AgentRuntimeWorker:
         return ContextRenderer().render(built)
 
     async def _run(
-        self, prompt: str, identity: RuntimeIdentity, scope: DurableActionScope
+        self,
+        prompt: str,
+        identity: RuntimeIdentity,
+        scope: DurableActionScope,
+        services: Mapping[str, Any],
     ) -> AgentResult:
         if self.tool_names:
             return await self.runtime.action(
@@ -248,11 +300,11 @@ class AgentRuntimeWorker:
                 identity=identity,
                 tool_names=self.tool_names,
                 autonomy=self.autonomy,
-                services=self.services,
+                services=services,
                 action_scope=scope,
             )
         return await self.runtime.chat(
-            prompt, identity=identity, autonomy=self.autonomy, services=self.services
+            prompt, identity=identity, autonomy=self.autonomy, services=services
         )
 
     async def _remember(

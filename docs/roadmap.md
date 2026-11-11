@@ -519,8 +519,10 @@ Each defect was reproduced with a failing test before its fix.
       task scan extracted into `scan_run_tasks`. Admission only: nothing is submitted, created,
       revised or run. Verified by deterministic tests (including honest characterizations of the
       point-in-time and per-instance-lock limits) and mutation checks of the key protections.
-- [x] M6.3.3-C1 cycle-boundary delegation (draft pull request 14, not merged, pending independent
-      review; integrated with the fenced execution foundation): opt-in `WorkflowController(delegation=...)`, the explicit
+- [x] M6.3.3-C1 cycle-boundary delegation (pull request 14, squash commit
+      `70d24e27a4bc089084d9fcb0358a132f5a68ff94`, merged after independent audit and its R1/R2
+      corrections; the post-merge CI run on `main` succeeded; integrated with the fenced execution
+      foundation): opt-in `WorkflowController(delegation=...)`, the explicit
       `WorkflowRevisionReason.DELEGATION_REQUESTED`, a fresh final authorization at the boundary
       after a cycle and before the completion gate, a compiler-written parent reference and depth
       for delegated tasks, and the child worker's declared capabilities checked at admission.
@@ -531,13 +533,29 @@ Each defect was reproduced with a failing test before its fix.
       SQLite-backed tests (restart, ownership loss at exact points, cancellation, bounds, forged
       parents) and mutation checks of the key protections. The audit R2 `xfail` is now a passing
       regression.
-- Not done: model-facing proposal tools and durable idempotent proposals (PR-C2), bounded
-  cross-cycle handoff over existing stores (PR-C3), reviewer approval and team acceptance
+- [~] M6.3.3-C2 model-facing Lead tools and durable delegation proposals (draft pull request,
+      pending independent audit): registered `lead.view` (bounded, paginated `LeadView`) and
+      `lead.propose_task` tools over a trusted per-execution `LeadToolSession`; proposals are staged
+      in an execution-local sink and finalized only by a successful Lead execution into the Lead
+      task's own output (`output["delegation_proposals"]`), which the existing scheduler persists
+      with COMPLETED in one fenced task write; `DurableLeadProposalSource` re-reads that output at
+      the cycle boundary, validates identity, bounds, host role bindings and digest, and hands the
+      controller an untrusted `DelegationCandidate`. The controller's fresh final admission is
+      unchanged. Verified by deterministic SQLite-backed tests and mutation checks; no external
+      model was run. Reproduced and fixed on the way (failing test first): `TaskScheduler.run`
+      could return while a concurrent task's final save was in flight, so a store re-read saw a
+      stale row; it now drains active workers before returning. Audit R1 corrections: the
+      controller refuses a durable proposal source that does not read its own authoritative
+      fenced database, run manager and workspace (a source over another store fed delegation
+      content in a reproduction), Lead workers unread by the source and configuration
+      mismatches; every proposal element is length-bounded on staging and on read.
+- Not done: bounded cross-cycle handoff over existing stores (PR-C3), reviewer approval and team acceptance
   (M6.3.4). There is no atomic reservation of delegation quotas: delegation at the cycle
   boundary is safe only because the run lease holder alone writes the run's tasks (enforced by
   the fenced write transaction) and the counted quotas are run-scoped; the job path serializes within one delegator instance only.
   After a restart, earlier delegated tasks count against the per-run limit, so an identical
-  proposal can be denied until durable proposal identity exists. The Lead view and workflow
+  proposal can still be denied (C2 proposal identity makes staging and reading idempotent; it does
+  not make admission or execution idempotent, and there is no durable cycle cursor). The Lead view and workflow
   admission need a store with `TaskRunQuery`; custom and in-memory task stores do not provide it
   yet.
 
@@ -553,8 +571,8 @@ Each defect was reproduced with a failing test before its fix.
       adversarial tests and mutation checks.
 - Not done: Redis plus SQLite and multi-host delegation (not approved), fencing of arbitrary worker
   code and external effects, exactly-once effects.
-- Pull request 14 (cycle-boundary delegation) is integrated on top of this foundation and awaits
-  independent audit; it is not merged.
+- Pull request 14 (cycle-boundary delegation) was integrated on top of this foundation and merged
+  as squash commit `70d24e27a4bc089084d9fcb0358a132f5a68ff94`.
 
 ### M7 design items (not started)
 

@@ -41,9 +41,11 @@ from kaiwen_agent.standards import StandardResolution
 from kaiwen_agent.tasks import AgentTask, TaskGraph, TaskScheduler, TaskStatus
 from kaiwen_agent.tools.durability import ActionIntentStatus, ActionIntentStore
 from kaiwen_agent.types import utc_now
+from kaiwen_agent.workers import WorkerNotFoundError
 from kaiwen_agent.workflow.compiler import DelegationBinding, WorkflowCompiler, WorkflowPlanError
 from kaiwen_agent.workflow.delegation import DelegationCandidate, WorkflowDelegation
 from kaiwen_agent.workflow.fenced import FencedExecution
+from kaiwen_agent.workflow.lead_tools import DurableLeadProposalSource
 from kaiwen_agent.workflow.models import (
     DelegationBoundary,
     DelegationParent,
@@ -242,6 +244,44 @@ class WorkflowController:
                 raise ValueError(
                     "Delegation admission must expect the controller's workspace binding"
                 )
+            source = delegation.source
+            if isinstance(source, DurableLeadProposalSource):
+                # The concrete durable source decides what is proposed, so what it reads must be
+                # the controller's own authoritative storage: the same fenced database and the
+                # same durable run manager. Identity by object, never by matching ids or flags.
+                # A custom source keeps the host-controlled contract and is not inspected here.
+                if source.tasks is not fenced.persistence and source.tasks is not fenced.task_store:
+                    raise FencedConfigurationError(
+                        "The durable proposal source must read tasks from the authoritative "
+                        "fenced database of this execution"
+                    )
+                if source.runs is not runs:
+                    raise FencedConfigurationError(
+                        "The durable proposal source must read the controller's authoritative "
+                        "durable runs"
+                    )
+                if source.expected_workspace != workspace_binding:
+                    raise ValueError(
+                        "The durable proposal source must expect the controller's workspace binding"
+                    )
+                for worker_id in sorted(compiler.worker_allowlist):
+                    try:
+                        lead = getattr(compiler.workers.get(worker_id), "lead", None)
+                    except WorkerNotFoundError:
+                        continue
+                    if lead is None:
+                        continue
+                    # A Lead worker nobody reads would commit proposals that are silently
+                    # dropped; a Lead whose tools use another configuration would stage what the
+                    # reader then rejects.
+                    if worker_id not in source.lead_workers:
+                        raise FencedConfigurationError(
+                            "A Lead worker is not read by the durable proposal source"
+                        )
+                    if lead.config != source.config:
+                        raise FencedConfigurationError(
+                            "A Lead worker's tool configuration differs from the source's"
+                        )
 
         self.runs = runs
         self.compiler = compiler
