@@ -135,6 +135,37 @@ class WorkflowRevisionRequest(BaseModel):
         return self
 
 
+class TeamAcceptanceStatus(StrEnum):
+    """The host's decision about delivering a whole team's work (ADR 0017).
+
+    Distinct from a task reporting completion, a reviewer's recommendation and the completion
+    gate's verdict; only the host computes it, and only `ACCEPTED` lets the run complete.
+    """
+
+    ACCEPTED = "accepted"
+    CHANGES_REQUIRED = "changes_required"
+    APPROVAL_REQUIRED = "approval_required"
+    BLOCKED = "blocked"
+    # The host cannot establish the facts (missing or corrupted review, unreadable inventory,
+    # no fingerprint, an unreachable approval source). Never counted as success.
+    UNAVAILABLE = "unavailable"
+
+
+class TeamAcceptanceDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    status: TeamAcceptanceStatus
+    code: str = Field(pattern=r"^[a-z_]{1,64}$")
+    reasons: tuple[str, ...] = Field(default=(), max_length=20)
+    reviewer_task_ids: tuple[str, ...] = Field(default=(), max_length=20)
+    # What a human approval (when required) is bound to; absent when none was evaluated.
+    subject_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @property
+    def accepted(self) -> bool:
+        return self.status is TeamAcceptanceStatus.ACCEPTED
+
+
 class WorkflowOutcomeStatus(StrEnum):
     COMPLETED = "completed"
     BLOCKED = "blocked"
@@ -152,3 +183,5 @@ class WorkflowOutcome(BaseModel):
     reason: str | None = None
     # The protected-input fingerprint the completion gate actually evaluated.
     verified_input_fingerprint: str | None = None
+    # Present only when team acceptance is configured and was evaluated for this outcome.
+    team_acceptance: TeamAcceptanceDecision | None = None

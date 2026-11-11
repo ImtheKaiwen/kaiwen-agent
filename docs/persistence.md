@@ -280,6 +280,13 @@ or another HTTP adapter can wrap the stream without entering the core package.
 Bearer token values before forwarding a record. Product applications should still
 avoid adding unnecessary personal or secret data to audit details.
 
+## Reviewer assessments (M6.3.4)
+
+No table or column was added. A reviewer worker built with `review=` stores its finalized record under
+`output["review_assessment"]` of its own task row, written with COMPLETED by the scheduler (the
+fenced task store in fenced mode). Team acceptance is recomputed from these rows and is not
+persisted. See `docs/workflows.md`.
+
 ## Delegation proposals (M6.3.3-C2)
 
 No table or column was added. A Lead worker built with `lead=` stores its finalized proposal set

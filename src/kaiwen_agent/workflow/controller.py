@@ -42,6 +42,7 @@ from kaiwen_agent.tasks import AgentTask, TaskGraph, TaskScheduler, TaskStatus
 from kaiwen_agent.tools.durability import ActionIntentStatus, ActionIntentStore
 from kaiwen_agent.types import utc_now
 from kaiwen_agent.workers import WorkerNotFoundError
+from kaiwen_agent.workflow.acceptance import TeamAcceptance
 from kaiwen_agent.workflow.compiler import DelegationBinding, WorkflowCompiler, WorkflowPlanError
 from kaiwen_agent.workflow.delegation import DelegationCandidate, WorkflowDelegation
 from kaiwen_agent.workflow.fenced import FencedExecution
@@ -49,6 +50,7 @@ from kaiwen_agent.workflow.lead_tools import DurableLeadProposalSource
 from kaiwen_agent.workflow.models import (
     DelegationBoundary,
     DelegationParent,
+    TeamAcceptanceDecision,
     WorkflowLimits,
     WorkflowOutcome,
     WorkflowOutcomeStatus,
@@ -196,6 +198,7 @@ class WorkflowController:
         block_unassociated_actions: bool = False,
         delegation: WorkflowDelegation | None = None,
         fenced: FencedExecution | None = None,
+        team_acceptance: TeamAcceptance | None = None,
     ) -> None:
         if lease_ttl_seconds <= 0:
             raise ValueError("lease_ttl_seconds must be positive")
@@ -283,6 +286,35 @@ class WorkflowController:
                             "A Lead worker's tool configuration differs from the source's"
                         )
 
+        if team_acceptance is not None:
+            # Opt-in and fail-closed at configuration (ADR 0017): acceptance decides whether a
+            # fenced terminal transition may happen, so it reads the controller's own
+            # authoritative storage, never another store, and needs fenced execution.
+            if fenced is None:
+                raise FencedConfigurationError(
+                    "Team acceptance requires fenced execution (ADR 0016)"
+                )
+            if (
+                team_acceptance.tasks is not fenced.persistence
+                and team_acceptance.tasks is not fenced.task_store
+            ):
+                raise FencedConfigurationError(
+                    "Team acceptance must read tasks from the authoritative fenced database"
+                )
+            if team_acceptance.runs is not runs:
+                raise FencedConfigurationError(
+                    "Team acceptance must read the controller's durable runs"
+                )
+            for worker_id, role in team_acceptance.policy.reviewer_workers.items():
+                if worker_id not in compiler.worker_allowlist:
+                    raise ValueError("A reviewer worker must be allowlisted by the compiler")
+                try:
+                    declared = getattr(compiler.workers.get(worker_id), "role", None)
+                except WorkerNotFoundError:
+                    raise ValueError("A reviewer worker must be registered") from None
+                if declared is not None and declared != role:
+                    raise ValueError("A reviewer worker declares a different role")
+        self.team_acceptance = team_acceptance
         self.runs = runs
         self.compiler = compiler
         self.scheduler_factory = scheduler_factory
@@ -777,6 +809,28 @@ class WorkflowController:
                             if confirmed
                             else "protected_input_unavailable",
                         )
+                if self.team_acceptance is not None:
+                    decision = await self.team_acceptance.evaluate(
+                        run=run,
+                        gate=latest_quality,
+                        fingerprint=gate_fingerprint
+                        if self.fingerprint_provider is not None
+                        else None,
+                    )
+                    if not decision.accepted:
+                        return await self._blocked(
+                            writer=writer,
+                            run=run,
+                            identity=identity,
+                            cycle=cycle,
+                            tasks=all_tasks,
+                            quality=latest_quality,
+                            reason=f"team_{decision.status.value}:{decision.code}",
+                            acceptance=decision,
+                        )
+                    accepted_decision: TeamAcceptanceDecision | None = decision
+                else:
+                    accepted_decision = None
                 completed = await writer.complete(run_id=run.id, identity=identity)
                 return WorkflowOutcome(
                     status=WorkflowOutcomeStatus.COMPLETED,
@@ -785,6 +839,7 @@ class WorkflowController:
                     tasks=tuple(all_tasks),
                     quality_result=latest_quality,
                     verified_input_fingerprint=gate_fingerprint,
+                    team_acceptance=accepted_decision,
                 )
             if latest_quality.status in {
                 CompletionGateStatus.APPROVAL_REQUIRED,
@@ -1050,6 +1105,7 @@ class WorkflowController:
         tasks: list[AgentTask],
         quality: CompletionGateResult | None,
         reason: str,
+        acceptance: TeamAcceptanceDecision | None = None,
     ) -> WorkflowOutcome:
         blocked = await writer.block(run_id=run.id, identity=identity, reason=reason)
         return WorkflowOutcome(
@@ -1059,6 +1115,7 @@ class WorkflowController:
             tasks=tuple(tasks),
             quality_result=quality,
             reason=reason,
+            team_acceptance=acceptance,
         )
 
     async def _revision_failure(
