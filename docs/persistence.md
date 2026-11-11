@@ -279,3 +279,12 @@ or another HTTP adapter can wrap the stream without entering the core package.
 `RedactingAuditStore` recursively removes credential-like keys and common API key or
 Bearer token values before forwarding a record. Product applications should still
 avoid adding unnecessary personal or secret data to audit details.
+
+## Delegation proposals (M6.3.3-C2)
+
+No table or column was added. A Lead worker built with `lead=` stores its finalized proposal set
+under `output["delegation_proposals"]` of its own task row; the scheduler writes it together with
+the COMPLETED status in one task write, through the fenced task store when the run is fenced, so
+the set exists exactly when the Lead completed under a valid owner epoch. The record carries the
+run, parent task, owner, workspace and a digest, and readers (`DurableLeadProposalSource`) treat it
+as untrusted input. Older code ignores the extra output key. See `docs/workflows.md`.

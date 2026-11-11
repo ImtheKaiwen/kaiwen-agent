@@ -26,6 +26,16 @@ from kaiwen_agent.workflow.delegation import (
     WorkflowDelegationSource,
 )
 from kaiwen_agent.workflow.fenced import FencedExecution
+from kaiwen_agent.workflow.lead_tools import (
+    LEAD_PROPOSE_TOOL,
+    LEAD_VIEW_TOOL,
+    DurableLeadProposalSource,
+    LeadProposalError,
+    LeadRoleBinding,
+    LeadToolConfig,
+    LeadTools,
+    LeadToolSession,
+)
 from kaiwen_agent.workflow.lead_view import (
     LeadApprovalRef,
     LeadTaskView,
@@ -56,6 +66,14 @@ from kaiwen_agent.workflow.task_context import (
 )
 
 __all__ = [
+    "DurableLeadProposalSource",
+    "LEAD_PROPOSE_TOOL",
+    "LEAD_VIEW_TOOL",
+    "LeadProposalError",
+    "LeadRoleBinding",
+    "LeadToolConfig",
+    "LeadToolSession",
+    "LeadTools",
     "FencedExecution",
     "AgentRuntimeWorker",
     "DelegationAuthority",

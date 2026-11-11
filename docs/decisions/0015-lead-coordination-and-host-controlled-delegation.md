@@ -324,7 +324,14 @@ cross-run sharing or persistence system are not part of M6.3.3 and are not desig
 - PR-C1 (M6.3.3-C1): controller integration at the cycle boundary, the explicit revision reason,
   host derivation of delegated task depth, and the final authorization with fresh policy and
   limit checks (section 4.5). Opt-in, requires fenced execution (ADR 0016), no durable proposals.
-- PR-C2: model-facing proposal tools and durable, idempotent proposal storage.
+- PR-C2 (M6.3.3-C2): model-facing `lead.view` and `lead.propose_task` tools and durable proposals.
+  Design as built: no separate proposal database. Each Lead execution stages validated proposals
+  in an execution-local sink; a successful execution finalizes a canonical, digested set into the
+  Lead task's own output, which the existing scheduler persists with COMPLETED in one (fenced)
+  task write; `DurableLeadProposalSource` reads it back at the cycle boundary and the controller's
+  fresh final admission is unchanged. Identity derives from trusted run and parent context plus
+  canonical content, never from a tool-call id. It does not make execution exactly-once and adds
+  no cursor or quota reservation. See `docs/workflows.md`.
 - PR-C3: bounded cross-cycle handoff over the existing stores.
 - M6.3.4: reviewer approval and team acceptance, including any approval workflow for
   delegation decisions that need one.
