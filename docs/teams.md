@@ -148,5 +148,6 @@ itself records for its own audit trail.
 
 Not part of this layer yet: the cycle-boundary integration with an explicit revision reason
 and the final authorization (PR-C1, merged), model-facing proposal tools and durable
-proposals (PR-C2, see `docs/workflows.md`), bounded cross-cycle handoff (PR-C3), reviewer approval and team acceptance
+proposals (PR-C2, see `docs/workflows.md`), bounded cross-cycle handoff (PR-C3, see `docs/workflows.md`), reviewer approval and team
+acceptance
 (M6.3.4), isolated parallel writers or worktree merging.

@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Add bounded earlier-cycle task handoffs (M6.3.3-C3, ADR 0015): opt-in `CrossCycleHandoffs` for
+  `TaskContextAssembler` and `AgentRuntimeWorker(cross_cycle=..., evidence_signer=...)`. A task with
+  a compiler-written delegation parent receives informational `TaskHandoff`s (new optional fields
+  `origin`, `source_cycle`, `source_worker_id`, `relation`) from its parent, the parent's completed
+  delegation-round siblings and its grandparent, chosen by the host from one bounded `TaskRunQuery`
+  scan in task-id order. Sources must belong to the run and owner, be COMPLETED, sit in a strictly
+  earlier cycle and carry a compiler-derived id (`compiled_task_id`, now public). Artifact and
+  evidence references are re-verified with the existing rules. `TaskContextPackage` gains a
+  `cross_cycle` summary (`complete`, `truncated`, `unavailable` with a stable reason,
+  `not_applicable`); no graph edge, table, transcript, permission or capability is added, and the
+  default behavior is unchanged. Audit R1: the cross-cycle source must be the assembler's own
+  task store (or the `FencedTaskStore` wrapping it), refused at construction in both the
+  assembler and `AgentRuntimeWorker`; a selected source without an output record, or an
+  unprovable row in the lineage position, now makes the summary `unavailable`
+  (`source_output_missing`, `source_identity_invalid`) instead of `complete`, and a valid task of
+  another delegation round is no longer counted as rejected. Audit R2: only the exact platform
+  `FencedTaskStore` type is accepted as the fenced wrapper of the assembler's store; a subclass
+  that could override `list_run_tasks` is refused like any foreign object.
 - Add model-facing Lead tools and durable delegation proposals (M6.3.3-C2, ADR 0015): registered
   `lead.view` (bounded, paginated Lead coordination view) and `lead.propose_task` tools built by
   `LeadTools` over host `LeadToolConfig` role bindings; `AgentRuntimeWorker(lead=...)` allocates a

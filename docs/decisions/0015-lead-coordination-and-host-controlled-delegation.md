@@ -332,7 +332,11 @@ cross-run sharing or persistence system are not part of M6.3.3 and are not desig
   fresh final admission is unchanged. Identity derives from trusted run and parent context plus
   canonical content, never from a tool-call id. It does not make execution exactly-once and adds
   no cursor or quota reservation. See `docs/workflows.md`.
-- PR-C3: bounded cross-cycle handoff over the existing stores.
+- PR-C3 (M6.3.3-C3): bounded cross-cycle handoff over the existing stores: an opt-in
+  `CrossCycleHandoffs` selection inside `TaskContextAssembler` (parent, delegation-round
+  siblings and grandparent, from one bounded run-scoped scan, sources proven by compiler-derived
+  ids and strictly earlier cycles, references re-verified, explicit `unavailable` states). No
+  new table, graph edge, transcript sharing or authority. See `docs/workflows.md`.
 - M6.3.4: reviewer approval and team acceptance, including any approval workflow for
   delegation decisions that need one.
 
