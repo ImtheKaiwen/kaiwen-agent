@@ -14,7 +14,9 @@
   re-checks the protected fingerprint right before completion (`workspace_changed_after_acceptance`),
   a review records the proven cycle (same-cycle dependency reviews are valid), acceptance evidence
   must be verified with the completion gate's artifact manager and signer, and an approval cannot
-  leave a criterion unknown.
+  leave a criterion unknown. Audit R2: when a human approval is configured, cited evidence is
+  authenticated again and the completion gate is asked again after the approval and before
+  completion (`completion_gate_changed_after_acceptance`).
 - Add bounded earlier-cycle task handoffs (M6.3.3-C3, ADR 0015): opt-in `CrossCycleHandoffs` for
   `TaskContextAssembler` and `AgentRuntimeWorker(cross_cycle=..., evidence_signer=...)`. A task with
   a compiler-written delegation parent receives informational `TaskHandoff`s (new optional fields

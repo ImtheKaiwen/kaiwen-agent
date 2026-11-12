@@ -344,6 +344,23 @@ cannot be detected. Without a fingerprint provider nothing is checked, as before
 bound to the fingerprint of its subject, so an approval for an earlier fingerprint never matches a
 later one.
 
+Evidence invalidation during a slow approval (R2). The artifact manager can delete or expire
+evidence without changing the workspace fingerprint, so an approval wait could otherwise end with
+evidence that no longer exists. When a `HumanApprovalPort` is configured: after the approval matches,
+acceptance authenticates every cited evidence reference again (a failure is `unavailable`,
+`evidence_unverifiable`), and the controller asks the completion gate again for the same
+fingerprint before the fingerprint re-check (a gate that no longer passes, or fails, blocks the run
+with `completion_gate_changed_after_acceptance`). This covers both reviewer-cited evidence and the
+evidence the gate's requirements rely on. Without a human approval there is no wait between the
+checks and the gate runs once, as before. Without a human approval a few awaits (the fingerprint re-check) still separate the last evidence check from the write; evidence deleted exactly there is not detected (a confirmed, tiny, accepted window with no wait involved). Everything remains point-in-time: evidence or workspace
+state can still change between the last check and the fenced database write, which cannot be made
+atomic without a transaction spanning the artifact store, the filesystem and SQLite.
+
+Reviewer independence and coverage (R2 review). `min_reviewers` counts distinct reviewer workers,
+never tasks: the same worker scheduled twice is one reviewer. `required_tasks` defaults to empty,
+and an empty set makes the coverage condition trivially true, so a host that wants every
+deliverable reviewed must name its required tasks; this default is unchanged and is host policy.
+
 Cycles and evidence authority. A reviewer's record stores, for each reviewed task, the cycle the host
 proved from the task's compiler-derived id, never a value written by the model. The cycle shown in the
 reviewer's context is informational: a same-cycle dependency has none, and a shown value that

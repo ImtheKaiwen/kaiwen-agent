@@ -280,8 +280,12 @@ def test_min_reviewers_is_enforced(tmp_path: Path) -> None:
     async def scenario() -> None:
         t = await team(tmp_path)
         expect(await t.decide(min_reviewers=2), Status.BLOCKED, "review_missing")
+        # The same reviewer worker scheduled twice is one reviewer, not two independent ones.
         await t.add_reviewer("review_b")
-        expect(await t.decide(min_reviewers=2), Status.ACCEPTED, "accepted")
+        expect(await t.decide(min_reviewers=2), Status.BLOCKED, "review_missing")
+        await t.add_reviewer("review_c", agent="reviewer2")
+        both = {"reviewer": "reviewer", "reviewer2": "reviewer"}
+        expect(await t.decide(min_reviewers=2, reviewer_workers=both), Status.ACCEPTED, "accepted")
 
     run_async(scenario)
 

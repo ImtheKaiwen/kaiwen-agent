@@ -60,6 +60,10 @@ What already exists and what was checked:
    label fails closed. The acceptance assembler must use the authoritative task store and, while
    evidence is required, the platform completion gate's artifact manager and signer by identity. An
    approval cannot leave a criterion `unknown`.
+8. R2: because evidence can be deleted or expire during a human approval wait with the fingerprint
+   unchanged, a configured approval is followed by a second authentication of the cited evidence and
+   a second completion gate evaluation before the fingerprint re-check. No new store or engine; the
+   checks stay point-in-time, not atomic with the database write.
 
 ## Consequences
 

@@ -243,7 +243,7 @@ class TeamAcceptance:
         current = sorted((r for r in candidates if cycles[r.id] == newest), key=lambda r: r.id)
         if any(r.status is not TaskStatus.COMPLETED for r in current):
             return _decide(TeamAcceptanceStatus.BLOCKED, "review_not_completed")
-        if len(current) < policy.min_reviewers:
+        if len({r.agent_id for r in current}) < policy.min_reviewers:
             return _decide(TeamAcceptanceStatus.BLOCKED, "review_missing")
         workspace_id = run.workspace_binding.workspace_id if run.workspace_binding else None
         reviews: list[VerifiedReview] = []
@@ -308,6 +308,17 @@ class TeamAcceptance:
                     ids=reviewer_ids,
                     subject=subject_digest,
                 )
+            if policy.require_evidence:
+                # The approval may have been awaited for a long time: evidence authenticated
+                # before it can have been deleted or expired since, with the fingerprint intact.
+                for review in reviews:
+                    if not await self._evidence_authentic(review, run):
+                        return _decide(
+                            TeamAcceptanceStatus.UNAVAILABLE,
+                            "evidence_unverifiable",
+                            ids=reviewer_ids,
+                            subject=subject_digest,
+                        )
         return _decide(
             TeamAcceptanceStatus.ACCEPTED, "accepted", ids=reviewer_ids, subject=subject_digest
         )
@@ -360,12 +371,13 @@ class TeamAcceptance:
         if policy.require_evidence:
             if not review.evidence_refs:
                 return _decide(TeamAcceptanceStatus.CHANGES_REQUIRED, "no_authenticated_evidence")
-            again = await self.assembler.owned_references(
-                review.evidence_refs, run, authenticate=True
-            )
-            if sorted(again) != sorted(review.evidence_refs):
+            if not await self._evidence_authentic(review, run):
                 return _decide(TeamAcceptanceStatus.UNAVAILABLE, "evidence_unverifiable")
         return None
+
+    async def _evidence_authentic(self, review: VerifiedReview, run: RuntimeRunRecord) -> bool:
+        again = await self.assembler.owned_references(review.evidence_refs, run, authenticate=True)
+        return sorted(again) == sorted(review.evidence_refs)
 
 
 def _subject(

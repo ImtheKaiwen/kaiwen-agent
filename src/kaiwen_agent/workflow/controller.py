@@ -834,6 +834,38 @@ class WorkflowController:
                             reason=f"team_{decision.status.value}:{decision.code}",
                             acceptance=decision,
                         )
+                    if self.team_acceptance.policy.human_approval is not None:
+                        # A human approval may have been awaited for a long time, and the
+                        # evidence the gate judged can have been deleted or expired meanwhile
+                        # with the fingerprint intact. Ask the gate again for the same state.
+                        try:
+                            again = await self.completion_gate.evaluate(
+                                standards,
+                                context=VerificationContext(
+                                    tenant_id=run.tenant_id,
+                                    user_id=run.user_id,
+                                    session_id=run.session_id,
+                                    trace_id=identity.trace_id or f"trace_{run.id}",
+                                    run_id=run.id,
+                                    protected_input_fingerprint=gate_fingerprint,
+                                ),
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            logger.warning("Completion gate failed after acceptance", exc_info=True)
+                            again = None
+                        if again is None or again.status != CompletionGateStatus.PASS:
+                            return await self._blocked(
+                                writer=writer,
+                                run=run,
+                                identity=identity,
+                                cycle=cycle,
+                                tasks=all_tasks,
+                                quality=again or latest_quality,
+                                reason="completion_gate_changed_after_acceptance",
+                                acceptance=decision,
+                            )
                     if self.fingerprint_provider is not None:
                         # Acceptance may have awaited an external approval for a long time: the
                         # acceptance describes the state it was computed for, so check once

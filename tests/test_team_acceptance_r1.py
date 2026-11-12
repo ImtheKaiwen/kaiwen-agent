@@ -18,7 +18,7 @@ from kaiwen_agent.artifacts import ArtifactManager
 from kaiwen_agent.exceptions import FencedConfigurationError, RunOwnershipError
 from kaiwen_agent.kits.coding import EvidenceSigner
 from kaiwen_agent.persistence import SQLitePersistence
-from kaiwen_agent.quality import CompletionGate, VerifierRegistry
+from kaiwen_agent.quality import CompletionGate, CompletionGateStatus, VerifierRegistry
 from kaiwen_agent.runtime import RuntimeRunStatus
 from kaiwen_agent.types import ModelResponse
 from kaiwen_agent.workflow import (
@@ -380,5 +380,162 @@ def test_an_approval_cannot_leave_criteria_unknown(tmp_path: Path) -> None:
             requested_changes=["check them"],
         )
         assert rv.contradiction(changes) is None
+
+    run_async(scenario)
+
+
+# ------------------------------------------------------------------------------- R2 finding
+
+
+def test_evidence_deleted_while_a_human_approval_is_pending_never_completes(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        human = GatedHuman()
+        harness = TeamHarness(tmp_path, human=human)
+        run = await harness.flow.new_run()
+        pending = asyncio.ensure_future(harness.execute(run))
+        await human.started.wait()
+        # Same fingerprint, but the cited evidence disappears while approval is awaited.
+        await harness.artifacts.delete(_artifact_context(run.id), harness.evidence_ref)
+        human.release.set()  # a valid approval for the original subject
+        outcome = await pending
+        team_blocked(outcome, "unavailable", "evidence_unverifiable")
+        assert await harness.status(run) is RuntimeRunStatus.BLOCKED
+        assert human.subjects[0].fingerprint == "fp-1"
+
+    run_async(scenario)
+
+
+def test_the_gate_is_asked_again_after_a_slow_approval_and_may_withdraw_its_pass(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        human = GatedHuman()
+        harness = TeamHarness(tmp_path, human=human)
+        run = await harness.flow.new_run()
+        pending = asyncio.ensure_future(harness.execute(run))
+        await human.started.wait()
+        harness.gate.status = CompletionGateStatus.BLOCKED  # gate evidence became invalid
+        human.release.set()
+        outcome = await pending
+        blocked(outcome, "completion_gate_changed_after_acceptance")
+        assert harness.gate.calls == 2
+        assert await harness.status(run) is RuntimeRunStatus.BLOCKED
+
+    run_async(scenario)
+
+
+def test_without_a_human_approval_the_gate_runs_once_as_before(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        harness = TeamHarness(tmp_path)
+        run = await harness.flow.new_run()
+        assert (await harness.execute(run)).status is WorkflowOutcomeStatus.COMPLETED
+        assert harness.gate.calls == 1
+
+    run_async(scenario)
+
+
+def test_evidence_deleted_after_a_blocked_run_is_noticed_on_replay(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        harness = TeamHarness(tmp_path, human=Human(HumanApprovalStatus.PENDING))
+        run = await harness.flow.new_run()
+        team_blocked(await harness.execute(run), "approval_required", "human_approval_pending")
+        await harness.artifacts.delete(_artifact_context(run.id), harness.evidence_ref)
+        harness.human.status = HumanApprovalStatus.APPROVED
+        team_blocked(await harness.execute(run), "unavailable", "evidence_unverifiable")
+
+    run_async(scenario)
+
+
+def test_a_gate_that_fails_when_asked_again_after_approval_blocks_the_run(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        human = GatedHuman()
+        harness = TeamHarness(tmp_path, human=human)
+
+        def fail_second_time() -> None:
+            if harness.gate.calls >= 1:
+                raise RuntimeError("gate backend unavailable")
+
+        harness.gate.hook = fail_second_time
+        run = await harness.flow.new_run()
+        pending = asyncio.ensure_future(harness.execute(run))
+        await human.started.wait()
+        human.release.set()
+        blocked(await pending, "completion_gate_changed_after_acceptance")
+        assert await harness.status(run) is RuntimeRunStatus.BLOCKED
+
+    run_async(scenario)
+
+
+def _record_gate_fingerprints(harness: TeamHarness) -> list[str]:
+    seen: list[str] = []
+    original = harness.real_gate.evaluate
+
+    async def spy(resolution: Any, *, context: Any) -> Any:
+        seen.append(context.protected_input_fingerprint)
+        return await original(resolution, context=context)
+
+    setattr(harness.real_gate, "evaluate", spy)  # noqa: B010
+    return seen
+
+
+def test_the_second_gate_evaluation_uses_the_fingerprint_of_the_first(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        human = GatedHuman()
+        harness = TeamHarness(tmp_path, human=human)
+        seen = _record_gate_fingerprints(harness)
+        run = await harness.flow.new_run()
+        pending = asyncio.ensure_future(harness.execute(run))
+        await human.started.wait()
+        harness.fingerprints.value = "fp-2"  # the live workspace moves during the approval
+        human.release.set()
+        blocked(await pending, "workspace_changed_after_acceptance")
+        # Both gate evaluations judged the same state; the move is caught by the fingerprint check.
+        assert seen == ["fp-1", "fp-1"]
+
+    run_async(scenario)
+
+
+def test_cancellation_during_the_second_gate_evaluation_propagates(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        human = GatedHuman()
+        harness = TeamHarness(tmp_path, human=human)
+
+        def cancel_second_time() -> None:
+            if harness.gate.calls >= 1:
+                raise asyncio.CancelledError
+
+        harness.gate.hook = cancel_second_time
+        run = await harness.flow.new_run()
+        pending = asyncio.ensure_future(harness.execute(run))
+        await human.started.wait()
+        human.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert await harness.status(run) is not RuntimeRunStatus.COMPLETED
+
+    run_async(scenario)
+
+
+def test_ownership_loss_during_the_second_gate_evaluation_never_completes(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        human = GatedHuman()
+        harness = TeamHarness(tmp_path, human=human)
+
+        def lose_lease_second_time() -> None:
+            if harness.gate.calls >= 1:
+                harness.flow.clock.advance(3600)
+
+        harness.gate.hook = lose_lease_second_time
+        run = await harness.flow.new_run()
+        pending = asyncio.ensure_future(harness.execute(run))
+        await human.started.wait()
+        human.release.set()
+        with pytest.raises(RunOwnershipError):
+            await pending
+        assert await harness.status(run) is not RuntimeRunStatus.COMPLETED
 
     run_async(scenario)
