@@ -124,6 +124,9 @@ def contradiction(assessment: ReviewAssessment) -> str | None:
         return None
     if any(item.verdict == "not_met" for item in assessment.criteria):
         return "approve_with_unmet_criteria"
+    if any(item.verdict == "unknown" for item in assessment.criteria):
+        # An approval must not silently imply that a criterion it could not assess passed.
+        return "approve_with_unknown_criteria"
     if any(item.severity in {"major", "blocking"} for item in assessment.findings):
         return "approve_with_serious_findings"
     if assessment.unresolved_concerns or assessment.requested_changes:
@@ -215,9 +218,14 @@ async def build_review_record(
     reviewer: AgentTask,
     read_task: ReadTask,
     authenticate: Authenticate,
-    is_proven: Callable[[AgentTask], bool],
+    cycle_of: Callable[[AgentTask], int | None],
 ) -> dict[str, Any]:
-    """Finalize the staged assessment into the canonical record stored in the task output."""
+    """Finalize the staged assessment into the canonical record stored in the task output.
+
+    `cycle_of` returns a task's compiler-proven cycle (or None when its identity is not proven).
+    The recorded cycle is always that authoritative value. The cycle the reviewer was shown is only
+    informational: absent for a same-cycle dependency, and when present it must agree.
+    """
 
     assessment = session.seal()
     reviewed: list[dict[str, Any]] = []
@@ -231,16 +239,20 @@ async def build_review_record(
             or task.metadata.get("runtime_run_id") != run.id
             or (task.tenant_id, task.user_id, task.session_id)
             != (run.tenant_id, run.user_id, run.session_id)
-            or not is_proven(task)
         ):
             raise ReviewRecordError("reviewed_task_unavailable")
+        cycle = cycle_of(task)
+        if cycle is None:
+            raise ReviewRecordError("reviewed_task_unavailable")
+        if source.cycle is not None and source.cycle != cycle:
+            raise ReviewRecordError("reviewed_cycle_conflict")
         if task.agent_id == reviewer.agent_id:
             raise ReviewRecordError("self_review")
         reviewed.append(
             {
                 "logical_id": logical,
                 "task_id": task.id,
-                "cycle": source.cycle,
+                "cycle": cycle,
                 "worker_id": task.agent_id,
                 "output_digest": output_digest(task),
             }
@@ -339,6 +351,7 @@ def verify_review_record(
             isinstance(item.get("logical_id"), str)
             and isinstance(item.get("task_id"), str)
             and isinstance(item.get("output_digest"), str)
+            and type(item.get("cycle")) is int  # the host-proven cycle, never absent or foreign
         ):
             raise ReviewRecordError("review_record_invalid")
     if sorted(str(item["logical_id"]) for item in reviewed) != sorted(

@@ -53,6 +53,14 @@ What already exists and what was checked:
    ledger (or a cycle cursor to resume after a decision), which is a new authority design. It stays
    blocked with `delegation_approval_required`, and a reviewer recommendation never approves it.
 
+7. Independent audit R1 corrections (same decision, no new authority). After acceptance returns
+   `accepted` the controller re-reads the protected fingerprint immediately before the terminal
+   transition (a point-in-time check, not atomic with the database write). A review records the
+   compiler-proven cycle of each reviewed task, so a same-cycle dependency is valid and a conflicting
+   label fails closed. The acceptance assembler must use the authoritative task store and, while
+   evidence is required, the platform completion gate's artifact manager and signer by identity. An
+   approval cannot leave a criterion `unknown`.
+
 ## Consequences
 
 - No schema change and no new authority store; older code ignores the extra output key.

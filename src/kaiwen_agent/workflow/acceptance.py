@@ -33,7 +33,7 @@ from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from kaiwen_agent.quality import CompletionGateResult, CompletionGateStatus
+from kaiwen_agent.quality import CompletionGate, CompletionGateResult, CompletionGateStatus
 from kaiwen_agent.runtime import DurableRunManager, RuntimeRunRecord
 from kaiwen_agent.tasks import AgentTask, TaskRunQuery, TaskStatus
 from kaiwen_agent.workflow.models import TeamAcceptanceDecision, TeamAcceptanceStatus
@@ -45,7 +45,11 @@ from kaiwen_agent.workflow.review import (
     verify_review_record,
 )
 from kaiwen_agent.workflow.run_tasks import RunTaskScanError, scan_run_tasks
-from kaiwen_agent.workflow.task_context import TaskContextAssembler, proven_cycle
+from kaiwen_agent.workflow.task_context import (
+    TaskContextAssembler,
+    _same_authority,
+    proven_cycle,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +140,41 @@ class TeamAcceptance:
     tasks: TaskRunQuery
     runs: DurableRunManager
     assembler: TaskContextAssembler
+
+    def composition_issues(self, completion_gate: object) -> list[str]:
+        """Why this acceptance does not verify evidence like the workflow's completion gate.
+
+        Identity only; matching ids, paths, protocols or flags never count. The task store must
+        be the authoritative one. When evidence is required, the assembler must authenticate with
+        the very artifact manager the platform `CompletionGate` reads and the very signer its
+        evidence verifiers use (the same relation `CodingWorkspace` already requires of a
+        controller). A gate that is not the platform `CompletionGate` cannot be inspected, so it
+        cannot be proven consistent and is refused rather than trusted.
+        """
+
+        issues: list[str] = []
+        if not _same_authority(self.assembler.store, self.tasks):
+            issues.append("assembler_reads_a_different_task_store")
+        if not self.policy.require_evidence:
+            return issues
+        signer = self.assembler.evidence_signer
+        if signer is None:
+            issues.append("assembler_has_no_evidence_signer")
+        if type(completion_gate) is not CompletionGate:
+            issues.append("completion_gate_evidence_pipeline_not_inspectable")
+            return issues
+        if self.assembler.artifacts is not completion_gate.artifacts:
+            issues.append("assembler_uses_different_artifacts")
+        verifier_signers = [
+            getattr(completion_gate.verifiers.get(verifier_id), "signer", None)
+            for verifier_id in ("coding.tests", "coding.acceptance")
+        ]
+        trusted = [candidate for candidate in verifier_signers if candidate is not None]
+        if not trusted:
+            issues.append("completion_gate_has_no_signed_evidence_verifier")
+        elif signer is not None and any(candidate is not signer for candidate in trusted):
+            issues.append("assembler_uses_a_different_evidence_signer")
+        return issues
 
     async def evaluate(
         self,
@@ -309,7 +348,7 @@ class TeamAcceptance:
             if output_digest(source) != item["output_digest"]:
                 return _decide(TeamAcceptanceStatus.CHANGES_REQUIRED, "reviewed_work_changed")
             if latest.get(str(item["logical_id"])) is not source or (
-                cycles[source.id] != item.get("cycle", cycles[source.id])
+                cycles[source.id] != item["cycle"]
             ):
                 return _decide(TeamAcceptanceStatus.CHANGES_REQUIRED, "reviewed_work_superseded")
         if not policy.required_tasks <= covered:

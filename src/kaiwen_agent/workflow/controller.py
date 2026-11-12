@@ -305,6 +305,12 @@ class WorkflowController:
                 raise FencedConfigurationError(
                     "Team acceptance must read the controller's durable runs"
                 )
+            composition = team_acceptance.composition_issues(completion_gate)
+            if composition:
+                raise FencedConfigurationError(
+                    "Team acceptance evidence is not verified like the completion gate: "
+                    + "; ".join(composition)
+                )
             for worker_id, role in team_acceptance.policy.reviewer_workers.items():
                 if worker_id not in compiler.worker_allowlist:
                     raise ValueError("A reviewer worker must be allowlisted by the compiler")
@@ -828,6 +834,34 @@ class WorkflowController:
                             reason=f"team_{decision.status.value}:{decision.code}",
                             acceptance=decision,
                         )
+                    if self.fingerprint_provider is not None:
+                        # Acceptance may have awaited an external approval for a long time: the
+                        # acceptance describes the state it was computed for, so check once
+                        # more, immediately before the terminal transition, that the protected
+                        # input is still that state. A point-in-time check, not atomic with the
+                        # (fenced) database write that follows.
+                        try:
+                            current = await self._fresh_fingerprint(run, identity)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            logger.warning(
+                                "Protected input unavailable after acceptance", exc_info=True
+                            )
+                            current = ""
+                        if current != gate_fingerprint:
+                            return await self._blocked(
+                                writer=writer,
+                                run=run,
+                                identity=identity,
+                                cycle=cycle,
+                                tasks=all_tasks,
+                                quality=latest_quality,
+                                reason="workspace_changed_after_acceptance"
+                                if current
+                                else "protected_input_unavailable",
+                                acceptance=decision,
+                            )
                     accepted_decision: TeamAcceptanceDecision | None = decision
                 else:
                     accepted_decision = None

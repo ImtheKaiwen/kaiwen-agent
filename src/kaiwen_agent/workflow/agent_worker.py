@@ -343,7 +343,7 @@ class AgentRuntimeWorker:
                 authenticate=lambda refs, run: self.assembler.owned_references(
                     refs, run, authenticate=True
                 ),
-                is_proven=lambda source: proven_cycle(source, record) is not None,
+                cycle_of=lambda source: proven_cycle(source, record),
             )
         return output
 

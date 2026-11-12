@@ -357,6 +357,21 @@ RECORD_FAILURES: list[tuple[str, dict[str, Any], str]] = [
     ("fingerprint_type", {"mutate": lambda b: b.update(fingerprint=7)}, "review_record_invalid"),
     ("reviewed_mismatch", {"mutate": lambda b: b["reviewed"].pop()}, "review_record_invalid"),
     (
+        "cycle_missing",
+        {"mutate": lambda b: b["reviewed"][0].pop("cycle")},
+        "review_record_invalid",
+    ),
+    (
+        "cycle_text",
+        {"mutate": lambda b: b["reviewed"][0].update(cycle="2")},
+        "review_record_invalid",
+    ),
+    (
+        "cycle_bool",
+        {"mutate": lambda b: b["reviewed"][0].update(cycle=True)},
+        "review_record_invalid",
+    ),
+    (
         "contradiction",
         {"assessment_fields": {"unresolved_concerns": ["still unsure"]}},
         "review_record_invalid",
@@ -457,6 +472,17 @@ def test_reviewing_a_superseded_revision_of_a_task_requires_a_new_review(tmp_pat
     async def scenario() -> None:
         t = await team(tmp_path)
         await t.env.seed(t.run, 3, "code", parent=t.tasks["lead"], output={"summary": "v2"})
+        expect(await t.decide(), Status.CHANGES_REQUIRED, "reviewed_work_superseded")
+
+    run_async(scenario)
+
+
+def test_a_recorded_cycle_that_is_not_the_authoritative_cycle_is_superseded(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        t = await team(tmp_path, with_reviewer=False)
+        await t.add_reviewer(mutate=lambda b: b["reviewed"][0].update(cycle=3))
         expect(await t.decide(), Status.CHANGES_REQUIRED, "reviewed_work_superseded")
 
     run_async(scenario)

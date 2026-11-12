@@ -10,7 +10,11 @@
   `changes_required`, `approval_required`, `blocked` or `unavailable` (`WorkflowOutcome.team_acceptance`,
   block reason `team_<status>:<code>`); `HumanApprovalPort` for a host-supplied human decision bound to
   a digest of the exact delivery. `proven_cycle` is now public. No new table; the
-  default behavior is unchanged; approval-required delegation stays blocked.
+  default behavior is unchanged; approval-required delegation stays blocked. Audit R1: acceptance
+  re-checks the protected fingerprint right before completion (`workspace_changed_after_acceptance`),
+  a review records the proven cycle (same-cycle dependency reviews are valid), acceptance evidence
+  must be verified with the completion gate's artifact manager and signer, and an approval cannot
+  leave a criterion unknown.
 - Add bounded earlier-cycle task handoffs (M6.3.3-C3, ADR 0015): opt-in `CrossCycleHandoffs` for
   `TaskContextAssembler` and `AgentRuntimeWorker(cross_cycle=..., evidence_signer=...)`. A task with
   a compiler-written delegation parent receives informational `TaskHandoff`s (new optional fields

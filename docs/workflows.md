@@ -334,6 +334,37 @@ delegation is a separate boundary and stays blocked (`delegation_approval_requir
 safely needs a durable proposal approval ledger or cycle cursor that this milestone does not add
 (ADR 0017); a reviewer recommendation never approves a delegation.
 
+Freshness at completion. Acceptance may wait on an external approval, so after it returns
+`accepted` the controller reads the protected fingerprint once more, immediately before the terminal
+transition, whenever a fingerprint provider is configured. A different value blocks the run with
+`workspace_changed_after_acceptance` and an unreadable one with `protected_input_unavailable`; the
+run is never completed against the earlier state. This is a point-in-time check: the filesystem
+and the SQLite write are not one atomic step, so a change after the check and before the write
+cannot be detected. Without a fingerprint provider nothing is checked, as before. An approval is
+bound to the fingerprint of its subject, so an approval for an earlier fingerprint never matches a
+later one.
+
+Cycles and evidence authority. A reviewer's record stores, for each reviewed task, the cycle the host
+proved from the task's compiler-derived id, never a value written by the model. The cycle shown in the
+reviewer's context is informational: a same-cycle dependency has none, and a shown value that
+disagrees with the proven one fails the review closed. A record whose cycle is missing or not an
+integer is unavailable. Review evidence is re-authenticated at acceptance with the assembler of the
+`TeamAcceptance`, so the controller requires that assembler to read the authoritative task store and,
+when evidence is required, to use the very artifact manager of the platform `CompletionGate` and the
+signer that gate's signed evidence verifiers (`coding.tests`, `coding.acceptance`) use, by object
+identity. A gate that is not the platform `CompletionGate` cannot be inspected and is refused while
+evidence is required. A foreign signer would authenticate evidence the gate rejects, which is the
+exploitable case; a foreign task store changes nothing in acceptance and is refused only as
+configuration hygiene.
+
+Reviewer contract. An approval is refused at submission when any criterion is `not_met` or
+`unknown`, or when serious findings or open items exist; it must not imply a criterion passed that the
+reviewer could not assess. A cited evidence reference that the host authenticated is evidence of the
+run (owner, run, content and trusted origin), not a proof that it concerns a particular reviewed
+task: the platform artifacts carry no task provenance, so no such relation is claimed. Authentic but
+unrelated run evidence can satisfy only the policy's "evidence was cited" condition; the completion
+gate alone decides whether a requirement is met.
+
 Durable and restart behavior. Durable: each reviewer's record, inside its own task row, written with
 the task's COMPLETED status. Recomputed every time: the acceptance decision, the gate verdict and the
 fingerprint. After a restart the same stored outputs give the same decision, or a different one if

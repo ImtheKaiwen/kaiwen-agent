@@ -132,7 +132,7 @@ def test_the_finalized_record_binds_host_facts_and_keeps_only_authentic_evidence
             reviewer=reviewer,
             read_task=t.env.store.get_task,
             authenticate=authenticate,
-            is_proven=lambda task: True,
+            cycle_of=lambda task: 2,
         )
         assert record["evidence_refs"] == [t.evidence] and record["unverified_reference_count"] == 1
         assert record["run_id"] == t.run.id and record["reviewer_task_id"] == reviewer.id
@@ -183,10 +183,43 @@ def test_a_reviewer_whose_work_cannot_be_re_read_or_proven_fails_to_finalize(
                 reviewer=reviewer,
                 read_task=read,
                 authenticate=authenticate,
-                is_proven=lambda task: case != "unproven",
+                cycle_of=lambda task: None if case == "unproven" else 2,
             )
         expected = "self_review" if case == "self_review" else "reviewed_task_unavailable"
         assert raised.value.code == expected
+
+    run_async(scenario)
+
+
+def test_the_recorded_cycle_is_the_proven_one_and_a_conflicting_label_fails_closed(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        t = await team(tmp_path, with_reviewer=False)
+        reviewer = await t.env.seed(t.run, 3, "review", parent=t.tasks["plan2"], agent="reviewer")
+
+        async def authenticate(refs: Any, run: Any) -> list[str]:
+            return []
+
+        async def build(label: int | None) -> dict[str, Any]:
+            shown = rv.ShownSource("code", t.tasks["code"].id, label)
+            session = session_for(t.run, shown, task_id=reviewer.id)
+            assert session.submit(assessment(reviewed=("code",)))[0] == "accepted"
+            return await rv.build_review_record(
+                session,
+                run=t.run,
+                reviewer=reviewer,
+                read_task=t.env.store.get_task,
+                authenticate=authenticate,
+                cycle_of=lambda task: 2,
+            )
+
+        # A same-cycle dependency has no informational label: the proven cycle is recorded.
+        assert (await build(None))["reviewed"][0]["cycle"] == 2
+        assert (await build(2))["reviewed"][0]["cycle"] == 2
+        for wrong in (1, 3, 99):
+            with pytest.raises(ReviewRecordError, match="reviewed_cycle_conflict"):
+                await build(wrong)
 
     run_async(scenario)
 

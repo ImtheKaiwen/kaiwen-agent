@@ -21,6 +21,7 @@ import pytest
 
 from kaiwen_agent.artifacts import ArtifactManager
 from kaiwen_agent.exceptions import FencedConfigurationError, RunOwnershipError
+from kaiwen_agent.kits.coding.verification.pipeline import TrustedEvidencePipeline
 from kaiwen_agent.persistence import SQLitePersistence
 from kaiwen_agent.policy import (
     DelegationAdmission,
@@ -29,7 +30,12 @@ from kaiwen_agent.policy import (
     PolicyEngine,
     PolicyRegistry,
 )
-from kaiwen_agent.quality import CompletionGateResult, CompletionGateStatus
+from kaiwen_agent.quality import (
+    CompletionGate,
+    CompletionGateResult,
+    CompletionGateStatus,
+    VerifierRegistry,
+)
 from kaiwen_agent.realtime import (
     ConversationMessage,
     ConversationModality,
@@ -164,6 +170,15 @@ class TeamHarness:
         self.flow = FencedFlow(tmp_path)
         self.gate = HookGate()
         self.artifacts = ArtifactManager()
+        # The platform gate over the shared trusted evidence pipeline; only its verdict is
+        # scripted (the instance's `evaluate` is replaced by the spy).
+        self.pipeline = TrustedEvidencePipeline.build(
+            artifacts=self.artifacts, signer=SIGNER, bindings=(), trusted_runners=(object(),)
+        )
+        registry = VerifierRegistry()
+        self.pipeline.install_verifiers(registry)
+        self.real_gate = CompletionGate(verifiers=registry, artifacts=self.artifacts)
+        setattr(self.real_gate, "evaluate", self.gate.evaluate)  # noqa: B010
         self.conversations = InMemoryConversationStore()
         self.fingerprints = Fingerprints()
         self.evidence_ref = ""
@@ -340,7 +355,7 @@ class TeamHarness:
             "runs": self.flow.runs,
             "compiler": self.compiler,
             "scheduler_factory": self.flow.scheduler,
-            "completion_gate": self.gate,
+            "completion_gate": self.real_gate,
             "leases": self.flow.leases,
             "fenced": self.flow.fenced,
             "lease_owner_id": "controller-1",
