@@ -566,8 +566,9 @@ Each defect was reproduced with a failing test before its fix.
       (a protocol-conforming foreign store with matching ids fed forged handoffs in a
       reproduction), and a missing selected output or an unprovable lineage row makes the
       result `unavailable` rather than `complete`.
-- [~] M6.3.4 reviewer assessment and team acceptance (draft pull request, pending independent
-      audit; ADR 0017, Proposed): a reviewer is an `AgentRuntimeWorker(review=ReviewTools())`
+- [x] M6.3.4 reviewer assessment and team acceptance (pull request 18, squash commit
+      `2ab7baeb266988dc5083e8ce5c2ebd06293d69a5`, merged after a fresh-context audit; ADR 0017,
+      Proposed): a reviewer is an `AgentRuntimeWorker(review=ReviewTools())`
       whose one `review.submit` assessment is finalized into its own task output with the existing
       scheduler write, bound by the host to the run, owner, workspace, its task id, a digest of
       each reviewed output and the fingerprint. Opt-in `WorkflowController(team_acceptance=...)`
@@ -578,6 +579,11 @@ Each defect was reproduced with a failing test before its fix.
       ledger. Verified by a real four-role SQLite flow, adversarial and recovery tests and mutation
       checks; no external model was run. Not done: resolving an approval-required delegation (it
       stays blocked; see ADR 0017), a first-party human approval store, general resume.
+      Accepted limitations: every check is point-in-time and not atomic with the database write;
+      replay is at-least-once; the review digest is a hash, not a signature. Known low-severity
+      technical debt (not blocking, no behavior change planned here): `TeamAcceptancePolicy`
+      accepts `required_tasks="code"` as the characters of the string (fails closed as a denial)
+      and `min_reviewers=True` as 1; both could be rejected at construction.
 - Not done: beta integration, resolving approval-required delegation and a durable cycle
   cursor. There is no atomic reservation of delegation quotas: delegation at the cycle
   boundary is safe only because the run lease holder alone writes the run's tasks (enforced by
