@@ -382,7 +382,7 @@ class TaskContextAssembler:
             config.expected_workspace
         ):
             return unavailable("workspace_mismatch")
-        cycle = _identified_cycle(task, run)
+        cycle = proven_cycle(task, run)
         if cycle is None:
             return unavailable("task_identity_invalid")
         failure: str | None = None
@@ -403,11 +403,11 @@ class TaskContextAssembler:
         parent = rows.get(task.parent_id)
         if (
             parent is None
-            or _identified_cycle(parent, run) is None
+            or proven_cycle(parent, run) is None
             or parent.delegation_depth != task.delegation_depth - 1
         ):
             return unavailable("parent_not_found")
-        parent_cycle = _identified_cycle(parent, run)
+        parent_cycle = proven_cycle(parent, run)
         assert parent_cycle is not None
         if parent_cycle >= cycle:
             return unavailable("parent_not_earlier")
@@ -416,7 +416,7 @@ class TaskContextAssembler:
         grandparent: AgentTask | None = None
         if parent.parent_id is not None:
             grandparent = rows.get(parent.parent_id)
-            grand_cycle = _identified_cycle(grandparent, run) if grandparent else None
+            grand_cycle = proven_cycle(grandparent, run) if grandparent else None
             if (
                 grandparent is None
                 or grand_cycle is None
@@ -434,7 +434,7 @@ class TaskContextAssembler:
                 or row.delegation_depth != parent.delegation_depth
             ):
                 continue
-            row_cycle = _identified_cycle(row, run)
+            row_cycle = proven_cycle(row, run)
             if row_cycle is None:
                 # Sits where a sibling would, but its cycle and logical id are not proven by its
                 # id (forged or corrupted): the host cannot trust the selection.
@@ -466,7 +466,7 @@ class TaskContextAssembler:
                 handoff.model_copy(
                     update={
                         "origin": "prior_cycle",
-                        "source_cycle": _identified_cycle(source, run),
+                        "source_cycle": proven_cycle(source, run),
                         "source_worker_id": source.agent_id,
                         "relation": relation,
                         "role": config.roles.get(source.agent_id),
@@ -617,7 +617,7 @@ def _is_platform_fenced(candidate: object) -> bool:
     return type(candidate) is FencedTaskStore
 
 
-def _identified_cycle(task: AgentTask | None, run: RuntimeRunRecord) -> int | None:
+def proven_cycle(task: AgentTask | None, run: RuntimeRunRecord) -> int | None:
     """A task's cycle, only if the run owns it and its id is the compiler-derived one."""
 
     if task is None or not belongs_to_run(task, run):

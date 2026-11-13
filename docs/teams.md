@@ -148,6 +148,11 @@ itself records for its own audit trail.
 
 Not part of this layer yet: the cycle-boundary integration with an explicit revision reason
 and the final authorization (PR-C1, merged), model-facing proposal tools and durable
-proposals (PR-C2, see `docs/workflows.md`), bounded cross-cycle handoff (PR-C3, see `docs/workflows.md`), reviewer approval and team
-acceptance
-(M6.3.4), isolated parallel writers or worktree merging.
+proposals (PR-C2, see `docs/workflows.md`), bounded cross-cycle handoff (PR-C3, see `docs/workflows.md`), reviewer assessment and team
+acceptance (M6.3.4, see `docs/workflows.md`), isolated parallel writers or worktree merging.
+
+`TeamHandoff` stays a bounded result envelope: its fields are model-authored and are never read as
+verified findings, a review record or an acceptance certificate. `TeamRuntime`, `JobManager` and
+the Coding Team facade are unchanged; reviewer assessment and team acceptance exist only on the
+workflow path (`WorkflowController`), so there is one definition of "accepted": the
+`TeamAcceptanceDecision` the host computes there.

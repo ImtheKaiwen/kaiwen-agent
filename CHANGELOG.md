@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- Add reviewer assessment and host-controlled team acceptance (M6.3.4, ADR 0017 Proposed):
+  `AgentRuntimeWorker(review=ReviewTools())` with the strict, bounded `review.submit` tool, finalized
+  into the reviewer's own task output and bound by the host to run, owner, workspace, its task id,
+  per-task output digests and the fingerprint; opt-in `WorkflowController(team_acceptance=
+  TeamAcceptance(...))` evaluated after a passing completion gate, returning `accepted`,
+  `changes_required`, `approval_required`, `blocked` or `unavailable` (`WorkflowOutcome.team_acceptance`,
+  block reason `team_<status>:<code>`); `HumanApprovalPort` for a host-supplied human decision bound to
+  a digest of the exact delivery. `proven_cycle` is now public. No new table; the
+  default behavior is unchanged; approval-required delegation stays blocked. Audit R1: acceptance
+  re-checks the protected fingerprint right before completion (`workspace_changed_after_acceptance`),
+  a review records the proven cycle (same-cycle dependency reviews are valid), acceptance evidence
+  must be verified with the completion gate's artifact manager and signer, and an approval cannot
+  leave a criterion unknown. Audit R2: when a human approval is configured, cited evidence is
+  authenticated again and the completion gate is asked again after the approval and before
+  completion (`completion_gate_changed_after_acceptance`). Operator decisions: with `require_evidence`
+  (default) reviewer-cited evidence must be among the references of the completion gate's `PASS`
+  verifications (`EvidenceMode.AUTHENTIC_RUN_LEGACY` is an explicit opt-in; a gate that verified no
+  evidence blocks acceptance); an empty `required_tasks` is refused unless `allow_partial_review=True`
+  (breaking for opt-in configurations that relied on the empty default); `reviewer_workers` is
+  immutable and the evidence composition is re-verified before acceptance and before completing.
+  The policy normalizes `evidence_mode` to the enum (unknown values and non-bool flags are refused),
+  so a raw string cannot silently disable the gate-verified evidence check.
 - Add bounded earlier-cycle task handoffs (M6.3.3-C3, ADR 0015): opt-in `CrossCycleHandoffs` for
   `TaskContextAssembler` and `AgentRuntimeWorker(cross_cycle=..., evidence_signer=...)`. A task with
   a compiler-written delegation parent receives informational `TaskHandoff`s (new optional fields

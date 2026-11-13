@@ -42,6 +42,7 @@ from kaiwen_agent.tasks import AgentTask, TaskGraph, TaskScheduler, TaskStatus
 from kaiwen_agent.tools.durability import ActionIntentStatus, ActionIntentStore
 from kaiwen_agent.types import utc_now
 from kaiwen_agent.workers import WorkerNotFoundError
+from kaiwen_agent.workflow.acceptance import TeamAcceptance
 from kaiwen_agent.workflow.compiler import DelegationBinding, WorkflowCompiler, WorkflowPlanError
 from kaiwen_agent.workflow.delegation import DelegationCandidate, WorkflowDelegation
 from kaiwen_agent.workflow.fenced import FencedExecution
@@ -49,6 +50,7 @@ from kaiwen_agent.workflow.lead_tools import DurableLeadProposalSource
 from kaiwen_agent.workflow.models import (
     DelegationBoundary,
     DelegationParent,
+    TeamAcceptanceDecision,
     WorkflowLimits,
     WorkflowOutcome,
     WorkflowOutcomeStatus,
@@ -196,6 +198,7 @@ class WorkflowController:
         block_unassociated_actions: bool = False,
         delegation: WorkflowDelegation | None = None,
         fenced: FencedExecution | None = None,
+        team_acceptance: TeamAcceptance | None = None,
     ) -> None:
         if lease_ttl_seconds <= 0:
             raise ValueError("lease_ttl_seconds must be positive")
@@ -283,6 +286,41 @@ class WorkflowController:
                             "A Lead worker's tool configuration differs from the source's"
                         )
 
+        if team_acceptance is not None:
+            # Opt-in and fail-closed at configuration (ADR 0017): acceptance decides whether a
+            # fenced terminal transition may happen, so it reads the controller's own
+            # authoritative storage, never another store, and needs fenced execution.
+            if fenced is None:
+                raise FencedConfigurationError(
+                    "Team acceptance requires fenced execution (ADR 0016)"
+                )
+            if (
+                team_acceptance.tasks is not fenced.persistence
+                and team_acceptance.tasks is not fenced.task_store
+            ):
+                raise FencedConfigurationError(
+                    "Team acceptance must read tasks from the authoritative fenced database"
+                )
+            if team_acceptance.runs is not runs:
+                raise FencedConfigurationError(
+                    "Team acceptance must read the controller's durable runs"
+                )
+            composition = team_acceptance.composition_issues(completion_gate)
+            if composition:
+                raise FencedConfigurationError(
+                    "Team acceptance evidence is not verified like the completion gate: "
+                    + "; ".join(composition)
+                )
+            for worker_id, role in team_acceptance.policy.reviewer_workers.items():
+                if worker_id not in compiler.worker_allowlist:
+                    raise ValueError("A reviewer worker must be allowlisted by the compiler")
+                try:
+                    declared = getattr(compiler.workers.get(worker_id), "role", None)
+                except WorkerNotFoundError:
+                    raise ValueError("A reviewer worker must be registered") from None
+                if declared is not None and declared != role:
+                    raise ValueError("A reviewer worker declares a different role")
+        self.team_acceptance = team_acceptance
         self.runs = runs
         self.compiler = compiler
         self.scheduler_factory = scheduler_factory
@@ -777,6 +815,125 @@ class WorkflowController:
                             if confirmed
                             else "protected_input_unavailable",
                         )
+                if self.team_acceptance is not None:
+                    changed = self._team_composition_problem()
+                    if changed is not None:
+                        return await self._blocked(
+                            writer=writer,
+                            run=run,
+                            identity=identity,
+                            cycle=cycle,
+                            tasks=all_tasks,
+                            quality=latest_quality,
+                            reason=f"team_acceptance_composition_changed:{changed}",
+                        )
+                    decision = await self.team_acceptance.evaluate(
+                        run=run,
+                        gate=latest_quality,
+                        fingerprint=gate_fingerprint
+                        if self.fingerprint_provider is not None
+                        else None,
+                    )
+                    if not decision.accepted:
+                        return await self._blocked(
+                            writer=writer,
+                            run=run,
+                            identity=identity,
+                            cycle=cycle,
+                            tasks=all_tasks,
+                            quality=latest_quality,
+                            reason=f"team_{decision.status.value}:{decision.code}",
+                            acceptance=decision,
+                        )
+                    if self.team_acceptance.policy.human_approval is not None:
+                        # A human approval may have been awaited for a long time, and the
+                        # evidence the gate judged can have been deleted or expired meanwhile
+                        # with the fingerprint intact. Ask the gate again for the same state.
+                        try:
+                            again = await self.completion_gate.evaluate(
+                                standards,
+                                context=VerificationContext(
+                                    tenant_id=run.tenant_id,
+                                    user_id=run.user_id,
+                                    session_id=run.session_id,
+                                    trace_id=identity.trace_id or f"trace_{run.id}",
+                                    run_id=run.id,
+                                    protected_input_fingerprint=gate_fingerprint,
+                                ),
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            logger.warning("Completion gate failed after acceptance", exc_info=True)
+                            again = None
+                        if again is None or again.status != CompletionGateStatus.PASS:
+                            return await self._blocked(
+                                writer=writer,
+                                run=run,
+                                identity=identity,
+                                cycle=cycle,
+                                tasks=all_tasks,
+                                quality=again or latest_quality,
+                                reason="completion_gate_changed_after_acceptance",
+                                acceptance=decision,
+                            )
+                        # The evidence the reviews cited must still be evidence this new gate
+                        # result verified (not assumed from the first evaluation).
+                        evidence_issue = self.team_acceptance.gate_evidence_issue(decision, again)
+                        if evidence_issue is not None:
+                            return await self._blocked(
+                                writer=writer,
+                                run=run,
+                                identity=identity,
+                                cycle=cycle,
+                                tasks=all_tasks,
+                                quality=again,
+                                reason=f"gate_evidence_changed_after_acceptance:{evidence_issue}",
+                                acceptance=decision,
+                            )
+                    changed = self._team_composition_problem()
+                    if changed is not None:
+                        return await self._blocked(
+                            writer=writer,
+                            run=run,
+                            identity=identity,
+                            cycle=cycle,
+                            tasks=all_tasks,
+                            quality=latest_quality,
+                            reason=f"team_acceptance_composition_changed:{changed}",
+                            acceptance=decision,
+                        )
+                    if self.fingerprint_provider is not None:
+                        # Acceptance may have awaited an external approval for a long time: the
+                        # acceptance describes the state it was computed for, so check once
+                        # more, immediately before the terminal transition, that the protected
+                        # input is still that state. A point-in-time check, not atomic with the
+                        # (fenced) database write that follows.
+                        try:
+                            current = await self._fresh_fingerprint(run, identity)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            logger.warning(
+                                "Protected input unavailable after acceptance", exc_info=True
+                            )
+                            current = ""
+                        if current != gate_fingerprint:
+                            return await self._blocked(
+                                writer=writer,
+                                run=run,
+                                identity=identity,
+                                cycle=cycle,
+                                tasks=all_tasks,
+                                quality=latest_quality,
+                                reason="workspace_changed_after_acceptance"
+                                if current
+                                else "protected_input_unavailable",
+                                acceptance=decision,
+                            )
+                    accepted_decision: TeamAcceptanceDecision | None = decision
+                else:
+                    accepted_decision = None
                 completed = await writer.complete(run_id=run.id, identity=identity)
                 return WorkflowOutcome(
                     status=WorkflowOutcomeStatus.COMPLETED,
@@ -785,6 +942,7 @@ class WorkflowController:
                     tasks=tuple(all_tasks),
                     quality_result=latest_quality,
                     verified_input_fingerprint=gate_fingerprint,
+                    team_acceptance=accepted_decision,
                 )
             if latest_quality.status in {
                 CompletionGateStatus.APPROVAL_REQUIRED,
@@ -1003,6 +1161,27 @@ class WorkflowController:
         ):
             raise RunOwnershipError("The run changed under another owner; delegation stopped")
 
+    def _team_composition_problem(self) -> str | None:
+        """Re-checks, by identity, what construction validated about team acceptance.
+
+        A host may reassign plain attributes of its own objects after the controller was built
+        (a trusted-host action, not reachable from a model, plan or tool). Acceptance decides a
+        terminal transition, so the task store, run manager, artifact manager and evidence signer
+        are verified again right before it and again right before completing. Point-in-time:
+        nothing here makes later mutation impossible.
+        """
+
+        acceptance = self.team_acceptance
+        fenced = self.fenced
+        if acceptance is None or fenced is None:
+            return "team_acceptance_unconfigured"
+        if acceptance.tasks is not fenced.persistence and acceptance.tasks is not fenced.task_store:
+            return "tasks_not_the_authoritative_store"
+        if acceptance.runs is not self.runs:
+            return "runs_not_the_controllers"
+        issues = acceptance.composition_issues(self.completion_gate)
+        return issues[0] if issues else None
+
     async def _fresh_fingerprint(self, run: RuntimeRunRecord, identity: RuntimeIdentity) -> str:
         assert self.fingerprint_provider is not None
         value = await self.fingerprint_provider.current(run=run, identity=identity)
@@ -1050,6 +1229,7 @@ class WorkflowController:
         tasks: list[AgentTask],
         quality: CompletionGateResult | None,
         reason: str,
+        acceptance: TeamAcceptanceDecision | None = None,
     ) -> WorkflowOutcome:
         blocked = await writer.block(run_id=run.id, identity=identity, reason=reason)
         return WorkflowOutcome(
@@ -1059,6 +1239,7 @@ class WorkflowController:
             tasks=tuple(tasks),
             quality_result=quality,
             reason=reason,
+            team_acceptance=acceptance,
         )
 
     async def _revision_failure(

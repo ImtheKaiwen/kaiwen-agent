@@ -550,8 +550,9 @@ Each defect was reproduced with a failing test before its fix.
       fenced database, run manager and workspace (a source over another store fed delegation
       content in a reproduction), Lead workers unread by the source and configuration
       mismatches; every proposal element is length-bounded on staging and on read.
-- [~] M6.3.3-C3 bounded cross-cycle task handoffs (draft pull request, pending independent
-      audit): opt-in `CrossCycleHandoffs` on `TaskContextAssembler` (and
+- [x] M6.3.3-C3 bounded cross-cycle task handoffs (pull request 17, squash commit
+      `a01f3abf4e8b96116c481dbc7a30a4d42bb661df`, merged after independent audit and its R1 and R2
+      corrections; the post-merge CI run on `main` succeeded): opt-in `CrossCycleHandoffs` on `TaskContextAssembler` (and
       `AgentRuntimeWorker(cross_cycle=...)`). A task with a compiler-written delegation parent
       receives informational handoffs from its parent, the parent's completed delegation-round
       siblings and the grandparent, selected by the host from one bounded run-scoped scan of the
@@ -565,8 +566,20 @@ Each defect was reproduced with a failing test before its fix.
       (a protocol-conforming foreign store with matching ids fed forged handoffs in a
       reproduction), and a missing selected output or an unprovable lineage row makes the
       result `unavailable` rather than `complete`.
-- Not done: reviewer approval and team acceptance
-  (M6.3.4). There is no atomic reservation of delegation quotas: delegation at the cycle
+- [~] M6.3.4 reviewer assessment and team acceptance (draft pull request, pending independent
+      audit; ADR 0017, Proposed): a reviewer is an `AgentRuntimeWorker(review=ReviewTools())`
+      whose one `review.submit` assessment is finalized into its own task output with the existing
+      scheduler write, bound by the host to the run, owner, workspace, its task id, a digest of
+      each reviewed output and the fingerprint. Opt-in `WorkflowController(team_acceptance=...)`
+      re-reads storage after a passing completion gate and decides `accepted`, `changes_required`,
+      `approval_required`, `blocked` or `unavailable`; only `accepted` lets the fenced completion
+      write happen. The gate keeps sole authority over technical requirements; a human approval
+      is a host-supplied port bound to a digest of the exact delivery. No new table or approval
+      ledger. Verified by a real four-role SQLite flow, adversarial and recovery tests and mutation
+      checks; no external model was run. Not done: resolving an approval-required delegation (it
+      stays blocked; see ADR 0017), a first-party human approval store, general resume.
+- Not done: beta integration, resolving approval-required delegation and a durable cycle
+  cursor. There is no atomic reservation of delegation quotas: delegation at the cycle
   boundary is safe only because the run lease holder alone writes the run's tasks (enforced by
   the fenced write transaction) and the counted quotas are run-scoped; the job path serializes within one delegator instance only.
   After a restart, earlier delegated tasks count against the per-run limit, so an identical

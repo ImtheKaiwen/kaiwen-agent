@@ -54,12 +54,22 @@ from kaiwen_agent.workflow.lead_tools import (
     LeadTools,
     LeadToolSession,
 )
+from kaiwen_agent.workflow.review import (
+    REVIEW_OUTPUT_KEY,
+    REVIEW_SESSION_SERVICE,
+    REVIEW_TOOL,
+    ReviewSession,
+    ReviewTools,
+    ShownSource,
+    build_review_record,
+)
 from kaiwen_agent.workflow.task_context import (
     CrossCycleHandoffs,
     EvidenceAuthenticator,
     TaskContextAssembler,
     TaskContextSource,
     private_conversation_id,
+    proven_cycle,
 )
 
 logger = logging.getLogger(__name__)
@@ -114,6 +124,7 @@ class AgentRuntimeWorker:
         lead: LeadTools | None = None,
         cross_cycle: CrossCycleHandoffs | None = None,
         evidence_signer: EvidenceAuthenticator | None = None,
+        review: ReviewTools | None = None,
     ) -> None:
         if not role or not role.strip():
             raise WorkerConfigurationError("A worker needs a role")
@@ -138,6 +149,24 @@ class AgentRuntimeWorker:
                 if runtime.registry.get(definition.name) is not definition:
                     raise WorkerConfigurationError(
                         f"Registered tool {definition.name} is not this worker's Lead tool"
+                    )
+                if not definition.permissions <= set(permissions):
+                    raise WorkerConfigurationError(
+                        f"The worker lacks the permission for {definition.name}"
+                    )
+        if REVIEW_TOOL in tools and review is None:
+            raise WorkerConfigurationError(
+                "The review tool needs the worker to be built with review="
+            )
+        if review is not None:
+            for definition in review.definitions():
+                if definition.name not in tools:
+                    raise WorkerConfigurationError(
+                        "A reviewer worker must be given the review tool"
+                    )
+                if runtime.registry.get(definition.name) is not definition:
+                    raise WorkerConfigurationError(
+                        f"Registered tool {definition.name} is not this worker's review tool"
                     )
                 if not definition.permissions <= set(permissions):
                     raise WorkerConfigurationError(
@@ -189,6 +218,7 @@ class AgentRuntimeWorker:
                 "The evidence signer differs from the authorized workspace's signer"
             )
         self.lead = lead
+        self.review = review
         self.runtime = runtime
         self.runs = runs
         self.role = role.strip()
@@ -275,6 +305,23 @@ class AgentRuntimeWorker:
                 workspace_id=workspace_id,
             )
             services = {**self.services, LEAD_SESSION_SERVICE: session}
+        review_session: ReviewSession | None = None
+        if self.review is not None:
+            review_session = ReviewSession(
+                run_id=record.id,
+                task_id=task.id,
+                tenant_id=record.tenant_id,
+                user_id=record.user_id,
+                session_id=record.session_id,
+                workspace_id=workspace_id,
+                fingerprint=package.source_fingerprint,
+                # Only completed work the host put in this reviewer's context.
+                shown=(
+                    ShownSource(h.logical_task_id, h.task_id, h.source_cycle)
+                    for h in package.handoffs
+                ),
+            )
+            services = {**services, REVIEW_SESSION_SERVICE: review_session}
         result = await self._run(prompt, identity, trusted_action_scope(task, record), services)
         await context.checkpoint(state={"phase": "finished", "role": self.role, "task": task.id})
         await context.report_progress(1.0, details={"phase": "finished", "role": self.role})
@@ -284,6 +331,19 @@ class AgentRuntimeWorker:
             # Finalized only after a successful run; the scheduler commits it with COMPLETED.
             output[PROPOSALS_OUTPUT_KEY] = session.finalize(
                 result.tool_results, config=self.lead.config
+            )
+        if review_session is not None:
+            # A reviewer that never submitted, or whose work cannot be re-read, fails (no
+            # partial record is ever committed with COMPLETED).
+            output[REVIEW_OUTPUT_KEY] = await build_review_record(
+                review_session,
+                run=record,
+                reviewer=task,
+                read_task=self.assembler.store.get_task,
+                authenticate=lambda refs, run: self.assembler.owned_references(
+                    refs, run, authenticate=True
+                ),
+                cycle_of=lambda source: proven_cycle(source, record),
             )
         return output
 
