@@ -289,6 +289,7 @@ class VerifiedReview:
     fingerprint: str | None
     reviewed: tuple[Mapping[str, Any], ...]
     evidence_refs: tuple[str, ...]
+    unverified_references: int
     digest: str
 
 
@@ -346,6 +347,9 @@ def verify_review_record(
         raise ReviewRecordError("review_record_invalid")
     if contradiction(assessment) is not None:
         raise ReviewRecordError("review_record_invalid")
+    unverified = raw.get("unverified_reference_count")
+    if type(unverified) is not int or unverified < 0:
+        raise ReviewRecordError("review_record_invalid")
     for item in reviewed:
         if not (
             isinstance(item.get("logical_id"), str)
@@ -364,6 +368,7 @@ def verify_review_record(
         fingerprint=fingerprint,
         reviewed=tuple(reviewed),
         evidence_refs=tuple(evidence),
+        unverified_references=unverified,
         digest=digest,
     )
 

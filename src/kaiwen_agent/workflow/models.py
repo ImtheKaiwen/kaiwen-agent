@@ -160,6 +160,8 @@ class TeamAcceptanceDecision(BaseModel):
     reviewer_task_ids: tuple[str, ...] = Field(default=(), max_length=20)
     # What a human approval (when required) is bound to; absent when none was evaluated.
     subject_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    # The gate-verified evidence references the reviews cited (what acceptance relied on).
+    evidence_refs: tuple[str, ...] = Field(default=(), max_length=500)
 
     @property
     def accepted(self) -> bool:

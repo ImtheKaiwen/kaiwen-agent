@@ -1,5 +1,6 @@
 from kaiwen_agent.workflow.acceptance import (
     ApprovalSubject,
+    EvidenceMode,
     HumanApproval,
     HumanApprovalPort,
     HumanApprovalStatus,
@@ -87,6 +88,7 @@ __all__ = [
     "ApprovalSubject",
     "HumanApproval",
     "HumanApprovalPort",
+    "EvidenceMode",
     "HumanApprovalStatus",
     "REVIEW_TOOL",
     "ReviewAssessment",

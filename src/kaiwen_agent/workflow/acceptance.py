@@ -29,11 +29,17 @@ import logging
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from kaiwen_agent.quality import CompletionGate, CompletionGateResult, CompletionGateStatus
+from kaiwen_agent.quality import (
+    CompletionGate,
+    CompletionGateResult,
+    CompletionGateStatus,
+    VerificationStatus,
+)
 from kaiwen_agent.runtime import DurableRunManager, RuntimeRunRecord
 from kaiwen_agent.tasks import AgentTask, TaskRunQuery, TaskStatus
 from kaiwen_agent.workflow.models import TeamAcceptanceDecision, TeamAcceptanceStatus
@@ -54,6 +60,19 @@ from kaiwen_agent.workflow.task_context import (
 logger = logging.getLogger(__name__)
 
 _MAX_SCAN = 500
+
+
+class EvidenceMode(StrEnum):
+    """What cited reviewer evidence must be, when `require_evidence` is set.
+
+    `GATE_VERIFIED` (the default): every cited reference must be among the references the
+    authoritative completion gate verified (`PASS` verifications only). `AUTHENTIC_RUN_LEGACY` is
+    the weaker pre-hardening contract, an explicit host opt-in: any signed, trusted-origin artifact
+    of this run counts, whether or not the gate relied on it. It must never be the default.
+    """
+
+    GATE_VERIFIED = "gate_verified"
+    AUTHENTIC_RUN_LEGACY = "authentic_run_legacy"
 
 
 class HumanApprovalStatus(StrEnum):
@@ -103,13 +122,18 @@ class TeamAcceptancePolicy:
 
     `reviewer_workers` maps the worker ids authorized as reviewers to the role the host expects of
     them (checked against the registered worker's own `role` when it declares one).
-    `required_tasks` are logical ids that must have completed and that every review must cover.
+    `required_tasks` are logical ids that must have completed and that every review must cover. An
+    empty set would silently imply a reviewed delivery, so it is refused unless the host sets
+    `allow_partial_review=True`: a review then certifies only the tasks it names, never every task.
+    `evidence_mode` defaults to evidence the gate itself verified (see `EvidenceMode`).
     """
 
     reviewer_workers: Mapping[str, str]
     required_tasks: frozenset[str] = frozenset()
+    allow_partial_review: bool = False
     min_reviewers: int = 1
     require_evidence: bool = True
+    evidence_mode: EvidenceMode = EvidenceMode.GATE_VERIFIED
     require_fingerprint: bool = True
     human_approval: HumanApprovalPort | None = None
     max_scan_tasks: int = 200
@@ -120,11 +144,18 @@ class TeamAcceptancePolicy:
         for worker_id, role in self.reviewer_workers.items():
             if not worker_id or not isinstance(role, str) or not role:
                 raise ValueError("Each reviewer worker needs a role")
+        if not self.required_tasks and not self.allow_partial_review:
+            raise ValueError(
+                "required_tasks must name the tasks every review covers; "
+                "set allow_partial_review=True only for an intentionally partial review"
+            )
         if not 1 <= self.min_reviewers <= 10:
             raise ValueError("min_reviewers must be between 1 and 10")
         if not 1 <= self.max_scan_tasks <= _MAX_SCAN:
             raise ValueError(f"max_scan_tasks must be between 1 and {_MAX_SCAN}")
-        object.__setattr__(self, "reviewer_workers", dict(self.reviewer_workers))
+        # A read-only copy: the validated mapping cannot change after construction.
+        object.__setattr__(self, "reviewer_workers", MappingProxyType(dict(self.reviewer_workers)))
+        object.__setattr__(self, "required_tasks", frozenset(self.required_tasks))
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,8 +290,11 @@ class TeamAcceptance:
             )
 
         problems: list[TeamAcceptanceDecision] = []
+        verified = _gate_verified_refs(gate)
         for review in reviews:
-            outcome = await self._check_review(review, run, by_id, latest, fingerprint, cycles)
+            outcome = await self._check_review(
+                review, run, by_id, latest, fingerprint, cycles, verified
+            )
             if outcome is None:
                 continue
             if outcome.status is TeamAcceptanceStatus.UNAVAILABLE:
@@ -319,9 +353,34 @@ class TeamAcceptance:
                             ids=reviewer_ids,
                             subject=subject_digest,
                         )
+        cited = sorted({ref for review in reviews for ref in review.evidence_refs})
         return _decide(
-            TeamAcceptanceStatus.ACCEPTED, "accepted", ids=reviewer_ids, subject=subject_digest
+            TeamAcceptanceStatus.ACCEPTED,
+            "accepted",
+            ids=reviewer_ids,
+            subject=subject_digest,
+            evidence=tuple(cited),
         )
+
+    def gate_evidence_issue(
+        self, decision: TeamAcceptanceDecision, gate: CompletionGateResult
+    ) -> str | None:
+        """Whether a later gate result still verifies the evidence an acceptance relied on.
+
+        Used by the controller after a slow human approval, when the gate is asked again: the
+        relationship "cited evidence is among the gate's verified evidence" is judged against the
+        new result, never assumed from the first. Returns a stable code, or None when it holds.
+        """
+
+        policy = self.policy
+        if not policy.require_evidence or policy.evidence_mode is not EvidenceMode.GATE_VERIFIED:
+            return None
+        verified = _gate_verified_refs(gate)
+        if not verified:
+            return "no_gate_verified_evidence"
+        if not decision.evidence_refs or not set(decision.evidence_refs) <= verified:
+            return "evidence_not_gate_verified"
+        return None
 
     async def _ask(self, port: HumanApprovalPort, subject: ApprovalSubject) -> HumanApproval | None:
         failure: str | None = None
@@ -345,6 +404,7 @@ class TeamAcceptance:
         latest: Mapping[str, AgentTask],
         fingerprint: str | None,
         cycles: Mapping[str, int],
+        verified: frozenset[str],
     ) -> TeamAcceptanceDecision | None:
         policy = self.policy
         if review.assessment.recommendation == "blocked":
@@ -371,6 +431,13 @@ class TeamAcceptance:
         if policy.require_evidence:
             if not review.evidence_refs:
                 return _decide(TeamAcceptanceStatus.CHANGES_REQUIRED, "no_authenticated_evidence")
+            if policy.evidence_mode is EvidenceMode.GATE_VERIFIED:
+                if not verified:
+                    return _decide(TeamAcceptanceStatus.BLOCKED, "no_gate_verified_evidence")
+                if review.unverified_references or not set(review.evidence_refs) <= verified:
+                    return _decide(
+                        TeamAcceptanceStatus.CHANGES_REQUIRED, "evidence_not_gate_verified"
+                    )
             if not await self._evidence_authentic(review, run):
                 return _decide(TeamAcceptanceStatus.UNAVAILABLE, "evidence_unverifiable")
         return None
@@ -413,6 +480,18 @@ def _subject(
     )
 
 
+def _gate_verified_refs(gate: CompletionGateResult) -> frozenset[str]:
+    """References of the gate's own `PASS` verifications; failed, inconclusive and
+    approval-required verifications contribute nothing, and nothing model-authored is read."""
+
+    return frozenset(
+        ref
+        for verification in gate.verifications
+        if verification.status is VerificationStatus.PASS
+        for ref in verification.evidence_refs
+    )
+
+
 def _decide(
     status: TeamAcceptanceStatus,
     code: str,
@@ -420,6 +499,7 @@ def _decide(
     *,
     ids: tuple[str, ...] = (),
     subject: str | None = None,
+    evidence: tuple[str, ...] = (),
 ) -> TeamAcceptanceDecision:
     reasons = (f"{code}: {subject_task}",) if subject_task else (code,)
     return TeamAcceptanceDecision(
@@ -428,4 +508,5 @@ def _decide(
         reasons=reasons,
         reviewer_task_ids=ids,
         subject_digest=subject,
+        evidence_refs=evidence,
     )

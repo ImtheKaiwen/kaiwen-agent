@@ -34,6 +34,8 @@ from kaiwen_agent.quality import (
     CompletionGate,
     CompletionGateResult,
     CompletionGateStatus,
+    VerificationResult,
+    VerificationStatus,
     VerifierRegistry,
 )
 from kaiwen_agent.realtime import (
@@ -109,11 +111,23 @@ class HookGate(SpyGate):
     def __init__(self) -> None:
         super().__init__()
         self.hook: Any = None
+        # The evidence references the (scripted) gate reports as verified for its requirement.
+        self.refs: Any = lambda: ()
 
     async def evaluate(self, resolution: Any, *, context: Any) -> CompletionGateResult:
         if self.hook is not None:
             self.hook()
-        return await super().evaluate(resolution, context=context)
+        result = await super().evaluate(resolution, context=context)
+        refs = tuple(self.refs())
+        verification = VerificationResult(
+            requirement_id="coding.tests.run",
+            status=VerificationStatus.PASS
+            if result.status is CompletionGateStatus.PASS
+            else VerificationStatus.FAIL,
+            evidence_refs=refs,
+            verifier_id="coding.tests",
+        )
+        return result.model_copy(update={"verifications": (verification,)})
 
 
 class Human:
@@ -169,6 +183,7 @@ class TeamHarness:
     ) -> None:
         self.flow = FencedFlow(tmp_path)
         self.gate = HookGate()
+        self.gate.refs = lambda: [self.evidence_ref] if self.evidence_ref else []
         self.artifacts = ArtifactManager()
         # The platform gate over the shared trusted evidence pipeline; only its verdict is
         # scripted (the instance's `evaluate` is replaced by the spy).
@@ -765,7 +780,7 @@ def test_reviewer_workers_must_be_allowlisted_registered_and_in_role(tmp_path: P
     good = harness.acceptance()
 
     def with_workers(workers: dict[str, str]) -> TeamAcceptance:
-        policy = TeamAcceptancePolicy(reviewer_workers=workers)
+        policy = TeamAcceptancePolicy(reviewer_workers=workers, required_tasks=frozenset({"code"}))
         return TeamAcceptance(
             policy=policy, tasks=good.tasks, runs=good.runs, assembler=good.assembler
         )

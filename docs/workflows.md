@@ -300,7 +300,8 @@ digest of each stored output, the cited evidence references that the host authen
 counted as unverified) and a digest of the whole. Reviewer text is untrusted data.
 
 Team acceptance. `WorkflowController(team_acceptance=TeamAcceptance(policy=TeamAcceptancePolicy(
-reviewer_workers={"reviewer": "reviewer"}, required_tasks={...}, human_approval=...), tasks=<fenced
+reviewer_workers={"reviewer": "reviewer"}, required_tasks={...} (or allow_partial_review=True),
+human_approval=...), tasks=<fenced
 store>, runs=<controller runs>, assembler=<TaskContextAssembler>), fenced=..., fingerprint_provider=
 ...)`. It is refused at construction without fenced execution, over another task store or another run
 manager, or with a reviewer worker that is not allowlisted, registered or in the declared role. After
@@ -310,10 +311,11 @@ asks `TeamAcceptance.evaluate`, which re-reads everything from storage and retur
 not prove its cycle, a missing, malformed, forged or mis-bound review record, no fingerprint, a cited
 evidence reference that no longer authenticates, an unreachable approval source); `blocked` (gate not
 passed, a required task missing, failed or cancelled, no or an unfinished reviewer, a reviewer that
-recommends `blocked`, self-review, a denied or mismatched human approval); `changes_required` (a
+recommends `blocked`, self-review, a gate that verified no evidence, a denied or mismatched human
+approval); `changes_required` (a
 reviewer requested changes or reviewers disagree, reviewed work changed or was superseded, a review
 that does not cover every required task, a review of another fingerprint, an approval that cites no
-authenticated evidence); `approval_required` (a human approval is pending); else `accepted`. Only the
+authenticated evidence or evidence the gate did not verify); `approval_required` (a human approval is pending); else `accepted`. Only the
 newest reviewer cycle counts (a later review supersedes an earlier one), every reviewer in it must
 approve, and a reviewer is recognized only by the host's `reviewer_workers` mapping, never by a role
 or label on a task. Any result but `accepted` BLOCKS the run with the reason
@@ -357,9 +359,15 @@ state can still change between the last check and the fenced database write, whi
 atomic without a transaction spanning the artifact store, the filesystem and SQLite.
 
 Reviewer independence and coverage (R2 review). `min_reviewers` counts distinct reviewer workers,
-never tasks: the same worker scheduled twice is one reviewer. `required_tasks` defaults to empty,
-and an empty set makes the coverage condition trivially true, so a host that wants every
-deliverable reviewed must name its required tasks; this default is unchanged and is host policy.
+never tasks: the same worker scheduled twice is one reviewer.
+
+Review coverage (operator decision B). An empty `required_tasks` would make the coverage condition
+trivially true and silently imply that the team's delivery was reviewed, so the policy refuses it at
+construction. A host that wants an intentionally partial review sets `allow_partial_review=True`; the
+review then certifies only the tasks it names (the decision carries the reviewer task ids, and the
+review record names the reviewed tasks), never every task of the team. Coverage is host policy: it is
+never inferred from task names or claims in a plan or a model's output. Valid nonempty configurations
+behave as before.
 
 Cycles and evidence authority. A reviewer's record stores, for each reviewed task, the cycle the host
 proved from the task's compiler-derived id, never a value written by the model. The cycle shown in the
@@ -374,13 +382,42 @@ evidence is required. A foreign signer would authenticate evidence the gate reje
 exploitable case; a foreign task store changes nothing in acceptance and is refused only as
 configuration hygiene.
 
+Gate-verified evidence (operator decision A). With `require_evidence` (the default) a reviewer's
+citation of an authentic same-run artifact is not enough. Every cited reference must be among the
+references of the authoritative completion gate's own `PASS` verifications
+(`CompletionGateResult.verifications`); references of failed, inconclusive or approval-required
+verifications (for example an optional requirement that failed while a mandatory one passed) are
+never permitted, and nothing model-authored is read. A review that cites nothing, cites any
+reference outside that set, or cites a reference the host could not authenticate is
+`changes_required` (`no_authenticated_evidence`, `evidence_not_gate_verified`); a gate that passed
+without verifying any evidence (empty standards, or no verification with evidence) is `blocked`
+(`no_gate_verified_evidence`), so an empty set of standards fails closed. When the gate is asked again
+after a slow human approval, the relationship is judged against the new result
+(`gate_evidence_changed_after_acceptance:<code>`). The accepted decision names the gate-verified
+references it relied on (`evidence_refs`). A host that must keep the weaker earlier contract sets
+`evidence_mode=EvidenceMode.AUTHENTIC_RUN_LEGACY` explicitly (any signed, trusted-origin artifact of
+this run counts, still re-authenticated); it is never the default. A gate-verified reference is
+evidence the gate used to verify a technical requirement. It is not proof that the evidence came from
+a particular task: the platform evidence labels (`requirement_id`, `evidence_type`,
+`input_fingerprint`, `command_id`, `outcome`) carry no task identity, so no task provenance is claimed.
+Hosts with a requirement-free standards set must opt out of evidence (`require_evidence=False`) or
+into the legacy mode.
+
+Configuration integrity (operator decision C). `reviewer_workers` is copied into a read-only mapping
+at construction and cannot change afterwards. The controller re-verifies, by object identity, the task
+store, the run manager, the assembler's task store, artifact manager and evidence signer against the
+completion gate before asking for acceptance and again right before completing (block reason
+`team_acceptance_composition_changed:<code>`). Cancellation and `RunOwnershipError` are unaffected.
+This is the trusted-host boundary: the objects of the host are plain Python and a host (or code
+running inside the host process) that reassigns them is outside the model, plan and tool boundary; the
+re-check detects such reassignment at two points, it does not prevent it, and nothing here is atomic.
+
 Reviewer contract. An approval is refused at submission when any criterion is `not_met` or
 `unknown`, or when serious findings or open items exist; it must not imply a criterion passed that the
 reviewer could not assess. A cited evidence reference that the host authenticated is evidence of the
-run (owner, run, content and trusted origin), not a proof that it concerns a particular reviewed
-task: the platform artifacts carry no task provenance, so no such relation is claimed. Authentic but
-unrelated run evidence can satisfy only the policy's "evidence was cited" condition; the completion
-gate alone decides whether a requirement is met.
+run (owner, run, content and trusted origin); under the default contract it must also be evidence the
+completion gate verified (see above), and it is still not a proof that it concerns a particular
+reviewed task. The completion gate alone decides whether a requirement is met.
 
 Durable and restart behavior. Durable: each reviewer's record, inside its own task row, written with
 the task's COMPLETED status. Recomputed every time: the acceptance decision, the gate verdict and the

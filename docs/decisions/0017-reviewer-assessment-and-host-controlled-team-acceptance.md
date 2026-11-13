@@ -65,6 +65,16 @@ What already exists and what was checked:
    a second completion gate evaluation before the fingerprint re-check. No new store or engine; the
    checks stay point-in-time, not atomic with the database write.
 
+9. Operator decisions after the independent audit. (A) With `require_evidence` every cited reference
+   must be among the references of the completion gate's own `PASS` verifications; a weaker
+   `AUTHENTIC_RUN_LEGACY` mode exists only as an explicit host opt-in, and a gate that verified no
+   evidence blocks acceptance. This is evidence the gate verified for a requirement, not evidence
+   proven to come from a task: the platform contracts carry no task provenance. (B) An empty
+   `required_tasks` is refused unless `allow_partial_review=True`, which certifies only what the review
+   names. (C) `reviewer_workers` is immutable after construction, and the task store, run manager,
+   artifact manager and evidence signer are re-verified by identity before acceptance and before
+   completing (a trusted-host boundary, point-in-time, not atomic).
+
 ## Consequences
 
 - No schema change and no new authority store; older code ignores the extra output key.

@@ -17,7 +17,12 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from kaiwen_agent.quality import CompletionGateResult, CompletionGateStatus
+from kaiwen_agent.quality import (
+    CompletionGateResult,
+    CompletionGateStatus,
+    VerificationResult,
+    VerificationStatus,
+)
 from kaiwen_agent.runtime import RuntimeRunRecord, WorkspaceBinding
 from kaiwen_agent.tasks import AgentTask, TaskRunPage, TaskStatus
 from kaiwen_agent.workflow import (
@@ -37,6 +42,23 @@ from tests.test_cross_cycle_handoffs import Env, Proxy
 from tests.test_workflow_fresh_evidence import SIGNER
 
 PASS_GATE = CompletionGateResult(status=CompletionGateStatus.PASS, verifications=())
+
+
+def gate_of(*verified: tuple[VerificationStatus, tuple[str, ...]]) -> CompletionGateResult:
+    """An overall-PASS gate result whose verifications carry the given evidence references."""
+
+    items = tuple(
+        VerificationResult(
+            requirement_id=f"requirement.{index}",
+            status=status,
+            evidence_refs=refs,
+            verifier_id="coding.tests",
+        )
+        for index, (status, refs) in enumerate(verified)
+    )
+    return CompletionGateResult(status=CompletionGateStatus.PASS, verifications=items)
+
+
 FP = "fingerprint-current"
 BINDING = WorkspaceBinding(workspace_id="ws-1", root="main", policy_checksum="p1")
 Status = TeamAcceptanceStatus
@@ -168,11 +190,20 @@ class Team:
             assembler=assembler,
         )
 
+    def gate(self) -> CompletionGateResult:
+        """The gate verdict of a delivery whose requirement was verified with `self.evidence`."""
+
+        return gate_of((VerificationStatus.PASS, (self.evidence,)))
+
     async def decide(
-        self, *, gate: CompletionGateResult = PASS_GATE, fingerprint: str | None = FP, **policy: Any
+        self,
+        *,
+        gate: CompletionGateResult | None = None,
+        fingerprint: str | None = FP,
+        **policy: Any,
     ) -> Any:
         return await self.acceptance(**policy).evaluate(
-            run=self.run, gate=gate, fingerprint=fingerprint
+            run=self.run, gate=gate or self.gate(), fingerprint=fingerprint
         )
 
 
@@ -510,7 +541,7 @@ def test_a_reviewed_task_that_is_no_longer_completed_needs_a_new_review(tmp_path
         # The required task itself is no longer completed: the stronger, earlier answer wins.
         expect(await t.decide(), Status.BLOCKED, "required_task_not_completed")
         expect(
-            await t.decide(required_tasks=frozenset()),
+            await t.decide(required_tasks=frozenset(), allow_partial_review=True),
             Status.CHANGES_REQUIRED,
             "reviewed_work_changed",
         )
@@ -587,7 +618,9 @@ def test_cited_evidence_is_authenticated_again_at_acceptance(tmp_path: Path, kin
         await t.add_reviewer(evidence=(ref,))
         if kind == "gone":
             env.artifacts.__init__()  # type: ignore[misc]  # an artifact store lost on restart
-        expect(await t.decide(), Status.UNAVAILABLE, "evidence_unverifiable")
+        # The gate verified the reference, so only the second authentication can reject it.
+        gate = gate_of((VerificationStatus.PASS, (ref,)))
+        expect(await t.decide(gate=gate), Status.UNAVAILABLE, "evidence_unverifiable")
 
     run_async(scenario)
 
@@ -636,7 +669,7 @@ def test_an_incomplete_or_untrustworthy_inventory_is_unavailable(
             runs=acceptance.runs,
             assembler=acceptance.assembler,
         )
-        decision = await acceptance.evaluate(run=t.run, gate=PASS_GATE, fingerprint=FP)
+        decision = await acceptance.evaluate(run=t.run, gate=t.gate(), fingerprint=FP)
         expect(decision, Status.UNAVAILABLE, code)
         assert "secret-token" not in decision.model_dump_json()
 
@@ -815,7 +848,7 @@ def test_human_approval_does_not_rescue_a_failed_review_condition(tmp_path: Path
 
 def test_the_policy_is_validated_at_configuration() -> None:
     with pytest.raises(ValueError):
-        TeamAcceptancePolicy(reviewer_workers={})
+        TeamAcceptancePolicy(reviewer_workers={}, required_tasks=frozenset({"x"}))
     for options in (
         {"min_reviewers": 0},
         {"min_reviewers": 11},
@@ -823,9 +856,11 @@ def test_the_policy_is_validated_at_configuration() -> None:
         {"max_scan_tasks": 501},
     ):
         with pytest.raises(ValueError):
-            TeamAcceptancePolicy(reviewer_workers={"r": "reviewer"}, **options)
+            TeamAcceptancePolicy(
+                reviewer_workers={"r": "reviewer"}, required_tasks=frozenset({"x"}), **options
+            )
     with pytest.raises(ValueError):
-        TeamAcceptancePolicy(reviewer_workers={"r": ""})
+        TeamAcceptancePolicy(reviewer_workers={"r": ""}, required_tasks=frozenset({"x"}))
 
 
 def test_the_reviewer_assessment_schema_is_strict_and_bounded() -> None:

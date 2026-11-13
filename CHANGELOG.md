@@ -16,7 +16,12 @@
   must be verified with the completion gate's artifact manager and signer, and an approval cannot
   leave a criterion unknown. Audit R2: when a human approval is configured, cited evidence is
   authenticated again and the completion gate is asked again after the approval and before
-  completion (`completion_gate_changed_after_acceptance`).
+  completion (`completion_gate_changed_after_acceptance`). Operator decisions: with `require_evidence`
+  (default) reviewer-cited evidence must be among the references of the completion gate's `PASS`
+  verifications (`EvidenceMode.AUTHENTIC_RUN_LEGACY` is an explicit opt-in; a gate that verified no
+  evidence blocks acceptance); an empty `required_tasks` is refused unless `allow_partial_review=True`
+  (breaking for opt-in configurations that relied on the empty default); `reviewer_workers` is
+  immutable and the evidence composition is re-verified before acceptance and before completing.
 - Add bounded earlier-cycle task handoffs (M6.3.3-C3, ADR 0015): opt-in `CrossCycleHandoffs` for
   `TaskContextAssembler` and `AgentRuntimeWorker(cross_cycle=..., evidence_signer=...)`. A task with
   a compiler-written delegation parent receives informational `TaskHandoff`s (new optional fields

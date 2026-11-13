@@ -816,6 +816,17 @@ class WorkflowController:
                             else "protected_input_unavailable",
                         )
                 if self.team_acceptance is not None:
+                    changed = self._team_composition_problem()
+                    if changed is not None:
+                        return await self._blocked(
+                            writer=writer,
+                            run=run,
+                            identity=identity,
+                            cycle=cycle,
+                            tasks=all_tasks,
+                            quality=latest_quality,
+                            reason=f"team_acceptance_composition_changed:{changed}",
+                        )
                     decision = await self.team_acceptance.evaluate(
                         run=run,
                         gate=latest_quality,
@@ -866,6 +877,32 @@ class WorkflowController:
                                 reason="completion_gate_changed_after_acceptance",
                                 acceptance=decision,
                             )
+                        # The evidence the reviews cited must still be evidence this new gate
+                        # result verified (not assumed from the first evaluation).
+                        evidence_issue = self.team_acceptance.gate_evidence_issue(decision, again)
+                        if evidence_issue is not None:
+                            return await self._blocked(
+                                writer=writer,
+                                run=run,
+                                identity=identity,
+                                cycle=cycle,
+                                tasks=all_tasks,
+                                quality=again,
+                                reason=f"gate_evidence_changed_after_acceptance:{evidence_issue}",
+                                acceptance=decision,
+                            )
+                    changed = self._team_composition_problem()
+                    if changed is not None:
+                        return await self._blocked(
+                            writer=writer,
+                            run=run,
+                            identity=identity,
+                            cycle=cycle,
+                            tasks=all_tasks,
+                            quality=latest_quality,
+                            reason=f"team_acceptance_composition_changed:{changed}",
+                            acceptance=decision,
+                        )
                     if self.fingerprint_provider is not None:
                         # Acceptance may have awaited an external approval for a long time: the
                         # acceptance describes the state it was computed for, so check once
@@ -1123,6 +1160,27 @@ class WorkflowController:
             or (writer.fence is not None and record.owner_fencing_token != writer.fence)
         ):
             raise RunOwnershipError("The run changed under another owner; delegation stopped")
+
+    def _team_composition_problem(self) -> str | None:
+        """Re-checks, by identity, what construction validated about team acceptance.
+
+        A host may reassign plain attributes of its own objects after the controller was built
+        (a trusted-host action, not reachable from a model, plan or tool). Acceptance decides a
+        terminal transition, so the task store, run manager, artifact manager and evidence signer
+        are verified again right before it and again right before completing. Point-in-time:
+        nothing here makes later mutation impossible.
+        """
+
+        acceptance = self.team_acceptance
+        fenced = self.fenced
+        if acceptance is None or fenced is None:
+            return "team_acceptance_unconfigured"
+        if acceptance.tasks is not fenced.persistence and acceptance.tasks is not fenced.task_store:
+            return "tasks_not_the_authoritative_store"
+        if acceptance.runs is not self.runs:
+            return "runs_not_the_controllers"
+        issues = acceptance.composition_issues(self.completion_gate)
+        return issues[0] if issues else None
 
     async def _fresh_fingerprint(self, run: RuntimeRunRecord, identity: RuntimeIdentity) -> str:
         assert self.fingerprint_provider is not None
