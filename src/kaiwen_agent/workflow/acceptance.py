@@ -139,6 +139,22 @@ class TeamAcceptancePolicy:
     max_scan_tasks: int = 200
 
     def __post_init__(self) -> None:
+        # Security-relevant branches compare the mode by enum identity, so a raw string must never
+        # reach them unnormalized: an exact value becomes the enum member, anything else is refused.
+        raw: object = self.evidence_mode
+        if type(raw) is not EvidenceMode:
+            normalized: EvidenceMode | None = None
+            if isinstance(raw, str):
+                try:
+                    normalized = EvidenceMode(raw)
+                except ValueError:
+                    normalized = None
+            if normalized is None:
+                raise ValueError("evidence_mode must be an EvidenceMode (or its exact value)")
+            object.__setattr__(self, "evidence_mode", normalized)
+        for flag in ("require_evidence", "require_fingerprint", "allow_partial_review"):
+            if type(getattr(self, flag)) is not bool:
+                raise ValueError(f"{flag} must be a bool")
         if not self.reviewer_workers:
             raise ValueError("A team acceptance policy needs at least one reviewer worker")
         for worker_id, role in self.reviewer_workers.items():

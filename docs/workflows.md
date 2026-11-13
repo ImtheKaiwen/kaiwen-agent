@@ -396,7 +396,10 @@ after a slow human approval, the relationship is judged against the new result
 (`gate_evidence_changed_after_acceptance:<code>`). The accepted decision names the gate-verified
 references it relied on (`evidence_refs`). A host that must keep the weaker earlier contract sets
 `evidence_mode=EvidenceMode.AUTHENTIC_RUN_LEGACY` explicitly (any signed, trusted-origin artifact of
-this run counts, still re-authenticated); it is never the default. A gate-verified reference is
+this run counts, still re-authenticated); it is never the default. The policy validates its
+configuration at construction: `evidence_mode` accepts an `EvidenceMode` or its exact value and any
+other value is refused (a raw string never reaches the identity comparisons unnormalized), and the
+boolean flags (`require_evidence`, `require_fingerprint`, `allow_partial_review`) must be real bools. A gate-verified reference is
 evidence the gate used to verify a technical requirement. It is not proof that the evidence came from
 a particular task: the platform evidence labels (`requirement_id`, `evidence_type`,
 `input_fingerprint`, `command_id`, `outcome`) carry no task identity, so no task provenance is claimed.

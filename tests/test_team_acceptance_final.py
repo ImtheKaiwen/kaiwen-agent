@@ -526,3 +526,69 @@ def test_with_the_real_gate_and_empty_standards_acceptance_fails_closed(tmp_path
         blocked(outcome, "team_blocked:no_gate_verified_evidence")
 
     run_async(scenario)
+
+
+# --------------------------------------------------- evidence_mode validation (fail closed)
+
+
+def test_a_raw_string_evidence_mode_cannot_bypass_the_strict_gate_contract(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        t = await team(tmp_path, with_reviewer=False)
+        other = await _evidence(t.env, _artifact_context(t.run.id))  # authentic, unrelated
+        await t.add_reviewer(evidence=(other,))
+        # "gate_verified" spelled as a plain string must mean the strict mode, not no check at all.
+        expect(
+            await t.decide(evidence_mode="gate_verified"),
+            Status.CHANGES_REQUIRED,
+            "evidence_not_gate_verified",
+        )
+        expect(
+            await t.decide(gate=gate_of(), evidence_mode="gate_verified"),
+            Status.BLOCKED,
+            "no_gate_verified_evidence",
+        )
+
+    run_async(scenario)
+
+
+def test_evidence_mode_is_normalized_or_refused_at_construction() -> None:
+    from kaiwen_agent.workflow import EvidenceMode
+
+    def policy(**options: Any) -> TeamAcceptancePolicy:
+        return TeamAcceptancePolicy(
+            reviewer_workers={"r": "reviewer"}, required_tasks=frozenset({"x"}), **options
+        )
+
+    assert policy().evidence_mode is EvidenceMode.GATE_VERIFIED  # the strict default
+    for value in (EvidenceMode.GATE_VERIFIED, "gate_verified"):
+        assert policy(evidence_mode=value).evidence_mode is EvidenceMode.GATE_VERIFIED
+    for value in (EvidenceMode.AUTHENTIC_RUN_LEGACY, "authentic_run_legacy"):
+        assert policy(evidence_mode=value).evidence_mode is EvidenceMode.AUTHENTIC_RUN_LEGACY
+    for bad in ("legacy", "GATE_VERIFIED", " gate_verified", "", None, 1, True, object()):
+        with pytest.raises(ValueError, match="evidence_mode"):
+            policy(evidence_mode=bad)
+
+
+def test_the_explicit_legacy_mode_keeps_its_documented_behavior(tmp_path: Path) -> None:
+    from kaiwen_agent.workflow import EvidenceMode
+
+    async def scenario() -> None:
+        t = await team(tmp_path, with_reviewer=False)
+        other = await _evidence(t.env, _artifact_context(t.run.id))
+        await t.add_reviewer(evidence=(other,))
+        for legacy in (EvidenceMode.AUTHENTIC_RUN_LEGACY, "authentic_run_legacy"):
+            expect(await t.decide(evidence_mode=legacy), Status.ACCEPTED, "accepted")
+        expect(await t.decide(), Status.CHANGES_REQUIRED, "evidence_not_gate_verified")
+
+    run_async(scenario)
+
+
+def test_boolean_policy_flags_must_be_real_booleans() -> None:
+    for flag in ("require_evidence", "require_fingerprint", "allow_partial_review"):
+        for bad in ("false", 0, 1, None):
+            with pytest.raises(ValueError, match=flag):
+                TeamAcceptancePolicy(
+                    reviewer_workers={"r": "reviewer"},
+                    required_tasks=frozenset({"x"}),
+                    **{flag: bad},
+                )

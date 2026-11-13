@@ -22,6 +22,8 @@
   evidence blocks acceptance); an empty `required_tasks` is refused unless `allow_partial_review=True`
   (breaking for opt-in configurations that relied on the empty default); `reviewer_workers` is
   immutable and the evidence composition is re-verified before acceptance and before completing.
+  The policy normalizes `evidence_mode` to the enum (unknown values and non-bool flags are refused),
+  so a raw string cannot silently disable the gate-verified evidence check.
 - Add bounded earlier-cycle task handoffs (M6.3.3-C3, ADR 0015): opt-in `CrossCycleHandoffs` for
   `TaskContextAssembler` and `AgentRuntimeWorker(cross_cycle=..., evidence_signer=...)`. A task with
   a compiler-written delegation parent receives informational `TaskHandoff`s (new optional fields
