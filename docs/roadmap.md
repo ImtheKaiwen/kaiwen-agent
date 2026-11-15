@@ -567,8 +567,9 @@ Each defect was reproduced with a failing test before its fix.
       reproduction), and a missing selected output or an unprovable lineage row makes the
       result `unavailable` rather than `complete`.
 - [x] M6.3.4 reviewer assessment and team acceptance (pull request 18, squash commit
-      `2ab7baeb266988dc5083e8ce5c2ebd06293d69a5`, merged after a fresh-context audit; ADR 0017,
-      Proposed): a reviewer is an `AgentRuntimeWorker(review=ReviewTools())`
+      `2ab7baeb266988dc5083e8ce5c2ebd06293d69a5`, merged after a read-only review by a separate
+      fresh-context instance of the same model, which is not an author-independent audit; the
+      operator accepted its findings and the documented limitations; ADR 0017): a reviewer is an `AgentRuntimeWorker(review=ReviewTools())`
       whose one `review.submit` assessment is finalized into its own task output with the existing
       scheduler write, bound by the host to the run, owner, workspace, its task id, a digest of
       each reviewed output and the fingerprint. Opt-in `WorkflowController(team_acceptance=...)`
