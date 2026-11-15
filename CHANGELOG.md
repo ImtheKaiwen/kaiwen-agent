@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add the credential-free `examples/coding-team-acceptance` (M6.4-A): Lead, Coder, Tester and Reviewer
+  over the fenced SQLite stack, the trusted evidence pipeline, a real completion gate and team acceptance,
+  with ten documented scenarios and `docs/coding-team-beta.md` (setup, readiness matrix, manual live
+  validation specification). No platform API changed.
 - Add reviewer assessment and host-controlled team acceptance (M6.3.4, ADR 0017):
   `AgentRuntimeWorker(review=ReviewTools())` with the strict, bounded `review.submit` tool, finalized
   into the reviewer's own task output and bound by the host to run, owner, workspace, its task id,

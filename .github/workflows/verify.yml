@@ -33,7 +33,7 @@ jobs:
             speech-pipeline validation-consumer legal-domain-validation coding-kit-fake \
             coding-kit-openai coding-simple-chat coding-simple-agent coding-simple-team \
             coding-simple-ollama coding-simple-custom-host coding-docker-evidence \
-            coding-evidence-freshness coding-agent-worker; do
+            coding-evidence-freshness coding-agent-worker coding-team-acceptance; do
             echo "mypy examples/$example"
             python -m mypy --no-incremental "examples/$example/main.py"
           done
@@ -88,7 +88,7 @@ jobs:
         run: |
           for example in simple-runtime autonomous-single-agent software-agent-team \
             speech-pipeline coding-simple-chat coding-simple-agent coding-simple-team \
-            coding-simple-custom-host; do
+            coding-simple-custom-host coding-team-acceptance; do
             echo "run examples/$example"
             python "examples/$example/main.py" > /dev/null
           done

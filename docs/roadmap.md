@@ -585,6 +585,14 @@ Each defect was reproduced with a failing test before its fix.
       technical debt (not blocking, no behavior change planned here): `TeamAcceptancePolicy`
       accepts `required_tasks="code"` as the characters of the string (fails closed as a denial)
       and `min_reviewers=True` as 1; both could be rejected at construction.
+- [~] M6.4-A beta host integration baseline (draft pull request, pending independent audit):
+      `examples/coding-team-acceptance` composes Lead, Coder, Tester and Reviewer from public
+      interfaces over the fenced SQLite stack, the trusted evidence pipeline, a real completion
+      gate and team acceptance, credential-free and deterministic, with ten documented scenarios
+      and tests; `docs/coding-team-beta.md` holds the assessment, setup, a manual live-validation
+      specification and the beta-readiness matrix. The Tester is a host-run step because a
+      model-driven unattended `testing.run` needs a runner with real isolation (Docker). Not done:
+      the model-driven Tester inside the team, any live multi-role provider run.
 - Not done: beta integration, resolving approval-required delegation and a durable cycle
   cursor. There is no atomic reservation of delegation quotas: delegation at the cycle
   boundary is safe only because the run lease holder alone writes the run's tasks (enforced by
