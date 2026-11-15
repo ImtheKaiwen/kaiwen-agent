@@ -181,6 +181,7 @@ class LocalSnapshotRunner:
         started = time.monotonic()
         snapshot = await self._capture()
         run_directory: Path | None = None
+        threads: list[asyncio.Future[Any]] = []  # worker threads that use the paths below
         try:
             posix = PurePosixPath(relative.as_posix())
             if not snapshot.has_directory(posix.as_posix()):
@@ -188,8 +189,8 @@ class LocalSnapshotRunner:
             run_directory = Path(tempfile.mkdtemp(prefix="kaiwen-local-run-"))
             copy = run_directory / "workspace"
             try:
-                await asyncio.to_thread(
-                    snapshot.materialize, copy, writable=command.writable_workspace
+                await self._thread(
+                    threads, snapshot.materialize, copy, writable=command.writable_workspace
                 )
             except SnapshotError as error:
                 raise SandboxUnavailableError("The execution snapshot is not intact") from error
@@ -197,7 +198,7 @@ class LocalSnapshotRunner:
             # The process is gone: compare the run copy with the captured digests. An
             # unverifiable comparison counts as modified, never as unchanged.
             try:
-                modified = await asyncio.to_thread(snapshot.changed_paths, copy)
+                modified = await self._thread(threads, snapshot.changed_paths, copy)
             except Exception:  # noqa: BLE001 - fail closed, whatever the reason
                 unchanged, modified = False, ()
             else:
@@ -216,12 +217,59 @@ class LocalSnapshotRunner:
                 modified_paths=modified,
             )
         finally:
-            snapshot.close()
-            leaked = False
-            if run_directory is not None:
-                shutil.rmtree(run_directory, ignore_errors=True)
-                leaked = run_directory.exists()
+            leaked = self._release(snapshot, run_directory, threads)
         return result.model_copy(update={"cleanup_failed": leaked})
+
+    @staticmethod
+    async def _thread(
+        threads: list[asyncio.Future[Any]], function: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> Any:
+        """Run `function` in a worker thread that stays registered after a cancellation.
+
+        `asyncio.to_thread` cannot stop its thread when the caller is cancelled. The future is
+        shielded and recorded so the cleanup that owns the files the thread writes or reads can wait
+        for it (see `_release`) instead of removing them underneath it.
+        """
+
+        future = asyncio.ensure_future(asyncio.to_thread(function, *args, **kwargs))
+        future.add_done_callback(lambda done: done.cancelled() or done.exception())
+        threads.append(future)
+        return await asyncio.shield(future)
+
+    @staticmethod
+    def _release(
+        snapshot: ExecutionSnapshot, run_directory: Path | None, threads: list[asyncio.Future[Any]]
+    ) -> bool:
+        """Close the snapshot and remove the run directory, never underneath a running thread.
+
+        On the normal path every thread has ended and this removes at once (the result reports a
+        leak). After a cancellation a thread may still be running (it could re-create a deleted
+        directory, as `materialize` does with `parents=True`): removal is then deferred to the
+        moment the last such thread ends. If the event loop is gone by then, the remainder is left
+        to the operating system's temporary-directory cleanup.
+        """
+
+        def remove() -> bool:
+            snapshot.close()
+            if run_directory is None:
+                return False
+            shutil.rmtree(run_directory, ignore_errors=True)
+            return run_directory.exists()
+
+        running = [thread for thread in threads if not thread.done()]
+        if not running:
+            return remove()
+        remaining = len(running)
+
+        def one_ended(_: object) -> None:
+            nonlocal remaining
+            remaining -= 1
+            if remaining == 0:
+                remove()
+
+        for thread in running:
+            thread.add_done_callback(one_ended)
+        return False
 
     def _validate(self, command: SandboxCommand) -> Path:
         """The platform runner's contract: this runner's workspace, a contained directory."""

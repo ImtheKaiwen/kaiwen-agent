@@ -75,7 +75,11 @@ Like the Docker runner it refuses, before any process or copy, a command whose w
 its configured root (an equivalent-looking path is not trusted) or whose working directory contains a
 traversal, resolves outside the root or is not part of the captured snapshot; a refused command starts
 no process and records no evidence. A snapshot captured in a worker thread is closed even when the
-caller is cancelled while it is being captured.
+caller is cancelled while it is being captured, and the run directory and snapshot are never removed
+underneath a worker thread that is still using them: after a cancellation the removal waits for that
+thread to end (a thread cannot be stopped, and `materialize` would otherwise re-create a deleted
+directory). If the event loop has already gone by then, the remainder is left to the operating system's
+temporary-directory cleanup.
 
 ## Configuration
 
