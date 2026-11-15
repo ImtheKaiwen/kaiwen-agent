@@ -65,7 +65,12 @@ nondeterministic dependency); the human approval answers (`ExampleApprover`, a r
 `HumanApprovalPort`); the Coder, whose edit is a host function writing through the real
 `WorkspaceFilesystem`; and the Tester, a host-run step that executes two fixed command presets through
 the real catalog and evidence pipeline. The test runner is `LocalSnapshotRunner`: it runs the tests
-in a temporary copy of the workspace with the current Python and is **not a sandbox**.
+in a private, verified copy of the captured snapshot with the current Python and is **not a sandbox**
+(no isolation, no process-tree kill, output read fully before truncation, only a small allowlist of
+environment variables). It keeps the platform's execution-evidence contract: `snapshot_unchanged` and
+`modified_paths` come from `ExecutionSnapshot.changed_paths` (an unverifiable comparison counts as
+modified, so a run that edits its own snapshot is rejected by the gate), a timeout kills and reaps the
+process and returns a timed-out result, and cancellation kills the process, cleans up and propagates.
 
 ## Configuration
 

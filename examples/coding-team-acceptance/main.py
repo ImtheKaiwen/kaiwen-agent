@@ -28,10 +28,14 @@ not end as documented exits with an error. A blocked run is never reported as a 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import inspect
+import os
+import shutil
 import sys
 import tempfile
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -76,7 +80,9 @@ from kaiwen_agent.toolkits import (
     CommandRunInput,
     SandboxCommand,
     SandboxResult,
+    SandboxUnavailableError,
     SnapshotBuilder,
+    SnapshotError,
 )
 from kaiwen_agent.tools import ToolExecutor
 from kaiwen_agent.types import ModelResponse, ToolCall
@@ -143,11 +149,25 @@ class ScriptedModel:
 
 
 class LocalSnapshotRunner:
-    """Runs the project's unit tests against a real snapshot of the workspace. Not a sandbox.
+    """Runs a host-registered `python` preset against a private copy of a snapshot. NOT a sandbox.
 
-    It satisfies the platform's `SandboxRunner` contract so the evidence pipeline can attribute the
-    result to the snapshot fingerprint. The host names this very object as the trusted runner.
+    It keeps the platform's execution-evidence contract, which the evidence pipeline and the gate
+    rely on: the command runs in a fresh, verified copy of the captured snapshot (never in the
+    snapshot or the workspace); `snapshot_unchanged` and `modified_paths` come from
+    `ExecutionSnapshot.changed_paths` and are reported as modified when the comparison cannot be
+    made; a timeout returns a timed-out result after the process was killed and reaped; cancellation
+    kills the process, cleans up and still propagates; and the project code receives only a small
+    allowlist of environment variables, never the host's keys. The host names this very object as
+    the trusted runner.
+
+    What it does not provide: isolation (the project code runs as the host user, with network and
+    filesystem access), a process-tree kill (only the started process), or a bounded read of a
+    flooding command (the output is read fully, then truncated). Only fixed host presets should use
+    it; production hosts configure `DockerSandboxRunner`.
     """
+
+    _ENVIRONMENT = ("SYSTEMROOT", "SYSTEMDRIVE", "TEMP", "TMP", "TMPDIR", "LANG", "LC_ALL")
+    _TIMEOUT_EXIT_CODE = 124  # the platform sandbox runner's convention
 
     def __init__(self, builder: SnapshotBuilder) -> None:
         self.builder = builder
@@ -156,30 +176,81 @@ class LocalSnapshotRunner:
         self.root = builder.root
 
     async def run(self, command: SandboxCommand) -> SandboxResult:
-        snapshot = await asyncio.to_thread(self.builder.capture)
+        if command.argv[0] != "python":
+            raise ValueError("The local runner only executes the python preset")
         try:
-            process = await asyncio.create_subprocess_exec(
-                sys.executable,
-                "-I",
-                *command.argv[1:],
-                cwd=snapshot.directory,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-            output, _ = await asyncio.wait_for(
-                process.communicate(), timeout=command.timeout_seconds
-            )
-            return SandboxResult(
-                exit_code=process.returncode or 0,
-                stdout=output.decode(errors="replace")[: command.max_output_bytes],
+            relative = command.working_directory.relative_to(command.workspace)
+        except ValueError:
+            raise ValueError("The working directory must stay inside the workspace") from None
+        started = time.monotonic()
+        snapshot = await asyncio.to_thread(self.builder.capture)
+        run_directory = Path(tempfile.mkdtemp(prefix="kaiwen-local-run-"))
+        try:
+            copy = run_directory / "workspace"
+            try:
+                await asyncio.to_thread(
+                    snapshot.materialize, copy, writable=command.writable_workspace
+                )
+            except SnapshotError as error:
+                raise SandboxUnavailableError("The execution snapshot is not intact") from error
+            output, returncode, timed_out = await self._execute(command, copy / relative)
+            # The process is gone: compare the run copy with the captured digests. An
+            # unverifiable comparison counts as modified, never as unchanged.
+            try:
+                modified = await asyncio.to_thread(snapshot.changed_paths, copy)
+            except Exception:  # noqa: BLE001 - fail closed, whatever the reason
+                unchanged, modified = False, ()
+            else:
+                unchanged = not modified
+            text = output[: command.max_output_bytes].decode(errors="ignore")
+            result = SandboxResult(
+                exit_code=returncode,
+                stdout=text,
+                duration_seconds=time.monotonic() - started,
+                timed_out=timed_out,
                 snapshot_fingerprint=snapshot.fingerprint,
                 image_ref="local-python",
                 image_id="local",
-                snapshot_unchanged=True,
-                cleanup_failed=False,
+                output_truncated=len(output) > command.max_output_bytes,
+                snapshot_unchanged=unchanged,
+                modified_paths=modified,
             )
         finally:
             snapshot.close()
+            shutil.rmtree(run_directory, ignore_errors=True)
+            leaked = run_directory.exists()
+        return result.model_copy(update={"cleanup_failed": leaked})
+
+    async def _execute(self, command: SandboxCommand, cwd: Path) -> tuple[bytes, int, bool]:
+        environment = {k: os.environ[k] for k in self._ENVIRONMENT if k in os.environ}
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-I",
+            *command.argv[1:],
+            cwd=cwd,
+            env=environment,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            output, _ = await asyncio.wait_for(
+                process.communicate(), timeout=command.timeout_seconds
+            )
+        except TimeoutError:
+            await asyncio.shield(self._terminate(process))
+            return b"", self._TIMEOUT_EXIT_CODE, True
+        except asyncio.CancelledError:
+            await asyncio.shield(self._terminate(process))
+            raise
+        return output, process.returncode or 0, False
+
+    @staticmethod
+    async def _terminate(process: asyncio.subprocess.Process) -> None:
+        with contextlib.suppress(ProcessLookupError, OSError):
+            process.kill()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(process.wait(), timeout=10)
 
 
 class ExampleApprover:
