@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Add reviewer assessment and host-controlled team acceptance (M6.3.4, ADR 0017 Proposed):
+- Add reviewer assessment and host-controlled team acceptance (M6.3.4, ADR 0017):
   `AgentRuntimeWorker(review=ReviewTools())` with the strict, bounded `review.submit` tool, finalized
   into the reviewer's own task output and bound by the host to run, owner, workspace, its task id,
   per-task output digests and the fingerprint; opt-in `WorkflowController(team_acceptance=

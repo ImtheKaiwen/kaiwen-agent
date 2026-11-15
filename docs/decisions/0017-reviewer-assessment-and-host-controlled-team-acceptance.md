@@ -1,6 +1,25 @@
 # ADR 0017: Reviewer assessment and host-controlled team acceptance
 
-- Status: Proposed
+- Status: Accepted, scoped (see Status notes)
+
+## Status notes
+
+- Implementation: completed and merged (pull request 18, squash commit
+  `2ab7baeb266988dc5083e8ce5c2ebd06293d69a5`); the post-merge CI run on `main` succeeded. The
+  decision below, including the audit R1 and R2 corrections and the operator decisions (items 7 to 9),
+  is what was implemented.
+- Operator acceptance: the operator accepted the findings of the pre-merge review, the documented
+  limitations (every check is point-in-time and not atomic with the database write; replay is at
+  least once; the review digest is a hash, not a signature; approval-required delegation stays blocked;
+  there is no first-party human approval store) and two non-blocking low-severity configuration items
+  recorded as technical debt (`required_tasks` given as a bare string is read as its characters and
+  fails closed as a denial; `min_reviewers=True` is accepted as 1). This acceptance takes effect when
+  this status change is merged by the operator.
+- Not claimed: there is no author-independent audit sign-off. The pre-merge review was a read-only
+  review by a separate fresh-context instance of the same model that wrote the implementation, not an
+  auditor independent of the author.
+- Scope: unchanged. The acceptance covers the reviewer assessment and the opt-in team acceptance
+  decision only; it does not resolve approval-required delegation or add an approval store.
 
 ## Context
 
