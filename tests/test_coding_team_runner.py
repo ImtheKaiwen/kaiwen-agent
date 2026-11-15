@@ -35,6 +35,7 @@ from kaiwen_agent.toolkits import (
     CommandPreset,
     CommandRunInput,
     SandboxCommand,
+    SandboxUnavailableError,
     SnapshotBuilder,
 )
 from kaiwen_agent.toolkits import snapshot as snapshot_module
@@ -297,8 +298,8 @@ def test_only_the_python_executable_runs_and_the_directory_must_stay_inside(
 ) -> None:
     project = Project(tmp_path)
     other = project.command("print(1)").model_copy(update={"argv": ("sh", "-c", "echo hi")})
-    with pytest.raises(ValueError):
+    with pytest.raises(SandboxUnavailableError):
         run(project.runner.run(other))
     outside = project.command("print(1)").model_copy(update={"working_directory": tmp_path})
-    with pytest.raises(ValueError):
+    with pytest.raises(SandboxUnavailableError):
         run(project.runner.run(outside))

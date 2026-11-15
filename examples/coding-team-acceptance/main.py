@@ -39,7 +39,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from kaiwen_agent.agents import VersionedReference
@@ -78,6 +78,7 @@ from kaiwen_agent.toolkits import (
     CommandCatalog,
     CommandPreset,
     CommandRunInput,
+    ExecutionSnapshot,
     SandboxCommand,
     SandboxResult,
     SandboxUnavailableError,
@@ -176,16 +177,15 @@ class LocalSnapshotRunner:
         self.root = builder.root
 
     async def run(self, command: SandboxCommand) -> SandboxResult:
-        if command.argv[0] != "python":
-            raise ValueError("The local runner only executes the python preset")
-        try:
-            relative = command.working_directory.relative_to(command.workspace)
-        except ValueError:
-            raise ValueError("The working directory must stay inside the workspace") from None
+        relative = self._validate(command)  # nothing runs, and nothing is copied, if it refuses
         started = time.monotonic()
-        snapshot = await asyncio.to_thread(self.builder.capture)
-        run_directory = Path(tempfile.mkdtemp(prefix="kaiwen-local-run-"))
+        snapshot = await self._capture()
+        run_directory: Path | None = None
         try:
+            posix = PurePosixPath(relative.as_posix())
+            if not snapshot.has_directory(posix.as_posix()):
+                raise SandboxUnavailableError("Working directory is not part of the snapshot")
+            run_directory = Path(tempfile.mkdtemp(prefix="kaiwen-local-run-"))
             copy = run_directory / "workspace"
             try:
                 await asyncio.to_thread(
@@ -217,9 +217,45 @@ class LocalSnapshotRunner:
             )
         finally:
             snapshot.close()
-            shutil.rmtree(run_directory, ignore_errors=True)
-            leaked = run_directory.exists()
+            leaked = False
+            if run_directory is not None:
+                shutil.rmtree(run_directory, ignore_errors=True)
+                leaked = run_directory.exists()
         return result.model_copy(update={"cleanup_failed": leaked})
+
+    def _validate(self, command: SandboxCommand) -> Path:
+        """The platform runner's contract: this runner's workspace, a contained directory."""
+
+        if command.argv[0] != "python":
+            raise SandboxUnavailableError("The local runner only executes the python preset")
+        root = self.filesystem.roots[self.root]
+        if command.workspace != root:  # the configured path itself, never an equivalent spelling
+            raise SandboxUnavailableError("Command workspace is not the configured root")
+        if ".." in command.working_directory.parts:
+            raise SandboxUnavailableError("Working directory must not contain a traversal")
+        try:
+            return command.working_directory.resolve(strict=False).relative_to(root)
+        except ValueError:
+            raise SandboxUnavailableError("Working directory is outside the workspace") from None
+
+    async def _capture(self) -> ExecutionSnapshot:
+        """Capture in a worker thread without leaking the copy if the caller is cancelled.
+
+        A cancelled `to_thread` call still lets the thread finish; the finished snapshot would
+        otherwise be dropped without `close()`. The orphan is closed when the thread ends.
+        """
+
+        future = asyncio.ensure_future(asyncio.to_thread(self.builder.capture))
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            future.add_done_callback(self._close_orphan)
+            raise
+
+    @staticmethod
+    def _close_orphan(future: asyncio.Future[ExecutionSnapshot]) -> None:
+        if not future.cancelled() and future.exception() is None:
+            future.result().close()
 
     async def _execute(self, command: SandboxCommand, cwd: Path) -> tuple[bytes, int, bool]:
         environment = {k: os.environ[k] for k in self._ENVIRONMENT if k in os.environ}

@@ -71,6 +71,11 @@ environment variables). It keeps the platform's execution-evidence contract: `sn
 `modified_paths` come from `ExecutionSnapshot.changed_paths` (an unverifiable comparison counts as
 modified, so a run that edits its own snapshot is rejected by the gate), a timeout kills and reaps the
 process and returns a timed-out result, and cancellation kills the process, cleans up and propagates.
+Like the Docker runner it refuses, before any process or copy, a command whose workspace is not exactly
+its configured root (an equivalent-looking path is not trusted) or whose working directory contains a
+traversal, resolves outside the root or is not part of the captured snapshot; a refused command starts
+no process and records no evidence. A snapshot captured in a worker thread is closed even when the
+caller is cancelled while it is being captured.
 
 ## Configuration
 
