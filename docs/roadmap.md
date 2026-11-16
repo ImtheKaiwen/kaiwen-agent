@@ -585,14 +585,32 @@ Each defect was reproduced with a failing test before its fix.
       technical debt (not blocking, no behavior change planned here): `TeamAcceptancePolicy`
       accepts `required_tasks="code"` as the characters of the string (fails closed as a denial)
       and `min_reviewers=True` as 1; both could be rejected at construction.
-- [~] M6.4-A beta host integration baseline (draft pull request, pending independent audit):
+- [x] M6.4-A beta host integration baseline (pull request 21, squash commit
+      `dbbff4ee991a3680b901a91e97446fe684ba1bc5`; all ten pull request checks on the final head and
+      all ten checks of the post-merge `main` run passed):
       `examples/coding-team-acceptance` composes Lead, Coder, Tester and Reviewer from public
       interfaces over the fenced SQLite stack, the trusted evidence pipeline, a real completion
       gate and team acceptance, credential-free and deterministic, with ten documented scenarios
       and tests; `docs/coding-team-beta.md` holds the assessment, setup, a manual live-validation
-      specification and the beta-readiness matrix. The Tester is a host-run step because a
-      model-driven unattended `testing.run` needs a runner with real isolation (Docker). Not done:
-      the model-driven Tester inside the team, any live multi-role provider run.
+      specification and the beta-readiness matrix. The Tester was a host-run step because a
+      model-driven unattended `testing.run` needs a runner with real isolation (Docker). Hardening
+      rounds R1 (snapshot comparison, timeout, cancellation, environment), R2 (directory
+      containment, workspace identity, cancellation during capture) and R3 (a worker thread must not
+      outlive the cleanup that owns its files) were part of the merged change. Review: read-only
+      reviews by AI models, one of them reproducing the R3 defect; the last was independent of the
+      implementation session but it is an AI-assisted review, not a human security certification. No
+      P0 to P2 finding remained. Not done by this milestone: the model-driven Tester inside the team,
+      any live multi-role provider run, production readiness.
+- [~] M6.4-B model-driven Tester and Docker team integration (draft pull request, pending
+      independent audit): the same team with the Tester as an `AgentRuntimeWorker` whose scripted
+      model calls `testing.run`, executed by `DockerSandboxRunner` (`--docker` scenarios), signed
+      evidence, the completion gate and team acceptance; a missing engine or image fails closed with no
+      local fallback. The Docker tests run only on a Linux engine (Linux CI); locally they are
+      skipped, so the real-container verification rests on the exact-head CI result. Prepared for a
+      later, separately authorized live run, not executed: the offline `team-plan` command (tool
+      schema and strictness check, request ceiling, worst-case spend, authorization request) and the
+      example's `model_factory` seam. Not done: any live multi-role provider run, the live team
+      harness, resume, production readiness.
 - Not done: beta integration, resolving approval-required delegation and a durable cycle
   cursor. There is no atomic reservation of delegation quotas: delegation at the cycle
   boundary is safe only because the run lease holder alone writes the run's tasks (enforced by

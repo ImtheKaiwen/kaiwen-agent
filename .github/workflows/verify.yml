@@ -80,6 +80,7 @@ jobs:
           python examples/coding-docker-evidence/main.py
           python examples/coding-evidence-freshness/main.py
           python examples/coding-agent-worker/main.py
+          python examples/coding-team-acceptance/main.py --docker
       - name: Run executable examples
         shell: bash
         env:

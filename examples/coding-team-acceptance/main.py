@@ -78,12 +78,15 @@ from kaiwen_agent.toolkits import (
     CommandCatalog,
     CommandPreset,
     CommandRunInput,
+    DockerSandboxConfig,
+    DockerSandboxRunner,
     ExecutionSnapshot,
     SandboxCommand,
     SandboxResult,
     SandboxUnavailableError,
     SnapshotBuilder,
     SnapshotError,
+    testing_tools,
 )
 from kaiwen_agent.tools import ToolExecutor
 from kaiwen_agent.types import ModelResponse, ToolCall
@@ -115,6 +118,11 @@ from kaiwen_agent.workflow import (
 )
 from kaiwen_agent.workflow import review as review_contract
 
+# The digest-pinned image the Docker scenarios run in (see docs/coding-team-beta.md).
+DOCKER_IMAGE = os.environ.get(
+    "KAIWEN_DOCKER_IMAGE",
+    "python@sha256:e064671ca452259bab50e8e2c7bd896e39e9a343bb06ca25234adf6fe18d0fc7",
+)
 CAPABILITIES = frozenset({"workspace.read"})
 ROLES = ("lead", "lead2", "coder", "tester", "reviewer")
 FIXED = "def add(a, b):\n    return a + b\n"
@@ -370,6 +378,13 @@ class Scenario:
     cite: str = "tests"  # "tests": the gate-verified artifact; "compile": an unrelated one
     approval: str | None = None  # None, "approve", "deny", "mismatch", "approve_after_edit"
     team_acceptance: bool = True  # False: the opt-in acceptance is not configured (legacy flow)
+    # "host": a host-run step on the local runner (no model, no isolation). "model": an
+    # AgentRuntimeWorker whose model calls `testing.run`, executed by DockerSandboxRunner.
+    tester: str = "host"
+    # What the scripted Tester model does: "presets" (run both presets), "claim" (run them and
+    # claim success whatever happened), "unregistered_command" (call `testing.run` with a command
+    # id the host never registered), "unregistered_tool" (call a tool the host never registered).
+    tester_calls: str = "presets"
 
 
 SCENARIOS = (
@@ -416,6 +431,42 @@ SCENARIOS = (
 )
 
 
+# Scenarios whose Tester is model-driven: `testing.run` runs in a Docker container and needs an
+# engine and the pinned image; without them the run fails closed and nothing is executed.
+DOCKER_SCENARIOS = (
+    Scenario("docker_accepted", WorkflowOutcomeStatus.COMPLETED, None, tester="model"),
+    Scenario(
+        "docker_failing_tests",
+        WorkflowOutcomeStatus.BLOCKED,
+        "quality_blocked",
+        fix_code=False,
+        tester="model",
+        tester_calls="claim",
+    ),
+    Scenario(
+        "docker_unrelated_evidence",
+        WorkflowOutcomeStatus.BLOCKED,
+        "team_changes_required:evidence_not_gate_verified",
+        cite="compile",
+        tester="model",
+    ),
+    Scenario(
+        "docker_unregistered_command",
+        WorkflowOutcomeStatus.FAILED,
+        "task_execution_failed",
+        tester="model",
+        tester_calls="unregistered_command",
+    ),
+    Scenario(
+        "docker_unregistered_tool",
+        WorkflowOutcomeStatus.FAILED,
+        "task_execution_failed",
+        tester="model",
+        tester_calls="unregistered_tool",
+    ),
+)
+
+
 @dataclass
 class Result:
     scenario: Scenario
@@ -425,6 +476,8 @@ class Result:
     approver: ExampleApprover | None = None
     # Runs the same durable run again (a replay); the scripted models are not rewound.
     replay: Callable[[], Awaitable[WorkflowOutcome]] | None = None
+    # The run's artifact store, so a caller can inspect the recorded evidence.
+    artifacts: ArtifactManager | None = None
 
     @property
     def acceptance(self) -> str:
@@ -497,11 +550,23 @@ async def run_scenario(
     *,
     approver: ExampleApprover | None = None,
     clock: Callable[[], datetime] | None = None,
+    docker_config: DockerSandboxConfig | None = None,
+    sandbox_factory: Callable[[WorkspaceFilesystem], Any] | None = None,
+    model_factory: Callable[[str, list[Any]], Any] | None = None,
 ) -> Result:
     """Compose the team from public platform interfaces and run one delivery to its outcome.
 
     `approver` and `clock` are injection points for deterministic tests (a barrier inside the
     approval source, an injected lease clock); nothing about the requirements changes.
+
+    A scenario with `tester="model"` runs `testing.run` in `DockerSandboxRunner`: the engine and
+    the pinned image are verified first and an unavailable sandbox raises
+    `SandboxUnavailableError` before anything runs. There is no local fallback. `docker_config`
+    selects another trusted sandbox configuration; `sandbox_factory` lets a test replace the
+    runner (the platform still refuses a runner that does not declare isolation). `model_factory`
+    receives a role name and that role's scripted steps and returns the model object for the role:
+    the seam a future, separately authorized live run would use to put a real provider behind the
+    same team. Nothing else about the composition, the tools or the requirements changes.
     """
 
     root = directory / "project"
@@ -515,7 +580,19 @@ async def run_scenario(
     # ---- host composition: workspace, evidence identity, durable and fenced state ------------
     filesystem = WorkspaceFilesystem(workspace_id="project", roots={"main": root})
     builder = SnapshotBuilder(filesystem, "main")
-    runner = LocalSnapshotRunner(builder)
+    runner: Any
+    if scenario.tester == "model":
+        if sandbox_factory is not None:
+            runner = sandbox_factory(filesystem)
+        else:
+            runner = DockerSandboxRunner(
+                docker_config or DockerSandboxConfig(image=DOCKER_IMAGE),
+                filesystem=filesystem,
+                root="main",
+            )
+            await runner.verify()  # engine, pinned image: fail closed, no local fallback
+    else:
+        runner = LocalSnapshotRunner(builder)
     artifacts = ArtifactManager()
     signer = EvidenceSigner(key=hashlib.sha256(b"example-signing-key").digest())
     pipeline = TrustedEvidencePipeline.build(
@@ -576,7 +653,12 @@ async def run_scenario(
     workers = WorkerRegistry()
     gate = CompletionGate(verifiers=verifiers, artifacts=artifacts)
 
-    def runtime(model: ScriptedModel, tools: tuple[Any, ...], permissions: frozenset[str]) -> Any:
+    def scripted(role: str, *steps: Any) -> Any:
+        """The scripted model of one role, or the model a live harness supplies for it."""
+
+        return model_factory(role, list(steps)) if model_factory else ScriptedModel(*steps)
+
+    def runtime(model: Any, tools: tuple[Any, ...], permissions: frozenset[str]) -> Any:
         return AgentRuntime(
             name="member",
             model=model,
@@ -610,7 +692,7 @@ async def run_scenario(
         workers.register(
             role,
             AgentRuntimeWorker(
-                runtime=runtime(ScriptedModel(*steps), lead_tools.definitions(), lead_permissions),
+                runtime=runtime(scripted(role, *steps), lead_tools.definitions(), lead_permissions),
                 runs=runs,
                 task_store=store,
                 role=role,
@@ -662,7 +744,8 @@ async def run_scenario(
             "evidence_refs": references,
         }
 
-    workers.register("tester", FunctionWorker(run_tests))
+    if scenario.tester == "host":
+        workers.register("tester", FunctionWorker(run_tests))
 
     review_tools = ReviewTools()
 
@@ -689,7 +772,7 @@ async def run_scenario(
         "reviewer",
         AgentRuntimeWorker(
             runtime=runtime(
-                ScriptedModel(reviewer_step, ModelResponse(text="reviewed")),
+                scripted("reviewer", reviewer_step, ModelResponse(text="reviewed")),
                 review_tools.definitions(),
                 reviewer_permissions,
             ),
@@ -782,6 +865,26 @@ async def run_scenario(
         delegation=delegation,
         team_acceptance=acceptance if scenario.team_acceptance else None,
     )
+    if scenario.tester == "model":
+        # A coding worker validates the controller it runs under, so it is built after it. The
+        # model-facing `testing.run` tool may only run unattended because the catalog's runner
+        # declares real isolation (`DockerSandboxRunner`); the platform refuses any other runner.
+        workers.register(
+            "tester",
+            _model_tester(
+                scenario,
+                runtime,
+                catalog,
+                workspace,
+                controller,
+                runs,
+                store,
+                artifacts,
+                fingerprints,
+                scripted,
+            ),
+        )
+
     standards = StandardsResolver(StandardsRegistry(coding_standards_packs())).resolve(
         [VersionedReference(id="coding.tests", version=1)],
         condition_facts={"has_executable_tests": True},
@@ -823,6 +926,73 @@ async def run_scenario(
         run_id=run.id,
         approver=approver,
         replay=execute,
+        artifacts=artifacts,
+    )
+
+
+def _model_tester(
+    scenario: Scenario,
+    runtime: Callable[..., Any],
+    catalog: CommandCatalog,
+    workspace: AuthorizedCodingWorkspace,
+    controller: WorkflowController,
+    runs: DurableRunManager,
+    store: SQLitePersistence,
+    artifacts: ArtifactManager,
+    fingerprints: WorkspaceFingerprintProvider,
+    scripted: Callable[..., Any],
+) -> AgentRuntimeWorker:
+    """The Tester as an `AgentRuntimeWorker` whose scripted model calls `testing.run`.
+
+    The model only names a registered tool and a registered command id; the host validates the
+    tool, the permission and the arguments, the command runs in the container, and the trusted
+    pipeline records the evidence. What the model then says about the result proves nothing.
+    """
+
+    def call(call_id: str, command_id: str) -> ToolCall:
+        return ToolCall(
+            id=call_id,
+            name="testing.run",
+            arguments={"command_id": command_id, "parameters": {}},
+        )
+
+    if scenario.tester_calls in {"unregistered_command", "unregistered_tool"}:
+        refused = (
+            call("u1", "rm.everything")
+            if scenario.tester_calls == "unregistered_command"
+            else ToolCall(id="u1", name="shell.run", arguments={"command": "cat /etc/passwd"})
+        )
+        steps: list[Any] = [
+            ModelResponse(tool_calls=[refused]),
+            ModelResponse(text="Everything passes; the delivery is verified."),
+        ]
+    else:
+        claim = (
+            "All tests pass! The delivery is verified."
+            if scenario.tester_calls == "claim"
+            else "Executed the test presets."
+        )
+        steps = [
+            ModelResponse(tool_calls=[call("t1", "unit.tests"), call("t2", "compile.check")]),
+            ModelResponse(text=claim),
+        ]
+    permissions = frozenset({"tests.run"})
+    return AgentRuntimeWorker(
+        runtime=runtime(
+            scripted("tester", *steps),
+            testing_tools(catalog, unattended_categories=frozenset({"test"})),
+            permissions,
+        ),
+        runs=runs,
+        task_store=store,
+        role="tester",
+        permissions=permissions,
+        tool_names=("testing.run",),
+        evidence_tool_names=frozenset({"testing.run"}),
+        workspace=workspace,
+        controller=controller,
+        artifacts=artifacts,
+        fingerprints=fingerprints,
     )
 
 
@@ -856,15 +1026,31 @@ async def _artifact_of_command(
     raise LookupError(f"no evidence artifact for {command_id}")
 
 
-async def main_async(names: list[str]) -> int:
-    chosen = [s for s in SCENARIOS if not names or s.name in names]
+async def main_async(
+    names: list[str],
+    *,
+    docker: bool = False,
+    docker_config: DockerSandboxConfig | None = None,
+) -> int:
+    """Run scenarios. `docker=True` runs the model-driven Tester scenarios in a container."""
+
+    catalog = DOCKER_SCENARIOS if docker else SCENARIOS
+    chosen = [s for s in catalog if not names or s.name in names]
     if not chosen:
-        print("Unknown scenario. Available: " + ", ".join(s.name for s in SCENARIOS))
+        print("Unknown scenario. Available: " + ", ".join(s.name for s in catalog))
         return 2
     failures = 0
     for scenario in chosen:
         with tempfile.TemporaryDirectory(prefix="kaiwen-team-") as directory:
-            result = await run_scenario(scenario, Path(directory))
+            try:
+                result = await run_scenario(scenario, Path(directory), docker_config=docker_config)
+            except SandboxUnavailableError as error:
+                # Fail closed: nothing ran, no evidence was recorded and no local fallback exists.
+                print(f"Docker sandbox unavailable ({error}); nothing was executed.")
+                if os.environ.get("KAIWEN_REQUIRE_DOCKER") == "1":
+                    print("KAIWEN_REQUIRE_DOCKER is set, so this is a failure.")
+                    return 1
+                return 0
         marker = "ok " if result.as_expected else "BAD"
         print(
             f"[{marker}] {scenario.name:36s} -> {result.outcome.status.value:9s} "
@@ -880,4 +1066,9 @@ async def main_async(names: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main_async(sys.argv[1:])))
+    arguments = sys.argv[1:]
+    sys.exit(
+        asyncio.run(
+            main_async([a for a in arguments if a != "--docker"], docker="--docker" in arguments)
+        )
+    )
