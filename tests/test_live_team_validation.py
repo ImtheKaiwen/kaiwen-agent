@@ -600,6 +600,25 @@ def test_the_rendered_report_scrubs_a_configured_secret_wherever_it_appears() ->
     assert SECRET not in text and "[REDACTED]" in text
 
 
+def test_the_real_client_is_built_with_the_request_timeout_and_no_sdk_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The one real client: SDK retries off (every request is counted) and the timeout set."""
+
+    import openai
+
+    seen: dict[str, Any] = {}
+
+    class Recorder:
+        def __init__(self, **kwargs: Any) -> None:
+            seen.update(kwargs)
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", Recorder)
+    provider_config = lv.Config(provider="openai", model="m", live=True, limits=_limits())
+    lv._real_client(provider_config, {"OPENAI_API_KEY": SECRET})
+    assert seen["max_retries"] == 0 and seen["timeout"] == 90.0
+
+
 # ---------------------------------------------------------------------------------- preflight
 
 
