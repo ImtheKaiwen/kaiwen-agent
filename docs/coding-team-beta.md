@@ -1,4 +1,4 @@
-# Coding team beta integration (M6.4-A)
+# Coding team beta integration (M6.4-A and M6.4-B)
 
 Status: a bounded integration baseline, not a production release. It shows that the existing
 platform composes into a coding team (Lead, Coder, Tester, Reviewer) whose delivery is completed
@@ -13,7 +13,7 @@ boundary (ADR 0012 to 0017).
 | Fenced run ownership, SQLite leases, fenced task store, durable runs | implemented and tested | unchanged, composed by the example |
 | Lead delegation (C1 to C3), compiler-proven ids, cross-cycle handoffs | implemented and tested | unchanged, composed by the example |
 | Reviewer assessment and team acceptance (ADR 0017) | implemented and tested, but only through test harnesses | composed from public interfaces by the example |
-| Trusted evidence pipeline, completion gate, protected-workspace fingerprint | implemented and tested (Docker examples, tests) | composed with a local runner by the example |
+| Trusted evidence pipeline, completion gate, protected-workspace fingerprint | implemented and tested (Docker examples, tests) | composed with a local runner by the example (M6.4-A) and with `DockerSandboxRunner` and a model-driven Tester (M6.4-B, `--docker`) |
 | Public host-composition interfaces | present: `WorkflowController`, `AgentRuntimeWorker`, `TeamAcceptance`, `AuthorizedCodingWorkspace`, `TrustedEvidencePipeline`, `CommandCatalog` | no new public API was needed |
 | Missing consumer code | a maintained, runnable composition of all of them | `examples/coding-team-acceptance/main.py` |
 | Needs a new decision | model-driven unattended test runs without Docker; model-driven file edits with durable approvals in a team; multi-process execution | not attempted (see Findings) |
@@ -122,16 +122,54 @@ key or model output is printed.
 ## Findings (confirmed integration gaps)
 
 1. A model-driven `testing.run` may only run unattended on a runner that declares real isolation
-   (`provides_isolation`, `DockerSandboxRunner`). A credential-free example without a Docker engine
-   therefore cannot give the Tester that tool without lying about isolation, and it does not. The Tester
-   is a host-run step that uses the same catalog and evidence pipeline. The model-driven Tester over
-   Docker is demonstrated by `examples/coding-agent-worker` (CI, Linux); the combination with this
-   multi-role team is not yet run anywhere.
+   (`provides_isolation`, `DockerSandboxRunner`). The default, credential-free example has no Docker
+   engine, so its Tester is a host-run step that uses the same catalog and evidence pipeline and never
+   claims isolation. M6.4-B composes the model-driven Tester over `DockerSandboxRunner` into the same
+   team (`--docker`, see Docker mode); it needs a Linux engine and the pinned image and is verified
+   only by the Linux CI run.
 2. `workspace.apply_patch` requires approval, and a run that waits for a durable approval has no
    resume path (general resume is not implemented). The Coder's edit is therefore a host function.
 3. The team runs in one process under one owner lease; distributed execution is out of scope.
 4. No new public API was needed; the example's only injection points (`approver`, `clock`) are
    parameters of the example function, and the lease clock is the existing `lease_clock` attribute.
+
+## Docker mode: a model-driven Tester (M6.4-B)
+
+Prerequisites: a reachable Linux Docker engine and the digest-pinned image available locally (the
+runner never pulls): `docker pull python@sha256:e064671ca452259bab50e8e2c7bd896e39e9a343bb06ca25234adf6fe18d0fc7`
+(or set `KAIWEN_DOCKER_IMAGE` to another digest-pinned reference). Run:
+
+```bash
+python examples/coding-team-acceptance/main.py --docker            # every Docker scenario
+python examples/coding-team-acceptance/main.py --docker docker_accepted
+```
+
+The Tester is an `AgentRuntimeWorker` whose scripted model calls the registered `testing.run` tool with
+a registered command id. The host validates the tool, the permission and the arguments; the command
+runs in `DockerSandboxRunner` (digest-pinned image, no network, non-root, read-only root, resource
+limits, a private copy of the content-aware snapshot); the trusted pipeline records signed, run-scoped
+evidence bound to the workspace fingerprint; the completion gate and team acceptance then decide. The
+Coder stays a host function and no approval or resume mechanism is added.
+
+| Scenario | Expected outcome |
+| --- | --- |
+| `docker_accepted` | completed; the review cites the gate-verified container evidence |
+| `docker_failing_tests` | blocked `quality_blocked`; the container ran and failed, and the model claim of success changes nothing |
+| `docker_unrelated_evidence` | blocked `team_changes_required:evidence_not_gate_verified` |
+| `docker_unregistered_command` | failed `task_execution_failed`; nothing ran and no evidence exists |
+| `docker_unregistered_tool` | failed `task_execution_failed`; nothing ran and no evidence exists |
+
+These outcomes are what the scenarios assert; they were not observed on a local engine (none was
+available), so the container behavior is verified by the exact-head Linux CI run, where an unavailable
+engine is a failure (`KAIWEN_REQUIRE_DOCKER=1`). Without an engine or image the command prints that
+nothing was executed and exits 0 (or 1 under `KAIWEN_REQUIRE_DOCKER=1`); there is no fallback to the
+local runner, and the platform refuses an unattended model-driven Tester on a runner that does not
+declare isolation. Tests: `tests/test_coding_team_docker.py` (the fail-closed tests need no engine; the
+container tests are skipped without one, and a skipped run proves nothing about isolation).
+
+Trust boundaries: the model chooses only among registered tools and registered commands; the command,
+the image, the network setting, the workspace and the run identity come from the host; what the model
+says afterwards is never evidence. The local runner is not a sandbox and is never used for this Tester.
 
 ## Real-provider readiness and manual validation specification
 
@@ -144,6 +182,24 @@ Unverified for a real multi-role workflow: a real model driving the Lead proposa
 tool (`review.submit` strict schema), and the model citing real evidence references; a real model
 inside the full controller with delegation and acceptance; provider error behavior across several
 roles; token and cost totals for a multi-task run.
+
+Prepared by M6.4-B, not executed: `python scripts/live_validation.py team-plan` is an offline command
+(no model, no key, no Docker) that builds the exact tool schemas of the model-driven roles (`lead.view`,
+`lead.propose_task`, `review.submit`, `testing.run`), checks strict tool-calling compatibility (an open
+object in a strict schema blocks the plan; `testing.run` is sent non-strict because of its free-form
+parameters mapping, with the host's own argument validation unchanged), computes the request ceiling
+(about nine model requests per delivery, so 18 for the proposed `docker_accepted` and
+`docker_failing_tests`) and the worst-case spend for the prices you pass, and prints the authorization
+request. With the prices recorded in `docs/live-validation.md` ($0.75 and $4.50 per million tokens) and
+the defaults (24 requests, 8000 input and 1500 output tokens per request, $0.50 budget) the worst case is
+$0.306 and the plan is `READY_FOR_AUTHORIZATION_REQUEST`; without prices it is `NOT_READY`. The example's
+`model_factory` argument is the seam a live harness would use to put a real provider behind the same team.
+The live team harness itself (a guarded client, the request ledger and the report) is not implemented.
+
+Proposed authorization request for a future live run (not made, nothing billed): provider OpenAI,
+model `gpt-5.4-mini`, scenarios `docker_accepted` and `docker_failing_tests`, at most 24 requests,
+$0.50 maximum spend, no retries, redacted report only. A live run needs explicit operator authorization
+naming the model and the maximum spend.
 
 A future manual validation (a separate run that requires explicit operator authorization and a stated
 maximum cost) should specify:
@@ -172,9 +228,9 @@ maximum cost) should specify:
 | --- | --- | --- |
 | Installation and configuration | PARTIAL | `pip install -e .` runs the example; no setup guide for a real consumer beyond the examples |
 | Coding workflow composition | READY (deterministic) | the example and its tests run the full team through the real stack |
-| Provider compatibility | PARTIAL | one model, single-worker, manual smoke; multi-role not validated live |
+| Provider compatibility | PARTIAL | one model, single-worker, manual smoke; multi-role not validated live; offline strict-schema check and authorization plan prepared |
 | Tool permissions | READY | deny-by-default, per-role permissions, covered by tests |
-| Sandbox execution | PARTIAL | Docker runner is tested in Linux CI; the multi-role team does not use it yet |
+| Sandbox execution | PARTIAL | the multi-role team composes `DockerSandboxRunner` (M6.4-B); its container tests run only on Linux CI, so the real-container evidence is the exact-head CI result |
 | Evidence verification | READY | signed, run- and fingerprint-scoped; gate-verified citations enforced |
 | Team review and acceptance | READY (author-side) | ADR 0017 accepted, fresh-context review only, no author-independent audit |
 | Durable state and recovery | PARTIAL | at-least-once replay and recovery reconcile exist; no general resume or cycle cursor |
@@ -182,6 +238,7 @@ maximum cost) should specify:
 | Diagnostics and error reporting | PARTIAL | stable codes, no secrets; no unified operator view across roles |
 | Documentation | PARTIAL | this guide and the workflow docs; no consumer quick start for a team |
 | Packaging | PARTIAL | wheel and sdist build and check in CI; the example is not part of the wheel |
+| Live multi-role validation | NOT IMPLEMENTED | the harness and any billed run are future work |
 | Out of scope | not started | distributed execution, gateway, speech, UI, production deployment, release |
 | Not implemented | missing | approval-required delegation, a first-party approval store, general resume, model-driven edits with approvals inside a team |
 
@@ -189,7 +246,8 @@ No claim of production readiness is made.
 
 ## Recommended next milestone
 
-M6.4-B: run the same team with a model-driven Tester (`testing.run` over `DockerSandboxRunner`) and,
-separately authorized, one bounded live-provider validation following the specification above. It is
-the smallest step that closes the two PARTIAL items with real evidence (sandbox in the team,
-multi-role provider behavior) without adding architecture.
+After M6.4-B is independently audited: M6.4-C, a live multi-role harness built on the `model_factory`
+seam and the existing guarded client, ledger and redacted report of `scripts/live_validation.py`, run
+only after a separate explicit authorization with a stated maximum spend (see the proposed request
+above). It is the smallest step that closes the remaining PARTIAL item (multi-role provider behavior)
+with real evidence without adding architecture.

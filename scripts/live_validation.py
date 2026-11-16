@@ -74,6 +74,11 @@ from kaiwen_agent.tools import ToolExecutor
 from kaiwen_agent.workers import WorkerRegistry
 from kaiwen_agent.workflow import (
     AgentRuntimeWorker,
+    LeadRoleBinding,
+    LeadToolConfig,
+    LeadTools,
+    LeadViewAssembler,
+    ReviewTools,
     WorkflowCompiler,
     WorkflowController,
     WorkflowOutcomeStatus,
@@ -1265,6 +1270,129 @@ def probe_openai_tool_strictness() -> dict[str, bool]:
     return {str(tool["name"]): bool(tool["strict"]) for tool in probe_openai_tools()}
 
 
+# ----------------------------------------------------------------------- multi-role team plan
+# A future, separately authorized live run of the whole coding team (Lead, second Lead, Tester
+# and Reviewer driven by a real model, the Tester in Docker). This section is OFFLINE: it builds
+# the exact tool schemas the roles would send, checks strict tool-calling compatibility, computes
+# the request ceiling and the worst-case spend, and prints the authorization request. It calls no
+# model, reads no key and executes nothing. The live team run itself is not implemented here.
+
+TEAM_SCENARIOS = ("docker_accepted", "docker_failing_tests")
+# Model requests one team delivery is expected to need: Lead (view, propose, finish), second Lead
+# (propose, finish), Tester (call, finish), Reviewer (submit, finish). A ceiling, not a guarantee.
+TEAM_REQUESTS_PER_DELIVERY = 9
+
+
+def probe_team_tools() -> list[dict[str, Any]]:
+    """The function tools of every model-driven role, as the OpenAI adapter would send them."""
+
+    with tempfile.TemporaryDirectory(
+        prefix="kaiwen-team-probe-", ignore_cleanup_errors=True
+    ) as tmp:
+        store = SQLitePersistence(Path(tmp) / "state.sqlite3")
+        lead = LeadTools(
+            config=LeadToolConfig(
+                roles={"coder": LeadRoleBinding("coder", "coder", frozenset())},
+                resource_allowlist=frozenset({"repo:main"}),
+            ),
+            assembler=LeadViewAssembler(runs=DurableRunManager(store), tasks=store),
+        )
+        definitions = [*lead.definitions(), *ReviewTools().definitions()]
+    used = {"testing__run"}
+    tools = [serialize_openai_tool(definition) for definition in definitions]
+    return tools + [tool for tool in probe_openai_tools() if tool["name"] in used]
+
+
+def team_plan(limits: Limits, pricing: Pricing, model: str) -> dict[str, Any]:
+    """The offline readiness assessment and authorization request for a live team run."""
+
+    tools = probe_team_tools()
+    issues = [issue for tool in tools for issue in strict_schema_issues(tool)]
+    needed = len(TEAM_SCENARIOS) * TEAM_REQUESTS_PER_DELIVERY
+    priced = pricing.input_per_mtok > 0 and pricing.output_per_mtok > 0
+    worst_case = worst_case_cost(limits, pricing) if priced else None
+    blockers: list[str] = []
+    if issues:
+        blockers.append("a strict tool schema contains an open object")
+    if limits.max_requests < needed:
+        blockers.append(f"max_requests {limits.max_requests} is below the {needed} the plan needs")
+    if not priced:
+        blockers.append("prices were not provided, so the worst-case spend is unknown")
+    elif worst_case is not None and worst_case > limits.budget_usd:
+        blockers.append("the worst-case spend exceeds the budget")
+    return {
+        "verdict": "READY_FOR_AUTHORIZATION_REQUEST" if not blockers else "NOT_READY",
+        "executed": False,
+        "model": model,
+        "scenarios": list(TEAM_SCENARIOS),
+        "roles": ["lead", "lead2", "tester", "reviewer"],
+        "tools": {str(tool["name"]): bool(tool["strict"]) for tool in tools},
+        "strict_schema_issues": issues,
+        "limits": asdict(limits),
+        "expected_requests": needed,
+        "worst_case_cost_usd": worst_case,
+        "blockers": blockers,
+        "authorization_request": {
+            "provider": "openai",
+            "model": model,
+            "scenarios": list(TEAM_SCENARIOS),
+            "maximum_spend_usd": limits.budget_usd,
+            "maximum_requests": limits.max_requests,
+            "retries": "none",
+            "requires": "explicit operator authorization naming this model and maximum spend",
+        },
+    }
+
+
+def build_team_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="live_validation.py team-plan",
+        description="Offline plan and authorization request for a live multi-role team run. "
+        "Calls no model and reads no key.",
+    )
+    parser.add_argument("--model", default=DEFAULT_OPENAI_MODEL)
+    parser.add_argument("--max-requests", type=int, default=24)
+    parser.add_argument("--max-steps", type=int, default=4)
+    parser.add_argument("--max-tool-calls", type=int, default=4)
+    parser.add_argument("--max-output-tokens", type=int, default=1_500)
+    parser.add_argument("--max-input-tokens", type=int, default=8_000)
+    parser.add_argument("--request-timeout", type=float, default=90.0)
+    parser.add_argument("--timeout", type=float, default=900.0, help="Overall seconds")
+    parser.add_argument("--budget-usd", type=float, default=0.50)
+    parser.add_argument("--price-input-per-mtok", type=float, default=0.0)
+    parser.add_argument("--price-output-per-mtok", type=float, default=0.0)
+    parser.add_argument("--report", type=Path, help="Write the plan as JSON here")
+    return parser
+
+
+def team_plan_main(argv: list[str]) -> int:
+    arguments = build_team_parser().parse_args(argv)
+    limits = Limits(
+        max_requests=arguments.max_requests,
+        max_steps=arguments.max_steps,
+        max_tool_calls=arguments.max_tool_calls,
+        max_output_tokens=arguments.max_output_tokens,
+        max_input_tokens=arguments.max_input_tokens,
+        request_timeout=arguments.request_timeout,
+        total_timeout=arguments.timeout,
+        budget_usd=arguments.budget_usd,
+    )
+    try:
+        limits.validate()
+    except ValueError as error:
+        print(f"Invalid configuration: {error}", file=sys.stderr)
+        return 2
+    pricing = Pricing(arguments.price_input_per_mtok, arguments.price_output_per_mtok)
+    plan = team_plan(limits, pricing, arguments.model)
+    text = json.dumps(plan, indent=2, sort_keys=True)
+    if arguments.report is not None:
+        arguments.report.parent.mkdir(parents=True, exist_ok=True)
+        arguments.report.write_text(text + "\n", encoding="utf-8")
+    print(text)
+    print("Plan only: no model was called and nothing was executed.", file=sys.stderr)
+    return 0 if plan["verdict"] == "READY_FOR_AUTHORIZATION_REQUEST" else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Opt-in live validation of a real model through the Kaiwen worker stack. "
@@ -1327,6 +1455,9 @@ def config_from(arguments: argparse.Namespace, environ: Mapping[str, str]) -> Co
 
 
 def main(argv: list[str] | None = None) -> int:
+    arguments_list = sys.argv[1:] if argv is None else argv
+    if arguments_list[:1] == ["team-plan"]:
+        return team_plan_main(arguments_list[1:])
     arguments = build_parser().parse_args(argv)
     try:
         from dotenv import load_dotenv

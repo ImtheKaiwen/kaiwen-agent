@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add the Docker mode of `examples/coding-team-acceptance` (M6.4-B): the Tester is an `AgentRuntimeWorker`
+  whose model calls `testing.run`, executed by `DockerSandboxRunner` (`--docker`; fails closed without an
+  engine, no local fallback), the `model_factory` seam, and the offline `team-plan` command of
+  `scripts/live_validation.py` for a future authorized live multi-role run. No platform API changed.
 - Add the credential-free `examples/coding-team-acceptance` (M6.4-A): Lead, Coder, Tester and Reviewer
   over the fenced SQLite stack, the trusted evidence pipeline, a real completion gate and team acceptance,
   with ten documented scenarios and `docs/coding-team-beta.md` (setup, readiness matrix, manual live
