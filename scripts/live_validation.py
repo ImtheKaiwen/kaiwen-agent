@@ -280,7 +280,8 @@ class Ledger:
         projected = self.spent_usd + self.pricing.cost(
             estimated_input_tokens, self.limits.max_output_tokens
         )
-        if projected > self.limits.budget_usd:
+        # Written so that a NaN projection fails the comparison and is refused, never accepted.
+        if not projected <= self.limits.budget_usd:
             self._abort("budget estimate exceeded")
         self.requests += 1
         self._pending = self.pricing.cost(estimated_input_tokens, self.limits.max_output_tokens)
@@ -656,6 +657,7 @@ async def run_validation(
     """Run the scenarios. `client` and `runner_factory` exist so tests need no network."""
 
     config.limits.validate()
+    config.pricing.validate()
     environment = os.environ if environ is None else environ
     report = Report(
         provider=config.provider,
@@ -1441,10 +1443,20 @@ def config_from(arguments: argparse.Namespace, environ: Mapping[str, str]) -> Co
     model = arguments.model or (
         environ.get("OPENAI_MODEL", DEFAULT_OPENAI_MODEL) if openai else DEFAULT_OLLAMA_MODEL
     )
+    # An explicitly supplied price is validated, never treated as omitted: zero, negative and
+    # non-finite values would understate or poison the worst-case estimate and the budget guard.
+    for flag, value in (
+        ("--price-input-per-mtok", arguments.price_input_per_mtok),
+        ("--price-output-per-mtok", arguments.price_output_per_mtok),
+    ):
+        if value is not None and not (math.isfinite(value) and value > 0):
+            raise ValueError(f"{flag} must be a finite number greater than zero")
     if openai:
+        input_price = arguments.price_input_per_mtok
+        output_price = arguments.price_output_per_mtok
         pricing = Pricing(
-            arguments.price_input_per_mtok or ASSUMED_OPENAI_PRICE[0],
-            arguments.price_output_per_mtok or ASSUMED_OPENAI_PRICE[1],
+            ASSUMED_OPENAI_PRICE[0] if input_price is None else input_price,
+            ASSUMED_OPENAI_PRICE[1] if output_price is None else output_price,
         )
     else:
         pricing = Pricing()
@@ -1484,11 +1496,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         config = config_from(arguments, os.environ)
         config.limits.validate()
+        config.pricing.validate()
     except ValueError as error:
         print(f"Invalid configuration: {error}", file=sys.stderr)
         return 2
     estimate = worst_case_cost(config.limits, config.pricing)
-    if config.live and config.provider == "openai" and estimate > config.limits.budget_usd:
+    if config.live and config.provider == "openai" and not estimate <= config.limits.budget_usd:
         print(
             f"Refused: worst-case estimate ${estimate:.4f} exceeds the budget "
             f"${config.limits.budget_usd:.2f}. Lower the limits or raise --budget-usd "

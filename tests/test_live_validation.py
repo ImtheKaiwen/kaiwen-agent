@@ -187,6 +187,64 @@ def test_invalid_limits_are_rejected() -> None:
     assert lv.main(["ollama", "--max-steps", "0"]) == 2
 
 
+BAD_PRICES = ["nan", "inf", "-inf", "-1", "0"]
+
+
+@pytest.mark.parametrize("flag", ["--price-input-per-mtok", "--price-output-per-mtok"])
+@pytest.mark.parametrize("value", BAD_PRICES)
+@pytest.mark.parametrize("mode", [[], ["--live"]], ids=["dry_run", "live"])
+def test_an_invalid_explicit_price_is_a_configuration_error_before_anything_starts(
+    flag: str,
+    value: str,
+    mode: list[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def forbidden(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("nothing may start with an invalid price")
+
+    monkeypatch.setattr(lv, "_real_client", forbidden)
+    monkeypatch.setattr(lv, "build_provider", forbidden)
+    monkeypatch.setattr(lv.asyncio, "run", forbidden)
+    report = tmp_path / "report.json"
+    code = lv.main(["openai", *mode, f"{flag}={value}", "--report", str(report)])
+    output = capsys.readouterr()
+    assert code == 2 and "Invalid configuration" in output.err
+    assert output.out == "" and not report.exists()  # no report of any kind is produced
+
+
+def test_a_nan_price_cannot_slip_past_the_budget_guard() -> None:
+    nan = lv.Pricing(float("nan"), float("nan"))
+    ledger = lv.Ledger(limits=lv.Limits(), pricing=nan)
+    with pytest.raises(Exception, match="budget estimate exceeded"):
+        ledger.before(100)
+    assert ledger.requests == 0  # the request was refused, not counted
+    # and the run entry point refuses the configuration before any request or client exists
+    client = FakeOpenAI([call_response()])
+    with pytest.raises(ValueError, match="prices"):
+        run(config(scenario="pass", pricing=nan), client)
+    assert client.requests == []
+
+
+def test_valid_explicit_prices_are_used_and_omitted_prices_keep_the_documented_default() -> None:
+    parser = lv.build_parser()
+    explicit = lv.config_from(
+        parser.parse_args(
+            ["openai", "--price-input-per-mtok", "0.75", "--price-output-per-mtok", "4.5"]
+        ),
+        {},
+    )
+    assert (explicit.pricing.input_per_mtok, explicit.pricing.output_per_mtok) == (0.75, 4.5)
+    default = lv.config_from(parser.parse_args(["openai"]), {})
+    assert (default.pricing.input_per_mtok, default.pricing.output_per_mtok) == (
+        lv.ASSUMED_OPENAI_PRICE
+    )
+    assert (
+        lv.main(["openai", "--price-input-per-mtok", "0.75", "--price-output-per-mtok", "4.5"]) == 0
+    )
+
+
 def test_prompts_come_from_the_registered_role_prompts() -> None:
     from kaiwen_agent.kits.coding.prompting import coding_prompt_definitions
 
