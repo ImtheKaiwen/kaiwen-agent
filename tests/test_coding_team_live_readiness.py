@@ -127,6 +127,40 @@ def test_the_command_line_plan_calls_no_model_and_reports_its_readiness(
     assert lv.main(["team-plan", "--max-requests", "0"]) == 2  # invalid limits are refused
 
 
+@pytest.mark.parametrize(
+    "option",
+    [
+        ["--budget-usd", "nan"],
+        ["--budget-usd", "inf"],
+        ["--timeout", "nan"],
+        ["--timeout", "inf"],
+        ["--request-timeout", "nan"],
+        ["--request-timeout", "inf"],
+        ["--price-input-per-mtok", "nan"],
+        ["--price-input-per-mtok", "inf"],
+        ["--price-output-per-mtok", "nan"],
+        ["--price-output-per-mtok", "inf"],
+        ["--price-output-per-mtok", "-1"],
+    ],
+    ids=lambda option: "_".join(option).replace("--", ""),
+)
+def test_a_non_finite_limit_or_price_is_refused_and_never_reported_ready(
+    option: list[str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    report = tmp_path / "plan.json"
+    arguments = ["team-plan", *PRICES, "--budget-usd", "0.5", *option, "--report", str(report)]
+    assert lv.main(arguments) == 2
+    assert "READY_FOR_AUTHORIZATION_REQUEST" not in capsys.readouterr().out
+    assert not report.exists()  # no authorization-ready report is written
+
+
+def test_a_ready_report_contains_only_finite_standard_json(tmp_path: Path) -> None:
+    report = tmp_path / "plan.json"
+    assert lv.main(["team-plan", *PRICES, "--report", str(report)]) == 0
+    text = report.read_text()
+    json.loads(text, parse_constant=lambda name: pytest.fail(f"non-standard JSON {name}"))
+
+
 # --------------------------------------------------------------------- model_factory seam
 
 

@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 import re
 import sys
@@ -219,6 +220,9 @@ class Limits:
             raise ValueError("request, step and tool-call limits must be at least 1")
         if min(self.max_output_tokens, self.max_input_tokens) < 1:
             raise ValueError("token limits must be at least 1")
+        numbers = (self.request_timeout, self.total_timeout, self.budget_usd)
+        if not all(math.isfinite(value) for value in numbers):
+            raise ValueError("timeouts and the budget must be finite numbers")
         if min(self.request_timeout, self.total_timeout) <= 0 or self.budget_usd < 0:
             raise ValueError("timeouts must be positive and the budget cannot be negative")
 
@@ -227,6 +231,11 @@ class Limits:
 class Pricing:
     input_per_mtok: float = 0.0
     output_per_mtok: float = 0.0
+
+    def validate(self) -> None:
+        prices = (self.input_per_mtok, self.output_per_mtok)
+        if not all(math.isfinite(value) and value >= 0 for value in prices):
+            raise ValueError("prices must be finite and not negative")
 
     def cost(self, input_tokens: int, output_tokens: int) -> float:
         return (input_tokens * self.input_per_mtok + output_tokens * self.output_per_mtok) / 1e6
@@ -1306,6 +1315,8 @@ def probe_team_tools() -> list[dict[str, Any]]:
 def team_plan(limits: Limits, pricing: Pricing, model: str) -> dict[str, Any]:
     """The offline readiness assessment and authorization request for a live team run."""
 
+    limits.validate()  # a non-finite or invalid limit never yields an authorization-ready plan
+    pricing.validate()
     tools = probe_team_tools()
     issues = [issue for tool in tools for issue in strict_schema_issues(tool)]
     needed = len(TEAM_SCENARIOS) * TEAM_REQUESTS_PER_DELIVERY
@@ -1383,6 +1394,11 @@ def team_plan_main(argv: list[str]) -> int:
         print(f"Invalid configuration: {error}", file=sys.stderr)
         return 2
     pricing = Pricing(arguments.price_input_per_mtok, arguments.price_output_per_mtok)
+    try:
+        pricing.validate()
+    except ValueError as error:
+        print(f"Invalid configuration: {error}", file=sys.stderr)
+        return 2
     plan = team_plan(limits, pricing, arguments.model)
     text = json.dumps(plan, indent=2, sort_keys=True)
     if arguments.report is not None:
