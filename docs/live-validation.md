@@ -172,6 +172,60 @@ What this does and does not show:
 - The harness honors the OpenAI SDK's own environment (for example a custom base URL). Do not
   run it with an untrusted environment.
 
+## Multi-role team validation (M6.4-C)
+
+`scripts/live_team_validation.py` puts real model calls behind the Lead, the second Lead, the Tester
+and the Reviewer of `examples/coding-team-acceptance`. It composes nothing itself: the example's fenced
+SQLite stack, delegation, trusted evidence pipeline, completion gate and team acceptance decide. The
+Coder stays a host function. `testing.run` runs only in `DockerSandboxRunner` (pinned digest, no
+network); a missing engine or image fails closed before any model request, with no local fallback. A
+model names only registered tools and registered command ids from fixed, host-written briefs appended to
+the registered `coding.lead`, `coding.tester` and `coding.reviewer` prompts; what a model says is never
+evidence. Briefs direct the Reviewer's recommendation, so a PASS shows that real models can drive the
+registered tool schemas and that the host's gates hold, not that the models judge code well.
+
+```bash
+python scripts/live_team_validation.py preflight --env-file .env
+python scripts/live_team_validation.py plan --price-input-per-mtok 0.75 --price-output-per-mtok 4.5
+python scripts/live_team_validation.py run --price-input-per-mtok 0.75 --price-output-per-mtok 4.5
+```
+
+A live run (billed; only after a separate explicit authorization) adds `--live` and an authorization that
+repeats the model, the maximum spend, the scenarios and the commit:
+
+```bash
+python scripts/live_team_validation.py run --live --price-input-per-mtok 0.75 --price-output-per-mtok 4.5 \
+    --authorize-model gpt-5.4-mini --authorize-max-usd 0.25 \
+    --authorize-scenarios LIVE_ACCEPTED,LIVE_FAILING_TESTS --authorize-head <commit>
+```
+
+- `preflight` reads the key from the process environment or the one named `.env` of this repository,
+  checks its shape, and calls `models.retrieve` (not a generation, no tokens). It reports
+  `KEY_NOT_FOUND`, `KEY_MALFORMED`, `AUTHENTICATION_FAILED`, `PERMISSION_DENIED`, `MODEL_UNAVAILABLE`,
+  `QUOTA_EXHAUSTED`, `RATE_LIMITED`, `NETWORK_FAILURE`, `PROVIDER_ERROR` or `OK`. It never prints the key.
+  The account balance is not readable with an ordinary key and is always `BALANCE_UNVERIFIED`; a
+  successful model lookup is not a tool-calling check.
+- `plan` is offline. It is not ready with an open strict schema, too few requests (nine per scenario),
+  unknown prices, or a worst case above the budget. Prices are never assumed: pass the current official
+  ones (on 2026-11-16 the OpenAI docs list `gpt-5.4-mini` at $0.75 input and $4.50 output per million
+  tokens, standard processing).
+- `run --live` additionally requires an authorization that matches the model and the scenarios with a
+  maximum spend not below the budget, is refused for a different `--authorize-head`, never retries, stops
+  at the first failure or limit, and starts no scenario after an abort.
+
+Scenarios: `LIVE_ACCEPTED` (fixed, tested in the container, reviewed, accepted), `LIVE_FAILING_TESTS`
+(the bug stays; the container run fails; never completed) and `LIVE_INVALID_EVIDENCE` (only the unrelated
+compile check exists; never completed). The verdict of each is `PASS`, `FAIL` or `INCONCLUSIVE`, derived
+from the outcome, the durable run status, the acceptance decision and the recorded evidence artifacts, never
+from model text. A negative scenario that completes is `FAIL` (an invariant violation); a run stopped by a
+limit, or where the Tester never ran, is `INCONCLUSIVE`.
+
+Limits apply to all roles combined through the one ledger: requests, input and output tokens, tool calls
+per scenario, model steps per task (at most 4), per-request and overall timeouts and estimated spend, with
+non-finite or negative values rejected. The report is redacted JSON with per-role request and token counts,
+no prompts, paths or secrets. Tests: `tests/test_live_team_validation.py` (a deterministic fake provider
+through the real stack, a test-only stand-in runner for the wiring, and Docker-gated container tests).
+
 ## Troubleshooting
 
 - `provider unavailable`: the key or service is missing, or the model is not installed or not

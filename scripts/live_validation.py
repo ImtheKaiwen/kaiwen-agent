@@ -1314,14 +1314,19 @@ def probe_team_tools() -> list[dict[str, Any]]:
     return tools + [tool for tool in probe_openai_tools() if tool["name"] in used]
 
 
-def team_plan(limits: Limits, pricing: Pricing, model: str) -> dict[str, Any]:
+def team_plan(
+    limits: Limits,
+    pricing: Pricing,
+    model: str,
+    scenarios: tuple[str, ...] = TEAM_SCENARIOS,
+) -> dict[str, Any]:
     """The offline readiness assessment and authorization request for a live team run."""
 
     limits.validate()  # a non-finite or invalid limit never yields an authorization-ready plan
     pricing.validate()
     tools = probe_team_tools()
     issues = [issue for tool in tools for issue in strict_schema_issues(tool)]
-    needed = len(TEAM_SCENARIOS) * TEAM_REQUESTS_PER_DELIVERY
+    needed = len(scenarios) * TEAM_REQUESTS_PER_DELIVERY
     priced = pricing.input_per_mtok > 0 and pricing.output_per_mtok > 0
     worst_case = worst_case_cost(limits, pricing) if priced else None
     blockers: list[str] = []
@@ -1337,7 +1342,7 @@ def team_plan(limits: Limits, pricing: Pricing, model: str) -> dict[str, Any]:
         "verdict": "READY_FOR_AUTHORIZATION_REQUEST" if not blockers else "NOT_READY",
         "executed": False,
         "model": model,
-        "scenarios": list(TEAM_SCENARIOS),
+        "scenarios": list(scenarios),
         "roles": ["lead", "lead2", "tester", "reviewer"],
         "tools": {str(tool["name"]): bool(tool["strict"]) for tool in tools},
         "strict_schema_issues": issues,
@@ -1348,7 +1353,7 @@ def team_plan(limits: Limits, pricing: Pricing, model: str) -> dict[str, Any]:
         "authorization_request": {
             "provider": "openai",
             "model": model,
-            "scenarios": list(TEAM_SCENARIOS),
+            "scenarios": list(scenarios),
             "maximum_spend_usd": limits.budget_usd,
             "maximum_requests": limits.max_requests,
             "retries": "none",
