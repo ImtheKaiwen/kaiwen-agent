@@ -5,7 +5,9 @@
 - Add `scripts/live_team_validation.py` (M6.4-C): `preflight`, `plan` and an authorization-gated `run` for a
   controlled live validation of the multi-role coding team (real Lead, Tester and Reviewer models, the
   Tester in `DockerSandboxRunner`, one shared request ledger and budget). Validated offline with a fake
-  provider; no live call was made. `run_scenario` of the example gained a `max_steps` argument. No platform
+  provider; the first authorized live run was inconclusive and its harness defects (stopping after a
+  non-passing scenario, per-role attribution and in-flight budget accounting under overlapping requests, task
+  failure diagnostics) are corrected. `run_scenario` of the example gained a `max_steps` argument. No platform
   API changed.
 - Add the Docker mode of `examples/coding-team-acceptance` (M6.4-B): the Tester is an `AgentRuntimeWorker`
   whose model calls `testing.run`, executed by `DockerSandboxRunner` (`--docker`; fails closed without an

@@ -29,12 +29,13 @@ import importlib.util
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -151,9 +152,24 @@ def briefs(scenario: LiveScenario) -> dict[str, str]:
 
 @dataclass(slots=True)
 class RoleUsage:
+    """One role's share of the shared ledger, for one scenario.
+
+    Every request is attributed to exactly one role when it is admitted and settled, so the roles
+    always add up to the scenario total (`TeamReport.attribution_reconciled`). Tokens are the
+    provider-reported usage only; a request without usage is counted in `unknown_usage_requests`
+    (a failed or cancelled request is one of them) and never as zero cost.
+    """
+
     requests: int = 0
+    responses: int = 0
+    responses_with_usage: int = 0
+    failed_requests: int = 0
+    unknown_usage_requests: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
+    # The shape of the conversation only, e.g. `tool:lead.view`, `tool:lead.propose_task x3`,
+    # `text`; tool names come from the registered tool set, never from the model's own words.
+    steps: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -167,6 +183,8 @@ class TeamScenarioReport:
     team_acceptance: str | None = None
     evidence_commands: list[str] = field(default_factory=list)
     roles: dict[str, RoleUsage] = field(default_factory=dict)
+    # Allowlisted facts about each task that did not complete: role, status, error code, category.
+    failed_tasks: list[dict[str, str]] = field(default_factory=list)
     reason: str | None = None
     elapsed_seconds: float = 0.0
 
@@ -195,6 +213,10 @@ class TeamReport:
     provider_error: dict[str, Any] | None = None
     failure: str | None = None
     authorization: dict[str, Any] | None = None
+    # Scenarios that never began because an earlier one did not PASS or the run stopped.
+    not_started: list[str] = field(default_factory=list)
+    # True when the per-role counters add up to the run totals (requests and reported tokens).
+    attribution_reconciled: bool | None = None
     verdict: str = "NOT_RUN"
 
     def finish(self) -> None:
@@ -306,53 +328,136 @@ def load_example() -> ModuleType:
 class RoleModel:
     """One role's real model: the registered role prompt plus its host-written brief.
 
-    It records only counters. Each request goes through the guarded client, so the shared ledger
-    enforces the limits of the whole run, whichever role asks.
+    The role's provider talks through a guarded client that carries the role, so the shared ledger
+    both enforces the run-wide limits and attributes each request to exactly this role. This class
+    only records the shape of each answer (registered tool names, or text).
     """
 
-    def __init__(self, role: str, provider: Any, ledger: lv.Ledger, usage: RoleUsage) -> None:
+    def __init__(self, role: str, provider: Any, steps: list[str]) -> None:
         self.role = role
         self._provider = provider
-        self._ledger = ledger
-        self._usage = usage
+        self._steps = steps
 
     async def respond(self, *args: Any, **kwargs: Any) -> Any:
-        ledger = self._ledger
-        requests, input_tokens, output_tokens = (
-            ledger.requests,
-            ledger.input_tokens,
-            ledger.output_tokens,
-        )
-        try:
-            return await self._provider.respond(*args, **kwargs)
-        finally:
-            self._usage.requests += ledger.requests - requests
-            self._usage.input_tokens += ledger.input_tokens - input_tokens
-            self._usage.output_tokens += ledger.output_tokens - output_tokens
+        response = await self._provider.respond(*args, **kwargs)
+        registered = {str(getattr(tool, "name", "")) for tool in kwargs.get("tools") or ()}
+        self._steps.append(_shape(response, registered))
+        return response
+
+
+def _shape(response: Any, registered: set[str]) -> str:
+    calls = [str(getattr(call, "name", "")) for call in getattr(response, "tool_calls", None) or []]
+    if not calls:
+        return "text" if getattr(response, "text", None) else "empty"
+    first = calls[0] if calls[0] in registered else "<unregistered>"
+    count = f" x{len(calls)}" if len(calls) > 1 else ""
+    if len(set(calls)) > 1:
+        return f"tools:{len(calls)} mixed"
+    return f"tool:{first}{count}"
 
 
 def model_factory_for(
     scenario: LiveScenario,
     config: TeamConfig,
-    client: Any,
+    inner: Any,
     ledger: lv.Ledger,
-    usage: dict[str, RoleUsage],
+    steps: dict[str, list[str]],
 ) -> Callable[[str, list[Any]], Any]:
+    """`inner` is the unguarded client: every role wraps it in its own role-tagged guard."""
+
     texts = briefs(scenario)
     provider_config = lv.Config(provider="openai", model=config.model, live=True)
 
-    def factory(role: str, steps: list[Any]) -> Any:
-        del steps  # the scripted steps are the deterministic example's; a live role ignores them
+    def factory(role: str, scripted_steps: list[Any]) -> Any:
+        del scripted_steps  # the deterministic example's script; a live role ignores it
         if role not in PROMPT_OF_ROLE:
             raise lv.HarnessError(f"no live model is defined for the role {role!r}")
         base, _, _ = lv.load_instructions(PROMPT_OF_ROLE[role])
         instructions = f"{base}\n\nVALIDATION BRIEF (host-authored, fixed)\n{texts[role]}"
+        guarded = lv.GuardedOpenAIClient(inner, ledger, role)
         provider = lv.DiagnosticProvider(
-            lv.build_provider(provider_config, client, instructions), ledger
+            lv.build_provider(provider_config, guarded, instructions), ledger, role
         )
-        return RoleModel(role, provider, ledger, usage.setdefault(role, RoleUsage()))
+        return RoleModel(role, provider, steps.setdefault(role, []))
 
     return factory
+
+
+def role_usage(
+    before: dict[str, lv.RoleLedger], after: dict[str, lv.RoleLedger], steps: dict[str, list[str]]
+) -> dict[str, RoleUsage]:
+    """This scenario's share of each role: the ledger now minus the ledger when it began."""
+
+    usage: dict[str, RoleUsage] = {}
+    for role in PROMPT_OF_ROLE:
+        now = after.get(role, lv.RoleLedger())
+        was = before.get(role, lv.RoleLedger())
+        requests = now.requests - was.requests
+        reported = now.usage_responses - was.usage_responses
+        usage[role] = RoleUsage(
+            requests=requests,
+            responses=now.responses - was.responses,
+            responses_with_usage=reported,
+            failed_requests=now.failed - was.failed,
+            unknown_usage_requests=requests - reported,
+            input_tokens=now.input_tokens - was.input_tokens,
+            output_tokens=now.output_tokens - was.output_tokens,
+            steps=list(steps.get(role, [])),
+        )
+    return usage
+
+
+_MAX_STEPS = re.compile(r"Agent exceeded max_steps=\d+")
+_INVALID_ARGUMENTS = re.compile(r"\d+ validation errors? for [A-Za-z]+")
+_KNOWN_LIMITS = frozenset(
+    {
+        "request limit reached",
+        "input token limit exceeded",
+        "budget estimate exceeded",
+        "budget exceeded after the request",
+        "tool-call limit exceeded",
+        "run stopped after a failed request",
+    }
+)
+_KNOWN_ROLES = frozenset({*PROMPT_OF_ROLE, "coder"})
+
+
+def failure_category(text: str | None) -> str:
+    """A category from a fixed set, derived from the shape of the task's error text.
+
+    The text itself is never copied: it can hold tool arguments or model output. Anything that
+    does not match a known shape is `unclassified`, which is honest rather than guessed.
+    """
+
+    if not text:
+        return "unclassified"
+    if _MAX_STEPS.fullmatch(text):
+        return "max_steps_exceeded"
+    if text in _KNOWN_LIMITS:
+        return "run_limit"
+    if _INVALID_ARGUMENTS.match(text):
+        return "invalid_tool_arguments"
+    return "unclassified"
+
+
+def failed_tasks(result: Any) -> list[dict[str, str]]:
+    """Allowlisted facts about each task that did not complete (role, status, code, category)."""
+
+    facts: list[dict[str, str]] = []
+    for task in result.outcome.tasks:
+        status = str(getattr(task.status, "value", task.status))
+        if status not in {"failed", "cancelled"}:
+            continue
+        role = str(task.agent_id)
+        facts.append(
+            {
+                "role": role if role in _KNOWN_ROLES else "other",
+                "status": status,
+                "error_code": lv._safe_token(task.error_code) or "unknown",
+                "category": failure_category(task.error),
+            }
+        )
+    return facts
 
 
 # ------------------------------------------------------------------------------------ the run
@@ -500,19 +605,19 @@ async def _live(
         safe = lv.sanitize_error(error, attempt=0)
         report.provider_error = asdict(safe)
         raise lv.HarnessError(f"provider unavailable: {safe.category}") from None
-    guarded = lv.GuardedOpenAIClient(inner, ledger)
     example = load_example()
     docker = (
         DockerSandboxConfig(image=config.image)
         if config.docker_path is None
         else DockerSandboxConfig(image=config.image, docker_path=config.docker_path)
     )
-    for name in config.scenarios:
+    for position, name in enumerate(config.scenarios):
         scenario = LIVE_SCENARIOS[name]
         item = TeamScenarioReport(name=name, expectation=scenario.description)
         report.scenarios.append(item)
         started = time.monotonic()
-        usage: dict[str, RoleUsage] = {}
+        steps: dict[str, list[str]] = {}
+        before = {role: replace(entry) for role, entry in ledger.roles.items()}
         ledger.scenario_tool_calls = 0
         example_scenario = example.Scenario(
             name.lower(),
@@ -533,16 +638,18 @@ async def _live(
                     Path(directory),
                     docker_config=docker,
                     sandbox_factory=sandbox_factory,
-                    model_factory=model_factory_for(scenario, config, guarded, ledger, usage),
+                    model_factory=model_factory_for(scenario, config, inner, ledger, steps),
                     max_steps=config.limits.max_steps,
                 )
                 evidence = await _evidence_commands(result)
         except SandboxUnavailableError:
             report.docker = "unavailable"
             item.verdict, item.reason = "INCONCLUSIVE", "sandbox unavailable; nothing was executed"
+            report.not_started = list(config.scenarios[position + 1 :])
             raise lv.HarnessError("Docker sandbox unavailable") from None
         report.docker = "available"
-        item.roles = usage
+        item.roles = role_usage(before, ledger.roles, steps)
+        item.failed_tasks = failed_tasks(result)
         item.outcome_status = result.outcome.status.value
         item.outcome_reason = result.outcome.reason
         item.run_status = result.run_status
@@ -553,11 +660,28 @@ async def _live(
         if ledger.abort_reason:
             report.abort_reason = ledger.abort_reason
             report.failure = f"aborted: {ledger.abort_reason}"
-        if report.failure or item.verdict == "FAIL":
-            break  # nothing after a failure or an abort: no request is spent hunting for a pass
+        elif ledger.errors:
+            # A failed or cancelled request: the task failure it caused is not the cause.
+            report.provider_error = report.provider_error or asdict(ledger.errors[0])
+            report.failure = f"provider failure: {ledger.errors[0].category}"
+        if report.failure or item.verdict != "PASS":
+            # Stop at the first scenario that did not pass, and at any abort, failed request or
+            # limit: no later scenario starts and no request is spent hunting for a pass.
+            report.not_started = list(config.scenarios[position + 1 :])
+            break
 
 
 def _account(report: TeamReport, ledger: lv.Ledger, config: TeamConfig) -> None:
+    report.attribution_reconciled = (
+        sum(usage.requests for item in report.scenarios for usage in item.roles.values())
+        == ledger.requests
+        and sum(usage.input_tokens for item in report.scenarios for usage in item.roles.values())
+        == ledger.input_tokens
+        and sum(usage.output_tokens for item in report.scenarios for usage in item.roles.values())
+        == ledger.output_tokens
+        if report.scenarios and all(item.roles for item in report.scenarios)
+        else None
+    )
     report.model_requests = ledger.requests
     report.successful_responses = ledger.responses
     report.responses_with_usage = ledger.usage_responses

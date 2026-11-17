@@ -191,7 +191,10 @@ separate authorization (model, maximum spend, scenarios). The real Lead, second 
 Reviewer are model calls; the Coder stays a host function; `testing.run` runs only in the pinned Docker
 container; a missing engine or image fails closed before any model request. The harness is validated
 offline with a deterministic fake provider through the real composition, which is not evidence that a
-live provider behaves the same way. No billed run has been made.
+live provider behaves the same way. One authorized billed run was made (2026-11-17, `gpt-5.4-mini`, about
+$0.023 by reported usage): it was INCONCLUSIVE (the negative scenario passed live, the accepted scenario's Lead
+task failed for a cause the report could not capture), and the harness defects it exposed were corrected
+offline. The accepted path has not been shown live.
 
 A future manual validation (a separate run that requires explicit operator authorization and a stated
 maximum cost) should specify:
@@ -230,7 +233,7 @@ maximum cost) should specify:
 | Diagnostics and error reporting | PARTIAL | stable codes, no secrets; no unified operator view across roles |
 | Documentation | PARTIAL | this guide and the workflow docs; no consumer quick start for a team |
 | Packaging | PARTIAL | wheel and sdist build and check in CI; the example is not part of the wheel |
-| Live multi-role validation | HARNESS READY, NOT RUN | `scripts/live_team_validation.py` is implemented and tested offline; no billed run has been made |
+| Live multi-role validation | INCONCLUSIVE (first run) | negative scenario passed live; the accepted path is not shown; harness defects corrected offline |
 | Out of scope | not started | distributed execution, gateway, speech, UI, production deployment, release |
 | Not implemented | missing | approval-required delegation, a first-party approval store, general resume, model-driven edits with approvals inside a team |
 
@@ -238,4 +241,4 @@ No claim of production readiness is made.
 
 ## Recommended next milestone
 
-After M6.4-C is independently reviewed: a separately authorized, bounded live run of the recommended scenarios (see the authorization report), then the beta closeout. No live result exists yet.
+After M6.4-C is independently reviewed: a separately authorized, bounded live run of the recommended scenarios (see the authorization report), then the beta closeout. The first live run was inconclusive, so the accepted path has no live result yet.

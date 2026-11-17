@@ -220,6 +220,21 @@ from the outcome, the durable run status, the acceptance decision and the record
 from model text. A negative scenario that completes is `FAIL` (an invariant violation); a run stopped by a
 limit, or where the Tester never ran, is `INCONCLUSIVE`.
 
+Stopping rule: the run stops at the first scenario that is not `PASS` (a negative scenario that is
+correctly blocked is a `PASS` and the next scenario may start), and at any abort, failed or cancelled
+request, exhausted limit or refused authorization. Scenarios that never began are listed in
+`not_started`, and the first failure's diagnostics are kept. After a failed request or an abort the ledger
+refuses every later request.
+
+Accounting: requests may overlap, so each admitted request holds its own reservation (its worst-case
+cost) until it settles, admission counts every reservation still in flight, and a request settles exactly
+once, with its reported usage or, when the usage is unknown (failure, no usage, cancellation, timeout), at
+its worst-case estimate, never as zero. Each request is attributed when it is admitted and settled to the
+one role whose guarded client sent it, so the per-role counters of a scenario add up to the run total
+(`attribution_reconciled`). Failed tasks are explained by an allowlist: role, status, error code and a
+category from a fixed set (`max_steps_exceeded`, `invalid_tool_arguments`, `run_limit`, `unclassified`);
+the conversation shape of each role (`tool:lead.view`, `text`) is recorded, never the text.
+
 Limits apply to all roles combined through the one ledger: requests, input and output tokens, tool calls
 per scenario, model steps per task (at most 4), per-request and overall timeouts and estimated spend, with
 non-finite or negative values rejected. The report is redacted JSON with per-role request and token counts,

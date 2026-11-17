@@ -169,7 +169,11 @@ def sanitize_error(
     if status is None:
         status = _safe_status(getattr(getattr(error, "response", None), "status_code", None))
     code = _safe_token(getattr(error, "code", None))
-    if "APITimeoutError" in names or "TimeoutException" in names or isinstance(error, TimeoutError):
+    if isinstance(error, asyncio.CancelledError):
+        category, stage = "cancelled", "cancelled"
+    elif (
+        "APITimeoutError" in names or "TimeoutException" in names or isinstance(error, TimeoutError)
+    ):
         category, stage = "timeout", "transport_failure"
     elif names & {"APIConnectionError", "ConnectError", "NetworkError", "TransportError"}:
         category, stage = "connection", "transport_failure"
@@ -249,8 +253,37 @@ def worst_case_cost(limits: Limits, pricing: Pricing) -> float:
 
 
 @dataclass(slots=True)
+class Reservation:
+    """The worst-case cost of one request that is in flight. Each request owns exactly one."""
+
+    estimate: float
+    role: str | None = None
+    open: bool = True
+
+
+@dataclass(slots=True)
+class RoleLedger:
+    """What the shared ledger attributed to one role. Counted per request, never by comparing the
+    run-wide counters before and after a call, so roles that overlap in time cannot double count."""
+
+    requests: int = 0
+    responses: int = 0
+    usage_responses: int = 0
+    failed: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
+@dataclass(slots=True)
 class Ledger:
-    """Local usage accounting shared by every request of one manually triggered run."""
+    """Local usage accounting shared by every request of one manually triggered run.
+
+    Requests may overlap. Each admitted request holds a `Reservation` (its worst-case cost) until
+    it settles, admission counts every reservation still in flight, and a request settles exactly
+    once: with its reported usage, or at its worst-case estimate when the usage is unknown (a
+    failure, a response without usage, a cancellation). Once the run has stopped, nothing more is
+    admitted.
+    """
 
     limits: Limits
     pricing: Pricing
@@ -266,32 +299,79 @@ class Ledger:
     # Budget accounting: reported cost, plus the pessimistic pre-request estimate for any
     # attempt whose usage is unknown (failed or usage-less), so unknown is never treated as zero.
     spent_usd: float = 0.0
+    # The worst-case cost of the requests in flight right now.
+    reserved_usd: float = 0.0
     scenario_tool_calls: int = 0
     abort_reason: str | None = None
+    # Set by a failed or cancelled request: the run is over, whatever the limits still allow.
+    stop_reason: str | None = None
     request_seconds: float = 0.0
     guard_failures: int = 0
     errors: list[SafeError] = field(default_factory=list)
-    _pending: float = 0.0
+    roles: dict[str, RoleLedger] = field(default_factory=dict)
+    _open: list[Reservation] = field(default_factory=list)
 
-    def before(self, estimated_input_tokens: int) -> None:
+    def before(self, estimated_input_tokens: int, role: str | None = None) -> Reservation:
+        if self.abort_reason:
+            raise LimitExceeded(self.abort_reason)
+        if self.stop_reason:
+            raise LimitExceeded(self.stop_reason)
         if self.requests >= self.limits.max_requests:
             self._abort("request limit reached")
         if estimated_input_tokens > self.limits.max_input_tokens:
             self._abort("input token limit exceeded")
-        projected = self.spent_usd + self.pricing.cost(
-            estimated_input_tokens, self.limits.max_output_tokens
-        )
+        cost = self.pricing.cost(estimated_input_tokens, self.limits.max_output_tokens)
+        projected = self.spent_usd + self.reserved_usd + cost
         # Written so that a NaN projection fails the comparison and is refused, never accepted.
         if not projected <= self.limits.budget_usd:
             self._abort("budget estimate exceeded")
         self.requests += 1
-        self._pending = self.pricing.cost(estimated_input_tokens, self.limits.max_output_tokens)
+        reservation = Reservation(cost, role)
+        self._open.append(reservation)
+        self.reserved_usd = sum(item.estimate for item in self._open)
+        if role is not None:
+            self.roles.setdefault(role, RoleLedger()).requests += 1
+        return reservation
 
-    def record_failure(self, error: BaseException) -> None:
-        """A transport or HTTP failure at the guarded client; usage is unknown."""
+    def _settle(self, reservation: Reservation | None) -> Reservation:
+        """The request's own reservation (or, for a caller that has none, the newest open one)."""
 
+        if reservation is None:
+            reservation = next((item for item in reversed(self._open) if item.open), None)
+            reservation = reservation or Reservation(0.0)
+        if reservation.open:
+            reservation.open = False
+            self._open = [item for item in self._open if item.open]
+            self.reserved_usd = sum(item.estimate for item in self._open)
+        return reservation
+
+    def _role(self, reservation: Reservation) -> RoleLedger | None:
+        return (
+            None
+            if reservation.role is None
+            else self.roles.setdefault(reservation.role, RoleLedger())
+        )
+
+    def counters(self, role: str | None) -> tuple[int, int, int]:
+        """(attempts, failures, responses) of one role, or of the whole run when `role` is None."""
+
+        if role is None:
+            return self.requests, self.guard_failures, self.responses
+        mine = self.roles.get(role, RoleLedger())
+        return mine.requests, mine.failed, mine.responses
+
+    def record_failure(self, error: BaseException, reservation: Reservation | None = None) -> None:
+        """A transport failure, an HTTP failure or a cancellation at the guarded client.
+
+        The usage is unknown, so the request is charged at its own worst-case estimate."""
+
+        reservation = self._settle(reservation)
         self.guard_failures += 1
-        self.spent_usd += self._pending
+        self.spent_usd += reservation.estimate
+        mine = self._role(reservation)
+        if mine is not None:
+            mine.failed += 1
+        self.stop_reason = self.stop_reason or "run stopped after a failed request"
         if len(self.errors) < 5:
             self.errors.append(sanitize_error(error, attempt=self.requests))
 
@@ -323,10 +403,15 @@ class Ledger:
         output_tokens: int | None,
         tool_calls: int,
         seconds: float,
+        reservation: Reservation | None = None,
     ) -> None:
+        reservation = self._settle(reservation)
+        mine = self._role(reservation)
         self.responses += 1
+        if mine is not None:
+            mine.responses += 1
         if input_tokens is None or output_tokens is None:
-            self.spent_usd += self._pending
+            self.spent_usd += reservation.estimate
         else:
             cost = self.pricing.cost(input_tokens, output_tokens)
             self.usage_responses += 1
@@ -334,6 +419,10 @@ class Ledger:
             self.output_tokens += output_tokens
             self.reported_usd += cost
             self.spent_usd += cost
+            if mine is not None:
+                mine.usage_responses += 1
+                mine.input_tokens += input_tokens
+                mine.output_tokens += output_tokens
         self.request_seconds += seconds
         self.scenario_tool_calls += tool_calls
         if self.scenario_tool_calls > self.limits.max_tool_calls:
@@ -353,19 +442,20 @@ def estimate_tokens(request: Mapping[str, Any]) -> int:
 
 
 class _GuardedResponses:
-    def __init__(self, inner: Any, ledger: Ledger) -> None:
+    def __init__(self, inner: Any, ledger: Ledger, role: str | None = None) -> None:
         self._inner = inner
         self._ledger = ledger
+        self._role = role
 
     async def create(self, **request: Any) -> Any:
         request["store"] = False
         request["max_output_tokens"] = self._ledger.limits.max_output_tokens
-        self._ledger.before(estimate_tokens(request))
+        reservation = self._ledger.before(estimate_tokens(request), self._role)
         started = time.monotonic()
         try:
             response = await self._inner.responses.create(**request)
-        except Exception as error:
-            self._ledger.record_failure(error)
+        except BaseException as error:  # noqa: BLE001 - a cancelled request may still be billed
+            self._ledger.record_failure(error, reservation)
             raise
         usage = getattr(response, "usage", None)
         calls = sum(
@@ -378,15 +468,18 @@ class _GuardedResponses:
             _optional_count(getattr(usage, "output_tokens", None)),
             calls,
             time.monotonic() - started,
+            reservation,
         )
         return response
 
 
 class GuardedOpenAIClient:
-    """The `responses.create` surface the provider uses, with limits and accounting."""
+    """The `responses.create` surface the provider uses, with limits and accounting.
 
-    def __init__(self, inner: Any, ledger: Ledger) -> None:
-        self.responses = _GuardedResponses(inner, ledger)
+    `role` names the one role every request through this client is attributed to."""
+
+    def __init__(self, inner: Any, ledger: Ledger, role: str | None = None) -> None:
+        self.responses = _GuardedResponses(inner, ledger, role)
 
 
 class GuardedOllamaClient:
@@ -405,12 +498,12 @@ class GuardedOllamaClient:
             "num_ctx": self._context_tokens,
             "temperature": 0,
         }
-        self._ledger.before(estimate_tokens(request))
+        reservation = self._ledger.before(estimate_tokens(request))
         started = time.monotonic()
         try:
             response = await self._inner.chat(**request)
-        except Exception as error:
-            self._ledger.record_failure(error)
+        except BaseException as error:  # noqa: BLE001 - a cancelled request may still be billed
+            self._ledger.record_failure(error, reservation)
             raise
         raw = _as_mapping(response)
         message = _as_mapping(raw.get("message", {}))
@@ -423,6 +516,7 @@ class GuardedOllamaClient:
             output_tokens,
             calls,
             time.monotonic() - started,
+            reservation,
         )
         return response
 
@@ -435,26 +529,30 @@ class DiagnosticProvider:
     had been received, plus the exception class name.
     """
 
-    def __init__(self, inner: Any, ledger: Ledger) -> None:
+    def __init__(self, inner: Any, ledger: Ledger, role: str | None = None) -> None:
         self._inner = inner
         self._ledger = ledger
+        self._role = role
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
 
     async def respond(self, *args: Any, **kwargs: Any) -> Any:
+        # The counters of this role only: another role's requests, failures and responses must
+        # never decide how this role's exception is classified.
         ledger = self._ledger
-        attempts, failures, responses = ledger.requests, ledger.guard_failures, ledger.responses
+        attempts, failures, responses = ledger.counters(self._role)
         try:
             return await self._inner.respond(*args, **kwargs)
         except LimitExceeded:
             raise
         except Exception as error:
-            if ledger.guard_failures == failures:
+            now_attempts, now_failures, now_responses = ledger.counters(self._role)
+            if now_failures == failures:
                 ledger.note_exception(
                     error,
-                    attempted=ledger.requests > attempts,
-                    received=ledger.responses > responses,
+                    attempted=now_attempts > attempts,
+                    received=now_responses > responses,
                 )
             raise
 

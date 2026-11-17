@@ -618,8 +618,14 @@ Each defect was reproduced with a failing test before its fix.
       `DockerSandboxRunner`. Scenarios `LIVE_ACCEPTED`, `LIVE_FAILING_TESTS` and
       `LIVE_INVALID_EVIDENCE`, judged from trusted host records only. Validated offline with a
       deterministic fake OpenAI client through the real composition. NO live or paid call has been
-      made: an offline PASS is not a real-provider PASS. Not done: any live run (it needs a
-      separate authorization and a working key), resume, production readiness.
+      made in the offline work. The first authorized live run (2026-11-17, `gpt-5.4-mini`, 13 requests,
+      about $0.023 by provider-reported usage) was INCONCLUSIVE: `LIVE_FAILING_TESTS` passed against a
+      real model and a real container, but the `LIVE_ACCEPTED` Lead task failed after four requests
+      for a cause the report could not capture. Harness defects found by that run (it continued after an
+      INCONCLUSIVE scenario; per-role counters double counted overlapping roles; the ledger kept one shared
+      pending cost) are corrected offline in the same pull request. The accepted path is still not shown
+      live. Not done: a successful live accepted run (it needs a new separate authorization), resume,
+      production readiness.
 - Not done: beta integration, resolving approval-required delegation and a durable cycle
   cursor. There is no atomic reservation of delegation quotas: delegation at the cycle
   boundary is safe only because the run lease holder alone writes the run's tasks (enforced by

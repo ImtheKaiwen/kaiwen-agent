@@ -76,10 +76,12 @@ class FakeTeamOpenAI:
         reviewer: str = "cite",
         tokens: Any = None,
         lead_views: int = 1,
+        interleave: bool = False,
     ) -> None:
         self.tester = tester
         self.reviewer = reviewer
         self.lead_views = lead_views
+        self.interleave = interleave
         self.tokens = tokens or (1500, 60)
         self.requests: list[dict[str, Any]] = []
         self.responses = SimpleNamespace(create=self._create)
@@ -97,6 +99,9 @@ class FakeTeamOpenAI:
 
     async def _create(self, **request: Any) -> Any:
         self.requests.append(request)
+        if self.interleave:
+            for _ in range(3):  # let concurrently running roles take turns, deterministically
+                await asyncio.sleep(0)
         names = {tool["name"] for tool in request["tools"]}
         instructions = request["instructions"]
         done = self.outputs(request)
