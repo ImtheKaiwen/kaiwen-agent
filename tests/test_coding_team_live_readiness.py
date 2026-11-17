@@ -70,7 +70,7 @@ def test_the_plan_is_offline_and_lists_the_exact_strict_tool_set() -> None:
 @pytest.mark.parametrize(
     ("limits", "pricing", "blocker"),
     [
-        ({"max_requests": 12}, lv.Pricing(0.75, 4.5), "below the 18 the plan needs"),
+        ({"max_requests": 12}, lv.Pricing(0.75, 4.5), "below the 22"),
         ({"budget_usd": 0.1}, lv.Pricing(0.75, 4.5), "exceeds the budget"),
         ({}, lv.Pricing(0.0, 0.0), "prices were not provided"),
     ],

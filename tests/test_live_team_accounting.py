@@ -27,6 +27,7 @@ from tests.test_live_team_validation import (
     _limits,
     config,
     run,
+    standin,
 )
 
 # ----------------------------------------------------------- a bare ledger with overlapping calls
@@ -524,3 +525,65 @@ def test_diagnostics_never_copy_arguments_error_text_or_secrets() -> None:
     assert set(failed[0]) == {"role", "status", "error_code", "category"}
     assert SECRET not in text and SECRET not in json.dumps(failed)
     assert report.scenarios[0].roles["tester"].steps == ["tool:<unregistered>"]
+
+
+# ----------------------------------------------------- a Lead that proposes one task per response
+
+
+def accepted_defaults(**changes: Any) -> lt.TeamConfig:
+    """The harness defaults for one LIVE_ACCEPTED run: no limit overridden except what is named."""
+
+    values: dict[str, Any] = {
+        "live": True,
+        "pricing": PRICES,
+        "scenarios": ("LIVE_ACCEPTED",),
+        "authorization": lt.Authorization("gpt-5.4-mini", 0.5, ("LIVE_ACCEPTED",)),
+    }
+    values.update(changes)
+    return lt.TeamConfig(**values)
+
+
+def test_a_serial_lead_needs_five_steps_and_the_old_four_step_limit_fails_it() -> None:
+    """view, three proposals, final answer: valid registered operations in five responses."""
+
+    client = FakeTeamOpenAI(lead_serial=True)
+    report = run(config(limits=_limits(max_steps=4)), client)
+    item = report.scenarios[0]
+    assert item.verdict == "INCONCLUSIVE" and item.run_status == "failed"
+    assert item.failed_tasks[0]["category"] == "max_steps_exceeded"  # the limit still holds
+    assert item.roles["lead"].steps == [
+        "tool:lead.view",
+        "tool:lead.propose_task",
+        "tool:lead.propose_task",
+        "tool:lead.propose_task",
+    ]  # four responses, all tool calls: no room left for the final answer
+
+
+def test_a_serial_lead_completes_the_delivery_under_the_default_limits() -> None:
+    client = FakeTeamOpenAI(lead_serial=True)
+    report = asyncio.run(
+        lt.run_team(accepted_defaults(), client=client, sandbox_factory=standin, environ={})
+    )
+    item = report.scenarios[0]
+    assert report.verdict == "PASS", (item.verdict, item.reason, item.failed_tasks)
+    assert report.model_requests == 11 and item.roles["lead"].requests == 5
+    assert report.attribution_reconciled is True
+
+
+def test_the_step_limit_is_still_a_hard_ceiling_that_cannot_be_raised_past_its_maximum() -> None:
+    with pytest.raises(ValueError, match="steps"):
+        lt.plan(accepted_defaults(limits=_limits(max_steps=lt.MAX_STEPS_CEILING + 1)))
+    assert lt.MAX_STEPS_CEILING >= lt.DEFAULT_MAX_STEPS >= 5  # a serial Lead fits the default
+
+
+def test_the_plan_counts_the_requests_a_serial_lead_can_validly_need() -> None:
+    ready = lt.plan(
+        accepted_defaults(limits=_limits(max_requests=12, budget_usd=0.15, max_input_tokens=6000))
+    )
+    assert ready["verdict"] == "READY_FOR_AUTHORIZATION_REQUEST", ready["blockers"]
+    assert ready["expected_requests"] == 9 and ready["maximum_valid_requests"] == 11
+    tight = lt.plan(
+        accepted_defaults(limits=_limits(max_requests=10, budget_usd=0.15, max_input_tokens=6000))
+    )
+    assert tight["verdict"] == "NOT_READY"
+    assert any("below the 11" in blocker for blocker in tight["blockers"])

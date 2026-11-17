@@ -1426,6 +1426,9 @@ TEAM_SCENARIOS = ("docker_accepted", "docker_failing_tests")
 # Model requests one team delivery is expected to need: Lead (view, propose, finish), second Lead
 # (propose, finish), Tester (call, finish), Reviewer (submit, finish). A ceiling, not a guarantee.
 TEAM_REQUESTS_PER_DELIVERY = 9
+# The most one delivery can validly need: a Lead that proposes one task per response (view, three
+# proposals, final answer = 5), the second Lead (2), the Tester (2) and the Reviewer (2).
+TEAM_MAX_REQUESTS_PER_DELIVERY = 11
 
 
 def probe_team_tools() -> list[dict[str, Any]]:
@@ -1461,13 +1464,17 @@ def team_plan(
     tools = probe_team_tools()
     issues = [issue for tool in tools for issue in strict_schema_issues(tool)]
     needed = len(scenarios) * TEAM_REQUESTS_PER_DELIVERY
+    maximum_valid = len(scenarios) * TEAM_MAX_REQUESTS_PER_DELIVERY
     priced = pricing.input_per_mtok > 0 and pricing.output_per_mtok > 0
     worst_case = worst_case_cost(limits, pricing) if priced else None
     blockers: list[str] = []
     if issues:
         blockers.append("a strict tool schema contains an open object")
-    if limits.max_requests < needed:
-        blockers.append(f"max_requests {limits.max_requests} is below the {needed} the plan needs")
+    if limits.max_requests < maximum_valid:
+        blockers.append(
+            f"max_requests {limits.max_requests} is below the {maximum_valid} a valid delivery "
+            "can need (a Lead that proposes one task per response)"
+        )
     if not priced:
         blockers.append("prices were not provided, so the worst-case spend is unknown")
     elif worst_case is not None and worst_case > limits.budget_usd:
@@ -1482,6 +1489,7 @@ def team_plan(
         "strict_schema_issues": issues,
         "limits": asdict(limits),
         "expected_requests": needed,
+        "maximum_valid_requests": maximum_valid,
         "worst_case_cost_usd": worst_case,
         "blockers": blockers,
         "authorization_request": {

@@ -195,8 +195,8 @@ repeats the model, the maximum spend, the scenarios and the commit:
 
 ```bash
 python scripts/live_team_validation.py run --live --price-input-per-mtok 0.75 --price-output-per-mtok 4.5 \
-    --authorize-model gpt-5.4-mini --authorize-max-usd 0.25 \
-    --authorize-scenarios LIVE_ACCEPTED,LIVE_FAILING_TESTS --authorize-head <commit>
+    --authorize-model gpt-5.4-mini --authorize-max-usd 0.15 \
+    --authorize-scenarios LIVE_ACCEPTED --authorize-head <commit>
 ```
 
 - `preflight` reads the key from the process environment or the one named `.env` of this repository,
@@ -205,7 +205,7 @@ python scripts/live_team_validation.py run --live --price-input-per-mtok 0.75 --
   `QUOTA_EXHAUSTED`, `RATE_LIMITED`, `NETWORK_FAILURE`, `PROVIDER_ERROR` or `OK`. It never prints the key.
   The account balance is not readable with an ordinary key and is always `BALANCE_UNVERIFIED`; a
   successful model lookup is not a tool-calling check.
-- `plan` is offline. It is not ready with an open strict schema, too few requests (nine per scenario),
+- `plan` is offline. It is not ready with an open strict schema, too few requests (nine per scenario when the Lead batches its proposals, eleven when it proposes one task per response; the plan requires eleven),
   unknown prices, or a worst case above the budget. Prices are never assumed: pass the current official
   ones (on 2026-11-16 the OpenAI docs list `gpt-5.4-mini` at $0.75 input and $4.50 output per million
   tokens, standard processing).
@@ -236,7 +236,7 @@ category from a fixed set (`max_steps_exceeded`, `invalid_tool_arguments`, `run_
 the conversation shape of each role (`tool:lead.view`, `text`) is recorded, never the text.
 
 Limits apply to all roles combined through the one ledger: requests, input and output tokens, tool calls
-per scenario, model steps per task (at most 4), per-request and overall timeouts and estimated spend, with
+per scenario, model steps per task (default and maximum 6: a Lead that proposes one task per response needs five), per-request and overall timeouts and estimated spend, with
 non-finite or negative values rejected. The report is redacted JSON with per-role request and token counts,
 no prompts, paths or secrets. Tests: `tests/test_live_team_validation.py` (a deterministic fake provider
 through the real stack, a test-only stand-in runner for the wiring, and Docker-gated container tests).

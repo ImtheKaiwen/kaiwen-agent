@@ -55,10 +55,14 @@ PROMPT_OF_ROLE = {
     "reviewer": "coding.reviewer",
 }
 MODEL_REQUESTS_PER_DELIVERY = lv.TEAM_REQUESTS_PER_DELIVERY
-DEFAULT_MAX_REQUESTS = 20  # the two recommended scenarios need 18; two requests of slack
+# One delivery needs 9 requests when the Lead batches its proposals and at most 11 when it proposes
+# one task per response; the ceiling is the larger number plus one request of slack.
+DEFAULT_MAX_STEPS = 6
+MAX_STEPS_CEILING = 6
+DEFAULT_MAX_REQUESTS = lv.TEAM_MAX_REQUESTS_PER_DELIVERY + 1
 DEFAULT_MAX_TOOL_CALLS = 10
 DEFAULT_MAX_INPUT_TOKENS = 6_000  # the largest planned request is about 4,000 by the local estimate
-DEFAULT_BUDGET_USD = 0.25
+DEFAULT_BUDGET_USD = 0.15  # one scenario's worst case is 12 requests at $0.01125
 
 
 # ------------------------------------------------------------------------------------ scenarios
@@ -108,8 +112,8 @@ LIVE_SCENARIOS: dict[str, LiveScenario] = {
     ),
 }
 ALL_SCENARIOS = tuple(LIVE_SCENARIOS)
-# Nothing is billed for these two unless the operator names them: the smallest useful live set.
-RECOMMENDED_SCENARIOS = ("LIVE_ACCEPTED", "LIVE_FAILING_TESTS")
+# The next live set: the accepted path is the one not yet shown with a real provider.
+RECOMMENDED_SCENARIOS = ("LIVE_ACCEPTED",)
 
 
 def briefs(scenario: LiveScenario) -> dict[str, str]:
@@ -273,7 +277,7 @@ class TeamConfig:
     limits: lv.Limits = field(
         default_factory=lambda: lv.Limits(
             max_requests=DEFAULT_MAX_REQUESTS,
-            max_steps=4,
+            max_steps=DEFAULT_MAX_STEPS,
             max_tool_calls=DEFAULT_MAX_TOOL_CALLS,
             max_output_tokens=1_500,
             max_input_tokens=DEFAULT_MAX_INPUT_TOKENS,
@@ -296,9 +300,9 @@ class TeamConfig:
             )
         if len(set(self.scenarios)) != len(self.scenarios):
             raise ValueError("a scenario may be listed once")
-        if self.limits.max_steps > 4:
+        if self.limits.max_steps > MAX_STEPS_CEILING:
             raise ValueError(
-                "the example bounds every task at 4 model steps; a higher limit is void"
+                f"model steps per task are capped at {MAX_STEPS_CEILING}; a higher limit is refused"
             )
 
 
@@ -847,7 +851,7 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--model", default=lv.DEFAULT_OPENAI_MODEL)
         p.add_argument("--scenarios", default=",".join(RECOMMENDED_SCENARIOS))
         p.add_argument("--max-requests", type=int, help="Default: nine per scenario plus two")
-        p.add_argument("--max-steps", type=int, default=4)
+        p.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
         p.add_argument("--max-tool-calls", type=int, default=DEFAULT_MAX_TOOL_CALLS)
         p.add_argument("--max-output-tokens", type=int, default=1_500)
         p.add_argument("--max-input-tokens", type=int, default=DEFAULT_MAX_INPUT_TOKENS)
@@ -912,7 +916,7 @@ def config_from(arguments: argparse.Namespace) -> TeamConfig:
     max_requests = (
         arguments.max_requests
         if arguments.max_requests is not None
-        else len(scenarios) * MODEL_REQUESTS_PER_DELIVERY + 2
+        else len(scenarios) * lv.TEAM_MAX_REQUESTS_PER_DELIVERY + 1
     )
     config = TeamConfig(
         model=arguments.model,

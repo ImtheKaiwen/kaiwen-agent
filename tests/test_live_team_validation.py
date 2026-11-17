@@ -77,11 +77,13 @@ class FakeTeamOpenAI:
         tokens: Any = None,
         lead_views: int = 1,
         interleave: bool = False,
+        lead_serial: bool = False,
     ) -> None:
         self.tester = tester
         self.reviewer = reviewer
         self.lead_views = lead_views
         self.interleave = interleave
+        self.lead_serial = lead_serial
         self.tokens = tokens or (1500, 60)
         self.requests: list[dict[str, Any]] = []
         self.responses = SimpleNamespace(create=self._create)
@@ -144,6 +146,14 @@ class FakeTeamOpenAI:
             return response(propose(id="review", name="Review", role="reviewer"), **usage)
         if done < self.lead_views:
             return response(("lead__view", {}), **usage)
+        if self.lead_serial and done <= self.lead_views + 2:
+            # One valid proposal per response: view, three proposals, then the final answer.
+            serial = [
+                propose(id="code", name="Fix add()", role="coder"),
+                propose(id="test", name="Run the tests", role="tester", dependencies=["code"]),
+                propose(id="plan2", name="Plan the review", role="lead2"),
+            ]
+            return response(serial[done - self.lead_views], **usage)
         if done == self.lead_views:
             return response(
                 propose(id="code", name="Fix add()", role="coder"),
@@ -187,27 +197,30 @@ def test_the_plan_covers_the_exact_three_scenarios_and_is_ready_with_known_price
     assert result["tools"]["testing__run"] is False and result["tools"]["review__submit"] is True
 
 
-def test_the_recommended_defaults_form_a_ready_plan_for_the_two_scenarios() -> None:
+def test_the_recommended_defaults_form_a_ready_plan_for_the_accepted_scenario() -> None:
     result = lt.plan(lt.TeamConfig(pricing=PRICES))  # every default limit, no overrides
     assert result["verdict"] == "READY_FOR_AUTHORIZATION_REQUEST", result["blockers"]
-    assert result["scenarios"] == ["LIVE_ACCEPTED", "LIVE_FAILING_TESTS"]
-    assert result["expected_requests"] == 18 and result["worst_case_cost_usd"] <= 0.25
+    assert result["scenarios"] == ["LIVE_ACCEPTED"]
+    assert (result["expected_requests"], result["maximum_valid_requests"]) == (9, 11)
+    assert result["limits"]["max_requests"] == 12 and result["limits"]["max_steps"] == 6
+    assert result["worst_case_cost_usd"] == pytest.approx(0.135)
+    assert result["worst_case_cost_usd"] <= result["limits"]["budget_usd"] == 0.15
 
 
 def test_the_plan_is_not_ready_without_prices_or_with_too_few_requests() -> None:
     unpriced = lt.plan(config(live=False, pricing=lv.Pricing()))
     assert unpriced["verdict"] == "NOT_READY"
     few = lt.plan(config(live=False, scenarios=lt.ALL_SCENARIOS, limits=_limits(max_requests=20)))
-    assert few["verdict"] == "NOT_READY" and any("below the 27" in b for b in few["blockers"])
+    assert few["verdict"] == "NOT_READY" and any("below the 33" in b for b in few["blockers"])
 
 
 def _limits(**changes: Any) -> lv.Limits:
     values: dict[str, Any] = {
-        "max_requests": 30,
+        "max_requests": 34,
         "max_steps": 4,
         "max_tool_calls": 10,
         "max_output_tokens": 1500,
-        "max_input_tokens": 12_000,
+        "max_input_tokens": 6_000,
         "request_timeout": 90.0,
         "total_timeout": 900.0,
         "budget_usd": 0.5,
@@ -383,10 +396,10 @@ def test_a_failed_or_incomplete_run_is_never_reported_as_delivered() -> None:
 
 
 def test_the_request_ceiling_stops_the_run_before_the_next_request_is_sent() -> None:
-    # A Lead that looks twice needs a tenth request; the plan allows exactly nine.
-    client = FakeTeamOpenAI(lead_views=2)
-    report = run(config(limits=_limits(max_requests=9)), client)
-    assert report.abort_reason == "request limit reached" and len(client.requests) == 9
+    # A Lead that looks four times needs a twelfth request; the plan allows eleven.
+    client = FakeTeamOpenAI(lead_views=4)
+    report = run(config(limits=_limits(max_requests=11, max_steps=6)), client)
+    assert report.abort_reason == "request limit reached" and len(client.requests) == 11
     assert report.verdict == "INCONCLUSIVE" and report.scenarios[0].run_status != "completed"
 
 
@@ -394,7 +407,7 @@ def test_the_budget_guard_stops_a_run_whose_provider_reports_more_usage_than_pla
     # The plan fits the budget (nine requests at the limits), but this provider reports far more
     # input tokens than the limits allow, so the running total must stop the run, not the plan.
     client = FakeTeamOpenAI(tokens=(60_000, 1_500))
-    report = run(config(limits=_limits(max_requests=9, budget_usd=0.15)), client)
+    report = run(config(limits=_limits(max_requests=11, budget_usd=0.18)), client)
     assert report.abort_reason in {"budget estimate exceeded", "budget exceeded after the request"}
     assert len(client.requests) < 9 and report.verdict != "PASS"
     assert report.scenarios[0].run_status != "completed"
@@ -422,7 +435,7 @@ def test_the_tool_call_ceiling_aborts_the_run() -> None:
 def test_a_plan_below_the_request_ceiling_is_refused_before_any_request() -> None:
     client = FakeTeamOpenAI()
     report = run(config(limits=_limits(max_requests=3)), client)
-    assert report.failure is not None and "below the 9" in report.failure
+    assert report.failure is not None and "below the 11" in report.failure
     assert client.requests == []
 
 
@@ -594,7 +607,7 @@ def test_a_negative_scenario_where_nothing_was_tested_is_inconclusive_not_a_pass
 
 def test_after_an_abort_no_further_scenario_is_started() -> None:
     client = FakeTeamOpenAI(tokens=(60_000, 1_500))
-    limits = _limits(max_requests=27, budget_usd=0.45)
+    limits = _limits(max_requests=33, budget_usd=0.45)
     report = run(config(scenarios=lt.ALL_SCENARIOS, limits=limits), client)
     assert report.abort_reason is not None and len(report.scenarios) == 1
     assert len(client.requests) < 27
