@@ -347,6 +347,43 @@ def test_a_mismatch_between_roles_and_the_run_is_reported_not_hidden(
     assert report.attribution_reconciled is False
 
 
+def test_an_adapter_failure_outside_the_client_call_also_stops_the_run() -> None:
+    ledger = lv.Ledger(_limits(max_requests=10, budget_usd=5.0), PRICES)
+
+    class RejectsBeforeTransport:
+        async def respond(self, *args: Any, **kwargs: Any) -> Any:
+            raise ValueError("rejected before any request left")
+
+    provider = lv.DiagnosticProvider(RejectsBeforeTransport(), ledger, "lead2")
+    with pytest.raises(ValueError):
+        asyncio.run(provider.respond())
+    with pytest.raises(lv.LimitExceeded, match="failed request"):
+        ledger.before(100, "tester")  # no other role may send after it
+
+
+def test_a_reservation_settles_once_whatever_the_caller_does() -> None:
+    limits = _limits(max_requests=10, budget_usd=5.0)
+    ledger = lv.Ledger(limits, PRICES)
+    reservation = ledger.before(1000, "tester")
+    ledger.after(1000, 20, 0, 0.0, reservation)
+    spent, responses = ledger.spent_usd, ledger.responses
+    ledger.after(1000, 20, 0, 0.0, reservation)  # a second settlement is ignored
+    ledger.record_failure(RuntimeError("late"), reservation)
+    assert (ledger.spent_usd, ledger.responses) == (spent, responses)
+    assert ledger.guard_failures == 0 and ledger.roles["tester"].failed == 0
+
+
+def test_a_run_that_times_out_lists_the_scenarios_that_never_began() -> None:
+    class Hangs(FakeTeamOpenAI):
+        async def _create(self, **request: Any) -> Any:
+            self.requests.append(request)
+            await asyncio.Event().wait()
+
+    report = run(config(scenarios=lt.ALL_SCENARIOS[:2], limits=_limits(total_timeout=0.5)), Hangs())
+    assert report.failure == "overall timeout reached"
+    assert report.not_started == ["LIVE_FAILING_TESTS"]
+
+
 # ------------------------------------------------------------------- per-role attribution
 
 

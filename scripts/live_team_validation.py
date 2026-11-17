@@ -565,6 +565,9 @@ async def run_team(
         report.failure = f"unexpected harness error: {lv._safe_token(type(error).__name__)}"
     finally:
         _account(report, ledger, config)
+        if report.failure is not None:
+            begun = {item.name for item in report.scenarios}
+            report.not_started = [name for name in config.scenarios if name not in begun]
     report.elapsed_seconds = round(time.monotonic() - started, 2)
     report.finish()
     return report

@@ -333,12 +333,16 @@ class Ledger:
             self.roles.setdefault(role, RoleLedger()).requests += 1
         return reservation
 
-    def _settle(self, reservation: Reservation | None) -> Reservation:
-        """The request's own reservation (or, for a caller that has none, the newest open one)."""
+    def _settle(self, reservation: Reservation | None) -> Reservation | None:
+        """The request's own reservation, closed; None when it was already settled.
 
+        A caller without one (legacy, single request at a time) gets the newest open reservation.
+        """
         if reservation is None:
             reservation = next((item for item in reversed(self._open) if item.open), None)
             reservation = reservation or Reservation(0.0)
+        elif not reservation.open:
+            return None  # a request settles exactly once
         if reservation.open:
             reservation.open = False
             self._open = [item for item in self._open if item.open]
@@ -365,7 +369,10 @@ class Ledger:
 
         The usage is unknown, so the request is charged at its own worst-case estimate."""
 
-        reservation = self._settle(reservation)
+        settled = self._settle(reservation)
+        if settled is None:
+            return
+        reservation = settled
         self.guard_failures += 1
         self.spent_usd += reservation.estimate
         mine = self._role(reservation)
@@ -378,6 +385,8 @@ class Ledger:
     def note_exception(self, error: BaseException, *, attempted: bool, received: bool) -> None:
         """A failure outside the client call: before transport, or after a good response."""
 
+        # A failed request, wherever it failed: the run is over, for every role.
+        self.stop_reason = self.stop_reason or "run stopped after a failed request"
         if len(self.errors) >= 5:
             return
         base = sanitize_error(error, attempt=self.requests, model_response_received=received)
@@ -405,7 +414,10 @@ class Ledger:
         seconds: float,
         reservation: Reservation | None = None,
     ) -> None:
-        reservation = self._settle(reservation)
+        settled = self._settle(reservation)
+        if settled is None:
+            return
+        reservation = settled
         mine = self._role(reservation)
         self.responses += 1
         if mine is not None:
