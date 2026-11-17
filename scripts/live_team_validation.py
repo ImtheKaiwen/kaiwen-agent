@@ -611,6 +611,18 @@ def locate_key(environ: Mapping[str, str], env_file: Path | None) -> tuple[str |
     return None, "not_found"
 
 
+def _file_values(env_file: Path | None) -> dict[str, str]:
+    """The values of the named `.env` (only to check where a request would go), or none."""
+
+    if env_file is None or not env_file.is_file():
+        return {}
+    try:
+        from dotenv import dotenv_values
+    except ImportError:
+        return {}
+    return {k: v for k, v in dotenv_values(env_file).items() if v is not None}
+
+
 def key_is_well_formed(value: str) -> bool:
     return (
         len(value) >= 20
@@ -658,9 +670,14 @@ async def preflight(
     result["key"] = "present"
     inner = client
     if inner is None:
-        from openai import AsyncOpenAI
-
-        inner = AsyncOpenAI(api_key=key, timeout=timeout, max_retries=0)
+        try:
+            inner = lv.openai_client(
+                key, timeout=timeout, environment={**_file_values(env_file), **environment}
+            )
+        except lv.HarnessError:
+            # Refused before any request: the credential never left this process.
+            result.update(status="ENDPOINT_REJECTED", error={"category": "endpoint_override"})
+            return result
     try:
         await asyncio.wait_for(inner.models.retrieve(model), timeout=timeout)
     except Exception as error:  # noqa: BLE001 - classified, class name and status only

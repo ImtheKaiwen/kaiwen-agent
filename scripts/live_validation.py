@@ -90,6 +90,7 @@ from kaiwen_agent.workflow import (
 ROOT = Path(__file__).parents[1]
 DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"
 DEFAULT_OLLAMA_MODEL = "qwen2.5-coder:7b"
+OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_IMAGE = "python@sha256:e064671ca452259bab50e8e2c7bd896e39e9a343bb06ca25234adf6fe18d0fc7"
 # Assumed list prices in USD per million tokens. They are deliberately generous placeholders,
 # not a statement of the provider's current price: override them with --price-* after
@@ -789,17 +790,40 @@ def _account(report: Report, ledger: Ledger, config: Config) -> None:
         )
 
 
+def endpoint_is_overridden(*environments: Mapping[str, str]) -> bool:
+    """True when any environment redirects the OpenAI SDK away from the official endpoint.
+
+    The SDK reads `OPENAI_BASE_URL` when no `base_url` is given. A credential must never follow
+    it, so the validation paths pin the endpoint and refuse a different one before any request.
+    The value is never echoed: it may itself carry a secret.
+    """
+
+    return any(
+        value and value.rstrip("/") != OPENAI_BASE_URL
+        for value in (environment.get("OPENAI_BASE_URL") for environment in environments)
+    )
+
+
+def openai_client(api_key: str, *, timeout: float, environment: Mapping[str, str]) -> Any:
+    """The one real OpenAI client of the validation paths: official endpoint only, no retries."""
+
+    if endpoint_is_overridden(environment, os.environ):
+        raise HarnessError("OPENAI_BASE_URL points away from the official OpenAI endpoint")
+    from openai import AsyncOpenAI
+
+    # `base_url` is explicit, so the SDK never consults the environment for it. No hidden
+    # retries: every request is counted by the ledger.
+    return AsyncOpenAI(api_key=api_key, base_url=OPENAI_BASE_URL, timeout=timeout, max_retries=0)
+
+
 def _real_client(config: Config, environment: Mapping[str, str]) -> Any:
     if config.provider == "openai":
         if not environment.get("OPENAI_API_KEY"):
             raise HarnessError("OPENAI_API_KEY is not configured")
-        from openai import AsyncOpenAI
-
-        # No hidden retries: every request is counted by the ledger.
-        return AsyncOpenAI(
-            api_key=environment["OPENAI_API_KEY"],
+        return openai_client(
+            environment["OPENAI_API_KEY"],
             timeout=config.limits.request_timeout,
-            max_retries=0,
+            environment=environment,
         )
     try:
         from ollama import AsyncClient  # type: ignore[import-not-found]

@@ -619,6 +619,130 @@ def test_the_real_client_is_built_with_the_request_timeout_and_no_sdk_retries(
     assert seen["max_retries"] == 0 and seen["timeout"] == 90.0
 
 
+# ------------------------------------------------------------------ endpoint integrity (R3)
+
+CANONICAL = "https://api.openai.com/v1"
+REDIRECT = "http://127.0.0.1:9/v1"  # never contacted: every transport below is mocked
+
+
+class WireRecorder:
+    """Replaces the HTTP transport of every SDK client: records where a request would go."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import httpx
+
+        self.sent: list[Any] = []
+
+        async def send(client: Any, request: Any, **kwargs: Any) -> Any:
+            self.sent.append(request)
+            body = {"id": "gpt-5.4-mini", "object": "model", "created": 0, "owned_by": "x"}
+            return httpx.Response(200, json=body, request=request)
+
+        monkeypatch.setattr(httpx.AsyncClient, "send", send)
+
+    @property
+    def hosts(self) -> set[str]:
+        return {request.url.host for request in self.sent}
+
+
+@pytest.mark.parametrize("override", [None, CANONICAL, CANONICAL + "/"])
+def test_preflight_sends_the_credential_only_to_the_official_endpoint(
+    monkeypatch: pytest.MonkeyPatch, override: str | None
+) -> None:
+    if override is None:
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    else:
+        monkeypatch.setenv("OPENAI_BASE_URL", override)
+    wire = WireRecorder(monkeypatch)
+    result = asyncio.run(lt.preflight("gpt-5.4-mini", **keyed()))
+    assert result["status"] == "OK" and wire.hosts == {"api.openai.com"}
+    assert wire.sent[0].headers["authorization"] == f"Bearer {SECRET}"  # only to that host
+
+
+@pytest.mark.parametrize(
+    "override", [REDIRECT, "https://evil.example/v1", "https://api.openai.com.evil.test/v1"]
+)
+def test_a_redirecting_base_url_in_the_process_environment_never_receives_the_credential(
+    monkeypatch: pytest.MonkeyPatch, override: str
+) -> None:
+    monkeypatch.setenv("OPENAI_BASE_URL", override)
+    wire = WireRecorder(monkeypatch)
+    result = asyncio.run(lt.preflight("gpt-5.4-mini", **keyed()))
+    assert result["status"] == "ENDPOINT_REJECTED" and result["model_requests"] == 0
+    assert wire.sent == []  # nothing, to any host, carried the key
+    assert override not in json.dumps(result) and SECRET not in json.dumps(result)
+
+
+def test_a_redirecting_base_url_from_the_loaded_configuration_is_refused_too(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The `.env` the harness loads may carry it even when the process environment does not."""
+
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text("\n".join([f"OPENAI_API_KEY={SECRET}", f"OPENAI_BASE_URL={REDIRECT}", ""]))
+    wire = WireRecorder(monkeypatch)
+    result = asyncio.run(lt.preflight("gpt-5.4-mini", environ={}, env_file=env_file))
+    assert result["status"] == "ENDPOINT_REJECTED" and wire.sent == []
+
+
+@pytest.mark.parametrize("override", [None, REDIRECT])
+def test_the_paid_execution_client_is_pinned_to_the_official_endpoint_or_refused(
+    monkeypatch: pytest.MonkeyPatch, override: str | None
+) -> None:
+    if override is None:
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    else:
+        monkeypatch.setenv("OPENAI_BASE_URL", override)
+    provider_config = lv.Config(provider="openai", model="m", live=True, limits=_limits())
+    if override is not None:
+        with pytest.raises(lv.HarnessError, match="OPENAI_BASE_URL"):
+            lv._real_client(provider_config, {"OPENAI_API_KEY": SECRET})
+        return
+    client = lv._real_client(provider_config, {"OPENAI_API_KEY": SECRET})
+    assert str(client.base_url).rstrip("/") == CANONICAL
+
+
+def test_the_endpoint_is_passed_explicitly_so_the_sdk_never_consults_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import openai
+
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    seen: dict[str, Any] = {}
+
+    class Recorder:
+        def __init__(self, **kwargs: Any) -> None:
+            seen.update(kwargs)
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", Recorder)
+    lv.openai_client(SECRET, timeout=5.0, environment={})
+    assert seen["base_url"] == CANONICAL and seen["max_retries"] == 0
+
+
+def test_a_redirect_in_the_configuration_mapping_is_refused_before_a_paid_run_sends_anything(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    wire = WireRecorder(monkeypatch)
+    environ = {"OPENAI_API_KEY": SECRET, "OPENAI_BASE_URL": REDIRECT}
+    report = asyncio.run(lt.run_team(config(), sandbox_factory=standin, environ=environ))
+    assert report.failure is not None and "OPENAI_BASE_URL" in report.failure
+    assert wire.sent == [] and report.model_requests == 0 and report.verdict != "PASS"
+
+
+def test_an_injected_client_is_untouched_by_the_endpoint_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Offline fakes keep working whatever the environment says: no credential can leave."""
+
+    monkeypatch.setenv("OPENAI_BASE_URL", REDIRECT)
+    report = run(config(), FakeTeamOpenAI())
+    assert report.verdict == "PASS"
+    result = asyncio.run(lt.preflight("m", **keyed(client=FakeTeamOpenAI())))
+    assert result["status"] == "OK"
+
+
 # ---------------------------------------------------------------------------------- preflight
 
 
