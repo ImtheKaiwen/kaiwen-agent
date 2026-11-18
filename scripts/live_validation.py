@@ -252,6 +252,18 @@ def worst_case_cost(limits: Limits, pricing: Pricing) -> float:
     return limits.max_requests * pricing.cost(limits.max_input_tokens, limits.max_output_tokens)
 
 
+# No honest request reports more tokens than this; anything above it is not a token count.
+MAX_PLAUSIBLE_TOKENS = 10**9
+
+
+def _is_plausible_count(value: Any) -> bool:
+    return type(value) is int and 0 <= value <= MAX_PLAUSIBLE_TOKENS
+
+
+def _plain_count(value: Any) -> int:
+    return value if type(value) is int and value >= 0 else 0
+
+
 @dataclass(slots=True)
 class Reservation:
     """The worst-case cost of one request that is in flight. Each request owns exactly one."""
@@ -408,39 +420,77 @@ class Ledger:
 
     def after(
         self,
-        input_tokens: int | None,
-        output_tokens: int | None,
-        tool_calls: int,
-        seconds: float,
+        input_tokens: Any,
+        output_tokens: Any,
+        tool_calls: Any,
+        seconds: Any,
         reservation: Reservation | None = None,
     ) -> None:
+        """Settle a request that was answered. The arguments are whatever the provider reported,
+        so nothing here is trusted: everything that could raise is computed first, the
+        bookkeeping that follows cannot fail, and the reservation is closed before either."""
+
         settled = self._settle(reservation)
         if settled is None:
             return
         reservation = settled
+        reported, untrusted = self._reported_cost(input_tokens, output_tokens)
+        calls = _plain_count(tool_calls)
+        elapsed = (
+            float(seconds)
+            if isinstance(seconds, (int, float))
+            and not isinstance(seconds, bool)
+            and math.isfinite(seconds)
+            and seconds >= 0
+            else 0.0
+        )
         mine = self._role(reservation)
         self.responses += 1
         if mine is not None:
             mine.responses += 1
-        if input_tokens is None or output_tokens is None:
+        if reported is None:
+            # Unknown billing is never free: the request is charged its own worst case. Usage
+            # that was reported but cannot be believed also ends the run, because the budget
+            # arithmetic can no longer be trusted.
             self.spent_usd += reservation.estimate
+            if untrusted:
+                self.stop_reason = self.stop_reason or "usage reported by the provider is untrusted"
         else:
-            cost = self.pricing.cost(input_tokens, output_tokens)
+            cost, used_input, used_output = reported
             self.usage_responses += 1
-            self.input_tokens += input_tokens
-            self.output_tokens += output_tokens
+            self.input_tokens += used_input
+            self.output_tokens += used_output
             self.reported_usd += cost
             self.spent_usd += cost
             if mine is not None:
                 mine.usage_responses += 1
-                mine.input_tokens += input_tokens
-                mine.output_tokens += output_tokens
-        self.request_seconds += seconds
-        self.scenario_tool_calls += tool_calls
+                mine.input_tokens += used_input
+                mine.output_tokens += used_output
+        self.request_seconds += elapsed
+        self.scenario_tool_calls += calls
         if self.scenario_tool_calls > self.limits.max_tool_calls:
             self._abort("tool-call limit exceeded")
         if self.spent_usd > self.limits.budget_usd:
             self._abort("budget exceeded after the request")
+
+    def _reported_cost(
+        self, input_tokens: Any, output_tokens: Any
+    ) -> tuple[tuple[float, int, int] | None, bool]:
+        """((cost, input, output), False) for usable usage; (None, False) when none was reported;
+        (None, True) when something was reported that cannot be trusted."""
+
+        reported = [value for value in (input_tokens, output_tokens) if value is not None]
+        if any(not _is_plausible_count(value) for value in reported):
+            return None, True
+        if len(reported) < 2:
+            return None, False
+        try:
+            cost = self.pricing.cost(input_tokens, output_tokens)
+        except Exception:  # noqa: BLE001 - an unpriceable usage is untrusted, whatever the cause
+            return None, True
+        if not (isinstance(cost, (int, float)) and math.isfinite(cost) and cost >= 0):
+            return None, True
+        return (float(cost), int(input_tokens), int(output_tokens)), False
 
     def _abort(self, reason: str) -> None:
         self.abort_reason = reason
@@ -451,6 +501,9 @@ def estimate_tokens(request: Mapping[str, Any]) -> int:
     """A deliberately pessimistic size estimate (three characters per token)."""
 
     return len(json.dumps(request, default=str, ensure_ascii=False)) // 3 + 1
+
+
+_UNREADABLE = object()  # stands for usage that could not even be read
 
 
 class _GuardedResponses:
@@ -469,15 +522,25 @@ class _GuardedResponses:
         except BaseException as error:  # noqa: BLE001 - a cancelled request may still be billed
             self._ledger.record_failure(error, reservation)
             raise
-        usage = getattr(response, "usage", None)
-        calls = sum(
-            1
-            for item in getattr(response, "output", [])
-            if getattr(item, "type", None) == "function_call"
-        )
+        # The response is whatever the provider sent: read it defensively, and settle the
+        # reservation whatever it holds. Unreadable usage is untrusted, never zero.
+        try:
+            usage = getattr(response, "usage", None)
+            reported_input = getattr(usage, "input_tokens", None)
+            reported_output = getattr(usage, "output_tokens", None)
+        except Exception:  # noqa: BLE001 - a response that cannot be read is untrusted usage
+            reported_input = reported_output = _UNREADABLE
+        try:
+            calls = sum(
+                1
+                for item in getattr(response, "output", None) or ()
+                if getattr(item, "type", None) == "function_call"
+            )
+        except Exception:  # noqa: BLE001 - a malformed output simply holds no counted call
+            calls = 0
         self._ledger.after(
-            _optional_count(getattr(usage, "input_tokens", None)),
-            _optional_count(getattr(usage, "output_tokens", None)),
+            reported_input,
+            reported_output,
             calls,
             time.monotonic() - started,
             reservation,

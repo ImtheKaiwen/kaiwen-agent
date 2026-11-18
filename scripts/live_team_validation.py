@@ -79,6 +79,10 @@ class LiveScenario:
     cite: str  # which command's evidence the example's own scripted checks would cite
     negative: bool
     accepted_reasons: frozenset[str] = frozenset()
+    # What the container's evidence for `command` must show for a negative scenario to count:
+    # "failed" with a real assertion failure (not an infrastructure problem), or "passed".
+    evidence_outcome: str = "passed"
+    needs_assertion_failure: bool = False
 
 
 LIVE_SCENARIOS: dict[str, LiveScenario] = {
@@ -92,16 +96,20 @@ LIVE_SCENARIOS: dict[str, LiveScenario] = {
     ),
     "LIVE_FAILING_TESTS": LiveScenario(
         "LIVE_FAILING_TESTS",
-        "the bug is left in place: the container run fails and the delivery is never completed",
+        "the bug is left in place: the container reports a real test failure and the delivery is "
+        "never completed",
         fix_code=False,
         command="unit.tests",
         cite="tests",
         negative=True,
         accepted_reasons=frozenset({"quality_blocked"}),
+        evidence_outcome="failed",
+        needs_assertion_failure=True,
     ),
     "LIVE_INVALID_EVIDENCE": LiveScenario(
         "LIVE_INVALID_EVIDENCE",
-        "only unrelated evidence exists (the compile check): the delivery is never completed",
+        "only unrelated evidence exists (a passing compile check, no test run): the completion "
+        "gate rejects the delivery for its missing required test evidence",
         fix_code=True,
         command="compile.check",
         cite="compile",
@@ -186,6 +194,13 @@ class TeamScenarioReport:
     run_status: str | None = None
     team_acceptance: str | None = None
     evidence_commands: list[str] = field(default_factory=list)
+    # The host's record of each evidence artifact: command, outcome label, exit code, whether the
+    # container reported an assertion failure. Allowlisted fields only.
+    evidence: list[dict[str, Any]] = field(default_factory=list)
+    # Per role, what is missing from the host's records of its participation (empty: nothing).
+    participation: dict[str, list[str]] = field(default_factory=dict)
+    # "completion_gate" or "team_acceptance" when the host rejected the delivery, else None.
+    rejected_by: str | None = None
     roles: dict[str, RoleUsage] = field(default_factory=dict)
     # Allowlisted facts about each task that did not complete: role, status, error code, category.
     failed_tasks: list[dict[str, str]] = field(default_factory=list)
@@ -234,6 +249,8 @@ class TeamReport:
             self.verdict = "FAIL"
         elif not verdicts or "INCONCLUSIVE" in verdicts or self.failure is not None:
             self.verdict = "INCONCLUSIVE"
+        elif self.attribution_reconciled is not True:
+            self.verdict = "FAIL"  # a PASS needs per-role accounting that adds up to the totals
         else:
             self.verdict = "PASS" if all(v == "PASS" for v in verdicts) else "INCONCLUSIVE"
 
@@ -467,8 +484,35 @@ def failed_tasks(result: Any) -> list[dict[str, str]]:
 # ------------------------------------------------------------------------------------ the run
 
 
-async def _evidence_commands(result: Any) -> list[str]:
-    """Command ids of the evidence artifacts the host recorded for the run (host-side lookup)."""
+@dataclass(frozen=True, slots=True)
+class EvidenceFact:
+    """One host-recorded evidence artifact, reduced to allowlisted fields."""
+
+    command_id: str
+    outcome: str  # the host's label: passed, failed, timed_out, cancelled, ...
+    exit_code: int | None
+    assertion_failure: bool  # the container's own output reported failing assertions
+
+
+_ASSERTION_FAILURE = re.compile(r"FAILED \(failures=\d+")
+_OUTCOMES = frozenset(
+    {
+        "passed",
+        "failed",
+        "timed_out",
+        "cancelled",
+        "snapshot_modified",
+        "cleanup_failed",
+        "unverified",
+    }
+)
+
+
+async def _evidence_facts(result: Any) -> list[EvidenceFact]:
+    """The evidence artifacts the host recorded for the run, from the host's artifact store.
+
+    Labels come from the trusted pipeline; the exit code and the output are read from the stored
+    payload only to classify the result, and none of its text is copied into the report."""
 
     if result.artifacts is None:
         return []
@@ -479,18 +523,97 @@ async def _evidence_commands(result: Any) -> list[str]:
         trace_id="live-report",
         run_id=result.run_id,
     )
-    listed = await result.artifacts.list(scope, limit=100)
-    return sorted(
-        {
-            str(item.labels.get("command_id"))
-            for item in listed
-            if item.run_id == result.run_id and item.labels.get("command_id")
-        }
+    facts: list[EvidenceFact] = []
+    for item in await result.artifacts.list(scope, limit=100):
+        command = item.labels.get("command_id")
+        if item.run_id != result.run_id or not command:
+            continue
+        outcome = str(item.labels.get("outcome", "unverified"))
+        exit_code: int | None = None
+        assertion = False
+        try:
+            payload = json.loads((await result.artifacts.read(scope, item.id)).content)
+            code = payload.get("exit_code")
+            exit_code = code if isinstance(code, int) and not isinstance(code, bool) else None
+            text = " ".join(
+                str(payload.get(stream, {}).get("text", "")) for stream in ("stdout", "stderr")
+            )
+            assertion = bool(_ASSERTION_FAILURE.search(text))
+        except Exception:  # noqa: BLE001 - an unreadable payload is simply not an assertion failure
+            pass
+        facts.append(
+            EvidenceFact(
+                command_id=str(command),
+                outcome=outcome if outcome in _OUTCOMES else "unverified",
+                exit_code=exit_code,
+                assertion_failure=assertion,
+            )
+        )
+    return sorted(facts, key=lambda fact: (fact.command_id, fact.outcome))
+
+
+# The registered tool whose successful execution the host must have recorded for each role.
+REQUIRED_TOOL = {
+    "lead": "lead.propose_task",
+    "lead2": "lead.propose_task",
+    "tester": "testing.run",
+    "reviewer": "review.submit",
+}
+# The host-built record in the task output that only the registered tool's execution produces.
+REQUIRED_RECORD = {"lead": "delegation_proposals", "lead2": "delegation_proposals"} | {
+    "reviewer": "review_assessment"
+}
+
+
+def participation_problems(
+    result: Any, roles: Mapping[str, RoleUsage] | None
+) -> dict[str, list[str]]:
+    """What is missing from the host's records of each role's part in the delivery.
+
+    Only trusted records count: the durable task records (completed, by this worker), the host's
+    own record of each registered tool call in the task output (never the model's words), the
+    record only the tool's execution produces, and the model requests the shared ledger counted."""
+
+    tasks = list(getattr(result.outcome, "tasks", ()) or ())
+    problems: dict[str, list[str]] = {}
+    for role in PROMPT_OF_ROLE:
+        found: list[str] = []
+        usage = (roles or {}).get(role)
+        if usage is None or usage.requests < 1:
+            found.append("no model request was counted")
+        mine = [t for t in tasks if str(getattr(t, "agent_id", "")) == role]
+        done = [t for t in mine if str(getattr(t.status, "value", t.status)) == "completed"]
+        if not done:
+            found.append("no completed task record")
+        else:
+            wanted = REQUIRED_TOOL[role]
+            record = REQUIRED_RECORD.get(role)
+            if not any(_ran_tool(t, wanted) and _has_record(t, record) for t in done):
+                found.append(f"no successful {wanted} execution on record")
+        problems[role] = found
+    return problems
+
+
+def _ran_tool(task: Any, tool: str) -> bool:
+    output = getattr(task, "output", None)
+    calls = output.get("tool_calls") if isinstance(output, dict) else None
+    return any(
+        isinstance(call, dict) and call.get("tool") == tool and call.get("is_error") is False
+        for call in calls or ()
     )
 
 
+def _has_record(task: Any, key: str | None) -> bool:
+    output = getattr(task, "output", None)
+    return key is None or (isinstance(output, dict) and bool(output.get(key)))
+
+
 def judge(
-    scenario: LiveScenario, result: Any, evidence: list[str], ledger: lv.Ledger
+    scenario: LiveScenario,
+    result: Any,
+    evidence: list[EvidenceFact],
+    ledger: lv.Ledger,
+    roles: Mapping[str, RoleUsage] | None,
 ) -> tuple[str, str]:
     """PASS, FAIL or INCONCLUSIVE from the host's trusted records only."""
 
@@ -501,21 +624,60 @@ def judge(
         return "FAIL", "the outcome and the durable run status disagree"
     if ledger.abort_reason:
         return "INCONCLUSIVE", f"a limit stopped the run: {ledger.abort_reason}"
+    mine = [fact for fact in evidence if fact.command_id == scenario.command]
     if not scenario.negative:
-        if completed and result.acceptance.startswith("accepted") and scenario.command in evidence:
-            return "PASS", "completed with gate-verified evidence and an accepting team decision"
-        if completed:
-            return "FAIL", "completed without the expected accepted decision or evidence"
-        return "INCONCLUSIVE", f"not completed: {status.value} {result.outcome.reason}"
+        if not completed:
+            return "INCONCLUSIVE", f"not completed: {status.value} {result.outcome.reason}"
+        if not result.acceptance.startswith("accepted"):
+            return "FAIL", "completed without an accepting team decision"
+        missing = {r: p for r, p in participation_problems(result, roles).items() if p}
+        if missing:
+            return "FAIL", "completed without verified participation of: " + ", ".join(
+                sorted(missing)
+            )
+        if not any(fact.outcome == scenario.evidence_outcome for fact in mine):
+            return (
+                "FAIL",
+                f"completed without {scenario.command} evidence that {scenario.evidence_outcome}",
+            )
+        return "PASS", "completed with every role on record, gate-verified evidence and acceptance"
     if completed:
         return "FAIL", "INVARIANT VIOLATION: a negative scenario was completed"
     if status not in {WorkflowOutcomeStatus.BLOCKED, WorkflowOutcomeStatus.FAILED}:
         return "INCONCLUSIVE", f"unexpected outcome {status.value}"
-    if scenario.command not in evidence:
+    if not mine:
         return "INCONCLUSIVE", "the Tester never ran the command, so nothing was tested"
+    tester = participation_problems(result, roles)["tester"]
+    if any(p != "no model request was counted" for p in tester):
+        return "INCONCLUSIVE", "the Tester's registered tool call is not on record: " + "; ".join(
+            tester
+        )
+    if scenario.needs_assertion_failure:
+        if not any(f.outcome == "failed" and f.assertion_failure for f in mine):
+            seen = ", ".join(f"{f.outcome} (exit {f.exit_code})" for f in mine)
+            return (
+                "INCONCLUSIVE",
+                "the container did not report an assertion failure, so this is not shown to be "
+                f"a failing test (evidence: {seen})",
+            )
+    elif not any(fact.outcome == scenario.evidence_outcome for fact in mine):
+        return (
+            "INCONCLUSIVE",
+            f"the {scenario.command} evidence did not show {scenario.evidence_outcome}",
+        )
     if result.outcome.reason in scenario.accepted_reasons:
         return "PASS", f"blocked by the host: {result.outcome.reason}"
     return "INCONCLUSIVE", f"blocked for an unexpected reason: {result.outcome.reason}"
+
+
+def rejection_layer(reason: str | None) -> str | None:
+    """Which host layer rejected the delivery, from its own stable reason code."""
+
+    if reason == "quality_blocked":
+        return "completion_gate"
+    if reason and reason.startswith("team_"):
+        return "team_acceptance"
+    return None
 
 
 async def run_team(
@@ -569,6 +731,11 @@ async def run_team(
         report.failure = f"unexpected harness error: {lv._safe_token(type(error).__name__)}"
     finally:
         _account(report, ledger, config)
+        if report.attribution_reconciled is False:
+            for item in report.scenarios:
+                if item.verdict == "PASS":
+                    item.verdict = "FAIL"
+                    item.reason = "per-role accounting does not reconcile with the run total"
         if report.failure is not None:
             begun = {item.name for item in report.scenarios}
             report.not_started = [name for name in config.scenarios if name not in begun]
@@ -648,7 +815,7 @@ async def _live(
                     model_factory=model_factory_for(scenario, config, inner, ledger, steps),
                     max_steps=config.limits.max_steps,
                 )
-                evidence = await _evidence_commands(result)
+                facts = await _evidence_facts(result)
         except SandboxUnavailableError:
             report.docker = "unavailable"
             item.verdict, item.reason = "INCONCLUSIVE", "sandbox unavailable; nothing was executed"
@@ -661,8 +828,11 @@ async def _live(
         item.outcome_reason = result.outcome.reason
         item.run_status = result.run_status
         item.team_acceptance = result.acceptance
-        item.evidence_commands = evidence
-        item.verdict, item.reason = judge(scenario, result, evidence, ledger)
+        item.evidence_commands = sorted({fact.command_id for fact in facts})
+        item.evidence = [asdict(fact) for fact in facts]
+        item.participation = participation_problems(result, item.roles)
+        item.rejected_by = rejection_layer(result.outcome.reason)
+        item.verdict, item.reason = judge(scenario, result, facts, ledger, item.roles)
         item.elapsed_seconds = round(time.monotonic() - started, 2)
         if ledger.abort_reason:
             report.abort_reason = ledger.abort_reason
@@ -942,19 +1112,86 @@ def config_from(arguments: argparse.Namespace) -> TeamConfig:
     return config
 
 
-def _head() -> str | None:
+_FULL_COMMIT = re.compile(r"[0-9a-f]{40}")
+_GIT_REDIRECTS = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+)
+
+
+def _git(root: Path, git: str, *arguments: str) -> str | None:
+    """The output of one read-only Git command in `root`, or None when it cannot be obtained.
+
+    Environment variables that redirect Git to another repository are removed, so the answer is
+    always about the repository this script belongs to."""
+
+    environment = {k: v for k, v in os.environ.items() if k not in _GIT_REDIRECTS}
     try:
         done = subprocess.run(  # noqa: S603 - fixed argv, no shell
-            ["git", "rev-parse", "HEAD"],  # noqa: S607
-            cwd=lv.ROOT,
+            [git, "--no-optional-locks", *arguments],
+            cwd=root,
+            env=environment,
             capture_output=True,
             text=True,
-            timeout=15,
+            timeout=30,
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    return done.stdout.strip() if done.returncode == 0 else None
+    return done.stdout if done.returncode == 0 else None
+
+
+def _installed_package() -> Path | None:
+    try:
+        import kaiwen_agent
+
+        return Path(kaiwen_agent.__file__ or "").resolve()
+    except (ImportError, OSError, ValueError):
+        return None
+
+
+def verify_authorized_commit(
+    authorized_head: str | None,
+    *,
+    root: Path | None = None,
+    git: str = "git",
+    package_file: Path | None = None,
+) -> str | None:
+    """None when a paid run may start, otherwise the reason it must not.
+
+    The authorization must name the full commit; the repository this script belongs to must be
+    at exactly that commit with no staged, modified or untracked-but-not-ignored change (ignored
+    local configuration and report files are fine); and the `kaiwen_agent` package that would run
+    must be this checkout's. Anything that cannot be established refuses. Nothing here touches
+    the network or a model.
+    """
+
+    root = (lv.ROOT if root is None else root).resolve()
+    if authorized_head is None or not _FULL_COMMIT.fullmatch(authorized_head.strip()):
+        return "--authorize-head must name the full 40-character commit that was authorized"
+    wanted = authorized_head.strip()
+    toplevel = _git(root, git, "rev-parse", "--show-toplevel")
+    head = _git(root, git, "rev-parse", "HEAD")
+    status = _git(root, git, "status", "--porcelain", "--untracked-files=all")
+    if toplevel is None or head is None or status is None:
+        return "the repository identity, HEAD or cleanliness cannot be established"
+    if Path(toplevel.strip()).resolve() != root:
+        return "the script is not at the root of the Git repository it belongs to"
+    if head.strip() != wanted:
+        return "the checked-out commit is not the authorized commit"
+    if status.strip():
+        return "the working tree has uncommitted changes that could affect the executed code"
+    package = package_file.resolve() if package_file is not None else _installed_package()
+    if package is None or not package.is_relative_to(root):
+        return "the kaiwen_agent package that would run does not belong to this checkout"
+    return None
 
 
 def _write(report: Path | None, text: str) -> None:
@@ -984,10 +1221,11 @@ def main(argv: list[str] | None = None) -> int:
         print("Plan only: no model was called and nothing was executed.", file=sys.stderr)
         return 0 if result["verdict"] == "READY_FOR_AUTHORIZATION_REQUEST" else 1
     if config.live:
-        authorized_head = arguments.authorize_head
-        head = _head()
-        if authorized_head is not None and head != authorized_head:
-            print("Refused: the checked-out commit is not the authorized commit.", file=sys.stderr)
+        # Before the key is read or any request can be made: the commit and the tree are the
+        # ones that were authorized, or nothing starts.
+        refusal = verify_authorized_commit(arguments.authorize_head)
+        if refusal is not None:
+            print(f"Refused: {refusal}.", file=sys.stderr)
             return 2
     try:
         from dotenv import dotenv_values

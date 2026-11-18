@@ -220,6 +220,34 @@ from the outcome, the durable run status, the acceptance decision and the record
 from model text. A negative scenario that completes is `FAIL` (an invariant violation); a run stopped by a
 limit, or where the Tester never ran, is `INCONCLUSIVE`.
 
+Authorization of a paid run: `--authorize-head` is required for every `--live` execution and must name the full
+40-character commit. Before the key is read or any request is made the script checks that the repository it
+belongs to is at exactly that commit, that the working tree has no staged, modified or untracked-but-not-ignored
+change (ignored local files such as `.env` and `.kaiwen-live/` reports do not count), and that the
+`kaiwen_agent` package that would run lives in this checkout. Anything that cannot be established (no Git, not
+a repository root, Git environment overrides, an unreadable status) refuses; dry runs and `plan` need none of this.
+
+What a PASS requires. `LIVE_ACCEPTED`: the run completed, the durable status is `completed`, team acceptance
+accepted, the host recorded `unit.tests` evidence labelled `passed`, and every role (Lead, second Lead, Tester,
+Reviewer) has a completed task record, a model request counted by the ledger, and the host's record of its
+registered tool call (`lead.propose_task` with delegation proposals, `testing.run`, `review.submit` with a review
+assessment), never the model's words; and the per-role accounting reconciles with the run total
+(`attribution_reconciled`), otherwise the scenario is `FAIL`. `LIVE_FAILING_TESTS`: the Tester's registered call
+and the `unit.tests` evidence are on record, the evidence outcome is `failed` and the container's own output
+reported failing assertions (`FAILED (failures=N)`), and the completion gate blocked with `quality_blocked`. An
+infrastructure problem that leaves a failing exit code (a Docker error, a timeout, an import error) is
+`INCONCLUSIVE`, not a PASS. Limitation: the assertion check reads the unittest summary of the project's own
+test command; it distinguishes a failing assertion from a loading error or a container fault, but it is not a
+proof that the right test failed. `LIVE_INVALID_EVIDENCE` verifies only the completion gate: with a passing
+compile check and no test run the gate rejects the delivery for its missing required test evidence
+(`rejected_by: completion_gate`); the team-acceptance check `evidence_not_gate_verified` is exercised only by the
+offline `docker_unrelated_evidence` scenario, not by this live scenario.
+
+Settlement: the response of a provider is not trusted. Missing or unreadable usage is charged at the request's own
+worst-case estimate; usage that is present but invalid (not an integer, negative, a boolean, not finite, above
+10^9 tokens, unpriceable) is charged the same way and stops the run; a malformed `output` or an error while
+reading the response cannot leave a reservation open; each reservation settles exactly once.
+
 Stopping rule: the run stops at the first scenario that is not `PASS` (a negative scenario that is
 correctly blocked is a `PASS` and the next scenario may start), and at any abort, failed or cancelled
 request, exhausted limit or refused authorization. Scenarios that never began are listed in

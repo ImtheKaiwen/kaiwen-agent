@@ -561,14 +561,33 @@ def verdict_of(
     evidence: tuple[str, ...] = ("unit.tests",),
     aborted: str | None = None,
 ) -> str:
+    scenario = lt.LIVE_SCENARIOS[name]
+    failed = scenario.evidence_outcome == "failed"
+    facts = [
+        lt.EvidenceFact(command, scenario.evidence_outcome, 1 if failed else 0, failed)
+        for command in evidence
+    ]
+    tasks = [
+        SimpleNamespace(
+            agent_id=role,
+            status=SimpleNamespace(value="completed"),
+            output={
+                "tool_calls": [{"tool": lt.REQUIRED_TOOL[role], "is_error": False}],
+                "delegation_proposals": [{}],
+                "review_assessment": {"recommendation": "approve"},
+            },
+        )
+        for role in lt.PROMPT_OF_ROLE
+    ]
     result = SimpleNamespace(
-        outcome=SimpleNamespace(status=status, reason=reason),
+        outcome=SimpleNamespace(status=status, reason=reason, tasks=tasks),
         run_status=run_status,
         acceptance=acceptance,
     )
     ledger = lv.Ledger(_limits(), PRICES)
     ledger.abort_reason = aborted
-    return lt.judge(lt.LIVE_SCENARIOS[name], result, list(evidence), ledger)[0]
+    roles = {role: lt.RoleUsage(requests=2) for role in lt.PROMPT_OF_ROLE}
+    return lt.judge(scenario, result, facts, ledger, roles)[0]
 
 
 STATUS = lt.WorkflowOutcomeStatus
@@ -848,9 +867,10 @@ def test_the_run_command_is_a_dry_run_and_refuses_an_unauthorized_live_run(
     env = ["--env-file", str(tmp_path / "none.env")]
     assert lt.main(["run", *prices, *env]) == 0
     assert '"verdict": "NOT_RUN"' in capsys.readouterr().out
-    assert lt.main(["run", "--live", *prices, *env]) == 1  # refused: no authorization
-    output = capsys.readouterr().out
-    assert "paid execution is not authorized" in output and SECRET not in output
+    # A paid run needs the authorized commit first: refused before anything else is looked at.
+    assert lt.main(["run", "--live", *prices, *env]) == 2
+    captured = capsys.readouterr()
+    assert "authorize-head" in captured.err and SECRET not in captured.out + captured.err
     assert lt.main(["run", "--live", "--authorize-head=" + "0" * 40, *prices, *env]) == 2
 
 
