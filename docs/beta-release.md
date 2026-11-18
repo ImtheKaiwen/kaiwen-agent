@@ -1,9 +1,9 @@
 # First beta: release preparation
 
-Status: prepared, not published. Nothing in this document has been released, tagged or uploaded. The actual
-release needs a separate authorization.
+Status: the release preparation of `0.8.0b1`. The GitHub Release is the record of what was published, with its
+files and hashes; this document is the plan and the limits that came with it.
 
-## Proposed version and channel
+## Version and channel
 
 - Python version: `0.8.0b1` (PEP 440; the previous tag is `v0.7.0a1`, and `scripts/check_release.py` accepts
   `a`, `b` and `rc` suffixes). Git tag: `v0.8.0b1`, created manually after verification, as in
@@ -12,8 +12,7 @@ release needs a separate authorization.
   attached. Not PyPI and not npm: the `Release packages` workflow publishes to registries and is not part of
   this beta. The npm packages (`@imthekaiwen/agent-protocol`, `@imthekaiwen/agent-ui`) are not part of the
   coding-team beta and are not released with it.
-- The version is not bumped in the repository yet. Bumping it and renaming the `Unreleased` heading of
-  `CHANGELOG.md` to `0.8.0b1` is step 1 of the checklist, in its own pull request.
+- The version bump and the `Unreleased` heading rename are step 1 of the checklist, in their own pull request.
 
 ## Supported capabilities (first beta)
 
@@ -63,18 +62,19 @@ and the example was run (see the quick start for what was verified and what was 
 
 ## Release checklist
 
-Each step after 1 needs the release authorization.
-
-1. Pull request: set `version = "0.8.0b1"` in `pyproject.toml`, rename `## Unreleased` in `CHANGELOG.md` to
-   `## 0.8.0b1`, run `python scripts/check_release.py metadata`, merge once the `CI gate` passes.
-2. From the merge commit on `main`, take the `python-dist` artifact of its CI run (the package job builds it,
-   runs `twine check --strict` and `check_release.py dist`, and installs both files into clean environments).
-   Do not rebuild locally for the release.
-3. Verify: the wheel and sdist names carry `0.8.0b1`; compute `sha256sum` and write `SHA256SUMS`; install the
+1. Pull request: set `version = "0.8.0b1"` and the `4 - Beta` classifier in `pyproject.toml`, rename `## Unreleased`
+   in `CHANGELOG.md` to `## 0.8.0b1`, run `python scripts/check_release.py metadata`, merge once the exact head passes
+   every check, then confirm the post-merge CI of `main` (the release commit).
+2. Before the tag exists: confirm the tag is absent; take the `python-dist` artifact of the CI run of the release
+   commit (the package job builds it, runs `twine check --strict` and `check_release.py dist`, and installs both files
+   into clean environments). Do not rebuild locally for the release.
+3. Verify from the exact release commit: the file names carry `0.8.0b1`; metadata and archive integrity; install the
    wheel into a clean Python 3.11+ virtual environment; `pip check`; run
-   `examples/coding-team-acceptance/main.py` from a checkout of the tag; run the `--docker` scenarios where an
-   engine is available.
-4. Create the tag `v0.8.0b1` on that commit and a GitHub Pre-release (the pre-release flag set) with the two
-   files, `SHA256SUMS` and the release notes above.
-5. Re-run the quick start from the published release in a clean environment; record the result.
-6. Versions are immutable: if anything is wrong after publishing, release `0.8.0b2`; never replace files.
+   `examples/coding-team-acceptance/main.py` from a checkout of the release commit; run the `--docker` scenarios where
+   an engine is available; compute `sha256sum` and write `SHA256SUMS`.
+4. Create the tag `v0.8.0b1` on that commit and a GitHub Pre-release (pre-release flag set) with the two files,
+   `SHA256SUMS` and the release notes above.
+5. After the tag exists: download the published files and compare them with `SHA256SUMS`; install the published wheel
+   into a clean environment and run the quick start from a checkout of the tag; record the result.
+6. Versions are immutable: if anything is wrong after publishing, report it and release `0.8.0b2`; never replace
+   or overwrite published files or the tag.

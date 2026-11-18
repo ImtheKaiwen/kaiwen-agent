@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kaiwen-agent"
-version = "0.7.0a1"
+version = "0.8.0b1"
 description = "Provider-neutral asynchronous agent runtime"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,7 +12,7 @@ license = { text = "MIT" }
 authors = [{ name = "Kaiwen" }]
 keywords = ["agent", "ai", "asyncio", "openai", "tools"]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 4 - Beta",
   "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
