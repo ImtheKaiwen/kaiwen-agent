@@ -40,6 +40,9 @@ npm install @imthekaiwen/agent-protocol @imthekaiwen/agent-ui
 Optional Python extras: `openai-live`, `gemini`, `ollama`, `postgres-memory`,
 `redis`.
 
+To try the coding-team preview (beta, deterministic, no credentials) from a source checkout, follow
+[`docs/quickstart-coding-team.md`](https://github.com/ImtheKaiwen/kaiwen-agent/blob/main/docs/quickstart-coding-team.md).
+
 ## Python quickstart
 
 ```python
