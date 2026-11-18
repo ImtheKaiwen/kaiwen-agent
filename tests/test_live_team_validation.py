@@ -761,6 +761,8 @@ def test_a_redirect_in_the_configuration_mapping_is_refused_before_a_paid_run_se
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    # The commit check comes first for a real client; it passes here, so the endpoint guard runs.
+    monkeypatch.setattr(lt, "verify_authorized_commit", lambda *a, **k: None)
     wire = WireRecorder(monkeypatch)
     environ = {"OPENAI_API_KEY": SECRET, "OPENAI_BASE_URL": REDIRECT}
     report = asyncio.run(lt.run_team(config(), sandbox_factory=standin, environ=environ))

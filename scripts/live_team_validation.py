@@ -236,6 +236,9 @@ class TeamReport:
     not_started: list[str] = field(default_factory=list)
     # True when the per-role counters add up to the run totals (requests and reported tokens).
     attribution_reconciled: bool | None = None
+    # The commit this run verified (at exactly that commit, clean tree) before a billable request.
+    # None when nothing was verified, e.g. an offline fake client; never filled in from a guess.
+    verified_commit: str | None = None
     verdict: str = "NOT_RUN"
 
     def finish(self) -> None:
@@ -271,6 +274,8 @@ class Authorization:
     model: str
     max_usd: float
     scenarios: tuple[str, ...]
+    # The full commit the operator authorized. A billable run verifies it (see `run_team`).
+    head: str | None = None
 
     def covers(self, config: TeamConfig) -> str | None:
         """None when the run is exactly what was authorized, otherwise why it is refused."""
@@ -643,8 +648,17 @@ def judge(
         return "PASS", "completed with every role on record, gate-verified evidence and acceptance"
     if completed:
         return "FAIL", "INVARIANT VIOLATION: a negative scenario was completed"
-    if status not in {WorkflowOutcomeStatus.BLOCKED, WorkflowOutcomeStatus.FAILED}:
+    if status is WorkflowOutcomeStatus.FAILED:
+        # An execution failure, not a gate decision: nothing here shows a delivery that was
+        # evaluated and blocked, whatever reason code accompanies it.
+        return "INCONCLUSIVE", f"the workflow failed, it was not blocked: {result.outcome.reason}"
+    if status is not WorkflowOutcomeStatus.BLOCKED:
         return "INCONCLUSIVE", f"unexpected outcome {status.value}"
+    if result.run_status != "blocked":
+        return "FAIL", (
+            "the outcome is blocked but the durable run status is "
+            f"{result.run_status!r}, not 'blocked'"
+        )
     if not mine:
         return "INCONCLUSIVE", "the Tester never ran the command, so nothing was tested"
     tester = participation_problems(result, roles)["tester"]
@@ -713,6 +727,19 @@ async def run_team(
         report.finish()
         return report
     report.authorization = asdict(config.authorization) if config.authorization else None
+    if _bills(client):
+        # Every route that can bill (the client the harness builds, or an injected provider
+        # client) is held to the same commit authorization as the command line, before anything
+        # is built or sent. Offline test fakes are not provider clients and need none.
+        head = config.authorization.head if config.authorization else None
+        refusal = verify_authorized_commit(head)
+        if refusal is not None:
+            report.failure = f"refused: {refusal}"
+            report.billing_note = "no request was sent"
+            report.estimated_cost_usd = 0.0
+            report.finish()
+            return report
+        report.verified_commit = head.strip() if head else None
     started = time.monotonic()
     ledger = lv.Ledger(config.limits, config.pricing)
     try:
@@ -742,6 +769,12 @@ async def run_team(
     report.elapsed_seconds = round(time.monotonic() - started, 2)
     report.finish()
     return report
+
+
+def _bills(client: Any | None) -> bool:
+    """True when the run would use a real provider client: none injected, or an `openai` one."""
+
+    return client is None or type(client).__module__.split(".")[0] == "openai"
 
 
 def _refusal(config: TeamConfig) -> str | None:
@@ -1081,6 +1114,7 @@ def config_from(arguments: argparse.Namespace) -> TeamConfig:
             scenarios=tuple(
                 item for item in (arguments.authorize_scenarios or "").split(",") if item
             ),
+            head=(getattr(arguments, "authorize_head", None) or "").strip() or None,
         )
     scenarios = tuple(item for item in arguments.scenarios.split(",") if item)
     max_requests = (

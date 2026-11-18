@@ -243,6 +243,8 @@ compile check and no test run the gate rejects the delivery for its missing requ
 (`rejected_by: completion_gate`); the team-acceptance check `evidence_not_gate_verified` is exercised only by the
 offline `docker_unrelated_evidence` scenario, not by this live scenario.
 
+Programmatic entry: `run_team` itself applies the same commit check (the authorization's `head`) whenever the run would use a real provider client, whether the harness builds it or a caller injects an `openai` client, before anything is built or sent; only offline test fakes skip it. A report records the checked commit in `verified_commit` (null when nothing was verified; earlier reports have no such field). A negative scenario passes only when the outcome is `blocked` and the durable run status is `blocked`; a `failed` workflow is `INCONCLUSIVE` even with a gate reason code.
+
 Settlement: the response of a provider is not trusted. Missing or unreadable usage is charged at the request's own
 worst-case estimate; usage that is present but invalid (not an integer, negative, a boolean, not finite, above
 10^9 tokens, unpriceable) is charged the same way and stops the run; a malformed `output` or an error while
