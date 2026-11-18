@@ -178,28 +178,33 @@ smoke on `gpt-5.4-mini` in a Docker sandbox, a passing and a deliberately broken
 signed evidence authenticated and the gate completing or blocking as expected, at about $0.002 per
 scenario. These calls are not repeated here.
 
-Unverified for a real multi-role workflow: a real model driving the Lead proposal tools, the review
+Shown live once (second run, below) for one positive scenario; still unverified beyond that run: a real model driving the Lead proposal tools, the review
 tool (`review.submit` strict schema), and the model citing real evidence references; a real model
 inside the full controller with delegation and acceptance; provider error behavior across several
 roles; token and cost totals for a multi-task run.
 
-Prepared by M6.4-B, not executed: `python scripts/live_validation.py team-plan` is an offline command
-(no model, no key, no Docker) that builds the exact tool schemas of the model-driven roles (`lead.view`,
-`lead.propose_task`, `review.submit`, `testing.run`), checks strict tool-calling compatibility (an open
-object in a strict schema blocks the plan; `testing.run` is sent non-strict because of its free-form
-parameters mapping, with the host's own argument validation unchanged), computes the request ceiling
-(about nine model requests per delivery, so 18 for the proposed `docker_accepted` and
-`docker_failing_tests`) and the worst-case spend for the prices you pass, and prints the authorization
-request. With the prices recorded in `docs/live-validation.md` ($0.75 and $4.50 per million tokens) and
-the defaults (24 requests, 8000 input and 1500 output tokens per request, $0.50 budget) the worst case is
-$0.306 and the plan is `READY_FOR_AUTHORIZATION_REQUEST`; without prices it is `NOT_READY`. The example's
-`model_factory` argument is the seam a live harness would use to put a real provider behind the same team.
-The live team harness itself (a guarded client, the request ledger and the report) is not implemented.
+Provided by M6.4-C: `python scripts/live_team_validation.py` (see
+`docs/live-validation.md`, "Multi-role team validation"). `preflight` checks the key, authentication
+and model availability without generating anything, `plan` is offline and prints the authorization
+request (request ceiling, worst-case spend, tool-schema strictness), and `run --live` needs an exact,
+separate authorization (model, maximum spend, scenarios). The real Lead, second Lead, Tester and
+Reviewer are model calls; the Coder stays a host function; `testing.run` runs only in the pinned Docker
+container; a missing engine or image fails closed before any model request. The harness is validated
+offline with a deterministic fake provider through the real composition, which is not evidence that a
+live provider behaves the same way. Two authorized billed runs were made, each with a separate explicit authorization. The first (2026-11-17,
+`gpt-5.4-mini`, about $0.023 by reported usage, commit `35c3ded`) was INCONCLUSIVE: the negative scenario
+passed live, while the accepted scenario's Lead task failed for a cause the report could not capture, and the
+harness defects it exposed were corrected offline. The second (2026-11-18, commit
+`2b4d6e228c26ff7478a56a767aec43c945c5200a`, `LIVE_ACCEPTED` only, about $0.0185 by reported usage) PASSED, judged
+from host records. Costs are provider-reported estimates, not billing records. Later hardening (R5) is not itself
+live-validated. One successful positive scenario on one model and one tiny project does not show reliability, and
+the Reviewer is a prompted model whose recommendation the brief directs. The reviews of this work were by models of
+the same family as the author and are not author-independent.
 
-Proposed authorization request for a future live run (not made, nothing billed): provider OpenAI,
-model `gpt-5.4-mini`, scenarios `docker_accepted` and `docker_failing_tests`, at most 24 requests,
-$0.50 maximum spend, no retries, redacted report only. A live run needs explicit operator authorization
-naming the model and the maximum spend.
+Limitation of commit pinning: the authorized-commit check (exact commit, clean tree, this checkout's package)
+is guaranteed for the supported command-line path. `run_team` repeats it for the client the harness builds and
+for an injected `openai` client, but an arbitrary Python wrapper injected by a caller is an unsupported test
+seam that the harness cannot recognize as billable; no protection is claimed there.
 
 A future manual validation (a separate run that requires explicit operator authorization and a stated
 maximum cost) should specify:
@@ -228,7 +233,7 @@ maximum cost) should specify:
 | --- | --- | --- |
 | Installation and configuration | PARTIAL | `pip install -e .` runs the example; no setup guide for a real consumer beyond the examples |
 | Coding workflow composition | READY (deterministic) | the example and its tests run the full team through the real stack |
-| Provider compatibility | PARTIAL | one model, single-worker, manual smoke; multi-role not validated live; offline strict-schema check and authorization plan prepared |
+| Provider compatibility | PARTIAL | one model, single-worker, manual smoke; multi-role validated live once for the accepted path only (second live run, commit `2b4d6e2`); one model, one tiny project |
 | Tool permissions | READY | deny-by-default, per-role permissions, covered by tests |
 | Sandbox execution | PARTIAL | the multi-role team composes `DockerSandboxRunner` (M6.4-B); its container tests run only on Linux CI, so the real-container evidence is the exact-head CI result |
 | Evidence verification | READY | signed, run- and fingerprint-scoped; gate-verified citations enforced |
@@ -238,7 +243,7 @@ maximum cost) should specify:
 | Diagnostics and error reporting | PARTIAL | stable codes, no secrets; no unified operator view across roles |
 | Documentation | PARTIAL | this guide and the workflow docs; no consumer quick start for a team |
 | Packaging | PARTIAL | wheel and sdist build and check in CI; the example is not part of the wheel |
-| Live multi-role validation | NOT IMPLEMENTED | the harness and any billed run are future work |
+| Live multi-role validation | PARTIAL | first live run INCONCLUSIVE (negative scenario PASS); second live run `LIVE_ACCEPTED` PASS at `2b4d6e2` (one run, one model); R5 hardening not live-validated |
 | Out of scope | not started | distributed execution, gateway, speech, UI, production deployment, release |
 | Not implemented | missing | approval-required delegation, a first-party approval store, general resume, model-driven edits with approvals inside a team |
 
@@ -246,8 +251,4 @@ No claim of production readiness is made.
 
 ## Recommended next milestone
 
-After M6.4-B is independently audited: M6.4-C, a live multi-role harness built on the `model_factory`
-seam and the existing guarded client, ledger and redacted report of `scripts/live_validation.py`, run
-only after a separate explicit authorization with a stated maximum spend (see the proposed request
-above). It is the smallest step that closes the remaining PARTIAL item (multi-role provider behavior)
-with real evidence without adding architecture.
+The beta closeout. The accepted path was shown once (second live run, commit `2b4d6e2`); the later R5 and final corrections were verified offline and by CI only, and were not live-validated. Any further live run needs its own separate authorization.

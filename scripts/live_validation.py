@@ -90,6 +90,7 @@ from kaiwen_agent.workflow import (
 ROOT = Path(__file__).parents[1]
 DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"
 DEFAULT_OLLAMA_MODEL = "qwen2.5-coder:7b"
+OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_IMAGE = "python@sha256:e064671ca452259bab50e8e2c7bd896e39e9a343bb06ca25234adf6fe18d0fc7"
 # Assumed list prices in USD per million tokens. They are deliberately generous placeholders,
 # not a statement of the provider's current price: override them with --price-* after
@@ -168,7 +169,11 @@ def sanitize_error(
     if status is None:
         status = _safe_status(getattr(getattr(error, "response", None), "status_code", None))
     code = _safe_token(getattr(error, "code", None))
-    if "APITimeoutError" in names or "TimeoutException" in names or isinstance(error, TimeoutError):
+    if isinstance(error, asyncio.CancelledError):
+        category, stage = "cancelled", "cancelled"
+    elif (
+        "APITimeoutError" in names or "TimeoutException" in names or isinstance(error, TimeoutError)
+    ):
         category, stage = "timeout", "transport_failure"
     elif names & {"APIConnectionError", "ConnectError", "NetworkError", "TransportError"}:
         category, stage = "connection", "transport_failure"
@@ -247,9 +252,50 @@ def worst_case_cost(limits: Limits, pricing: Pricing) -> float:
     return limits.max_requests * pricing.cost(limits.max_input_tokens, limits.max_output_tokens)
 
 
+# No honest request reports more tokens than this; anything above it is not a token count.
+MAX_PLAUSIBLE_TOKENS = 10**9
+
+
+def _is_plausible_count(value: Any) -> bool:
+    return type(value) is int and 0 <= value <= MAX_PLAUSIBLE_TOKENS
+
+
+def _plain_count(value: Any) -> int:
+    return value if type(value) is int and value >= 0 else 0
+
+
+@dataclass(slots=True)
+class Reservation:
+    """The worst-case cost of one request that is in flight. Each request owns exactly one."""
+
+    estimate: float
+    role: str | None = None
+    open: bool = True
+
+
+@dataclass(slots=True)
+class RoleLedger:
+    """What the shared ledger attributed to one role. Counted per request, never by comparing the
+    run-wide counters before and after a call, so roles that overlap in time cannot double count."""
+
+    requests: int = 0
+    responses: int = 0
+    usage_responses: int = 0
+    failed: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
 @dataclass(slots=True)
 class Ledger:
-    """Local usage accounting shared by every request of one manually triggered run."""
+    """Local usage accounting shared by every request of one manually triggered run.
+
+    Requests may overlap. Each admitted request holds a `Reservation` (its worst-case cost) until
+    it settles, admission counts every reservation still in flight, and a request settles exactly
+    once: with its reported usage, or at its worst-case estimate when the usage is unknown (a
+    failure, a response without usage, a cancellation). Once the run has stopped, nothing more is
+    admitted.
+    """
 
     limits: Limits
     pricing: Pricing
@@ -265,38 +311,94 @@ class Ledger:
     # Budget accounting: reported cost, plus the pessimistic pre-request estimate for any
     # attempt whose usage is unknown (failed or usage-less), so unknown is never treated as zero.
     spent_usd: float = 0.0
+    # The worst-case cost of the requests in flight right now.
+    reserved_usd: float = 0.0
     scenario_tool_calls: int = 0
     abort_reason: str | None = None
+    # Set by a failed or cancelled request: the run is over, whatever the limits still allow.
+    stop_reason: str | None = None
     request_seconds: float = 0.0
     guard_failures: int = 0
     errors: list[SafeError] = field(default_factory=list)
-    _pending: float = 0.0
+    roles: dict[str, RoleLedger] = field(default_factory=dict)
+    _open: list[Reservation] = field(default_factory=list)
 
-    def before(self, estimated_input_tokens: int) -> None:
+    def before(self, estimated_input_tokens: int, role: str | None = None) -> Reservation:
+        if self.abort_reason:
+            raise LimitExceeded(self.abort_reason)
+        if self.stop_reason:
+            raise LimitExceeded(self.stop_reason)
         if self.requests >= self.limits.max_requests:
             self._abort("request limit reached")
         if estimated_input_tokens > self.limits.max_input_tokens:
             self._abort("input token limit exceeded")
-        projected = self.spent_usd + self.pricing.cost(
-            estimated_input_tokens, self.limits.max_output_tokens
-        )
+        cost = self.pricing.cost(estimated_input_tokens, self.limits.max_output_tokens)
+        projected = self.spent_usd + self.reserved_usd + cost
         # Written so that a NaN projection fails the comparison and is refused, never accepted.
         if not projected <= self.limits.budget_usd:
             self._abort("budget estimate exceeded")
         self.requests += 1
-        self._pending = self.pricing.cost(estimated_input_tokens, self.limits.max_output_tokens)
+        reservation = Reservation(cost, role)
+        self._open.append(reservation)
+        self.reserved_usd = sum(item.estimate for item in self._open)
+        if role is not None:
+            self.roles.setdefault(role, RoleLedger()).requests += 1
+        return reservation
 
-    def record_failure(self, error: BaseException) -> None:
-        """A transport or HTTP failure at the guarded client; usage is unknown."""
+    def _settle(self, reservation: Reservation | None) -> Reservation | None:
+        """The request's own reservation, closed; None when it was already settled.
 
+        A caller without one (legacy, single request at a time) gets the newest open reservation.
+        """
+        if reservation is None:
+            reservation = next((item for item in reversed(self._open) if item.open), None)
+            reservation = reservation or Reservation(0.0)
+        elif not reservation.open:
+            return None  # a request settles exactly once
+        if reservation.open:
+            reservation.open = False
+            self._open = [item for item in self._open if item.open]
+            self.reserved_usd = sum(item.estimate for item in self._open)
+        return reservation
+
+    def _role(self, reservation: Reservation) -> RoleLedger | None:
+        return (
+            None
+            if reservation.role is None
+            else self.roles.setdefault(reservation.role, RoleLedger())
+        )
+
+    def counters(self, role: str | None) -> tuple[int, int, int]:
+        """(attempts, failures, responses) of one role, or of the whole run when `role` is None."""
+
+        if role is None:
+            return self.requests, self.guard_failures, self.responses
+        mine = self.roles.get(role, RoleLedger())
+        return mine.requests, mine.failed, mine.responses
+
+    def record_failure(self, error: BaseException, reservation: Reservation | None = None) -> None:
+        """A transport failure, an HTTP failure or a cancellation at the guarded client.
+
+        The usage is unknown, so the request is charged at its own worst-case estimate."""
+
+        settled = self._settle(reservation)
+        if settled is None:
+            return
+        reservation = settled
         self.guard_failures += 1
-        self.spent_usd += self._pending
+        self.spent_usd += reservation.estimate
+        mine = self._role(reservation)
+        if mine is not None:
+            mine.failed += 1
+        self.stop_reason = self.stop_reason or "run stopped after a failed request"
         if len(self.errors) < 5:
             self.errors.append(sanitize_error(error, attempt=self.requests))
 
     def note_exception(self, error: BaseException, *, attempted: bool, received: bool) -> None:
         """A failure outside the client call: before transport, or after a good response."""
 
+        # A failed request, wherever it failed: the run is over, for every role.
+        self.stop_reason = self.stop_reason or "run stopped after a failed request"
         if len(self.errors) >= 5:
             return
         base = sanitize_error(error, attempt=self.requests, model_response_received=received)
@@ -318,27 +420,77 @@ class Ledger:
 
     def after(
         self,
-        input_tokens: int | None,
-        output_tokens: int | None,
-        tool_calls: int,
-        seconds: float,
+        input_tokens: Any,
+        output_tokens: Any,
+        tool_calls: Any,
+        seconds: Any,
+        reservation: Reservation | None = None,
     ) -> None:
+        """Settle a request that was answered. The arguments are whatever the provider reported,
+        so nothing here is trusted: everything that could raise is computed first, the
+        bookkeeping that follows cannot fail, and the reservation is closed before either."""
+
+        settled = self._settle(reservation)
+        if settled is None:
+            return
+        reservation = settled
+        reported, untrusted = self._reported_cost(input_tokens, output_tokens)
+        calls = _plain_count(tool_calls)
+        elapsed = (
+            float(seconds)
+            if isinstance(seconds, (int, float))
+            and not isinstance(seconds, bool)
+            and math.isfinite(seconds)
+            and seconds >= 0
+            else 0.0
+        )
+        mine = self._role(reservation)
         self.responses += 1
-        if input_tokens is None or output_tokens is None:
-            self.spent_usd += self._pending
+        if mine is not None:
+            mine.responses += 1
+        if reported is None:
+            # Unknown billing is never free: the request is charged its own worst case. Usage
+            # that was reported but cannot be believed also ends the run, because the budget
+            # arithmetic can no longer be trusted.
+            self.spent_usd += reservation.estimate
+            if untrusted:
+                self.stop_reason = self.stop_reason or "usage reported by the provider is untrusted"
         else:
-            cost = self.pricing.cost(input_tokens, output_tokens)
+            cost, used_input, used_output = reported
             self.usage_responses += 1
-            self.input_tokens += input_tokens
-            self.output_tokens += output_tokens
+            self.input_tokens += used_input
+            self.output_tokens += used_output
             self.reported_usd += cost
             self.spent_usd += cost
-        self.request_seconds += seconds
-        self.scenario_tool_calls += tool_calls
+            if mine is not None:
+                mine.usage_responses += 1
+                mine.input_tokens += used_input
+                mine.output_tokens += used_output
+        self.request_seconds += elapsed
+        self.scenario_tool_calls += calls
         if self.scenario_tool_calls > self.limits.max_tool_calls:
             self._abort("tool-call limit exceeded")
         if self.spent_usd > self.limits.budget_usd:
             self._abort("budget exceeded after the request")
+
+    def _reported_cost(
+        self, input_tokens: Any, output_tokens: Any
+    ) -> tuple[tuple[float, int, int] | None, bool]:
+        """((cost, input, output), False) for usable usage; (None, False) when none was reported;
+        (None, True) when something was reported that cannot be trusted."""
+
+        reported = [value for value in (input_tokens, output_tokens) if value is not None]
+        if any(not _is_plausible_count(value) for value in reported):
+            return None, True
+        if len(reported) < 2:
+            return None, False
+        try:
+            cost = self.pricing.cost(input_tokens, output_tokens)
+        except Exception:  # noqa: BLE001 - an unpriceable usage is untrusted, whatever the cause
+            return None, True
+        if not (isinstance(cost, (int, float)) and math.isfinite(cost) and cost >= 0):
+            return None, True
+        return (float(cost), int(input_tokens), int(output_tokens)), False
 
     def _abort(self, reason: str) -> None:
         self.abort_reason = reason
@@ -351,41 +503,58 @@ def estimate_tokens(request: Mapping[str, Any]) -> int:
     return len(json.dumps(request, default=str, ensure_ascii=False)) // 3 + 1
 
 
+_UNREADABLE = object()  # stands for usage that could not even be read
+
+
 class _GuardedResponses:
-    def __init__(self, inner: Any, ledger: Ledger) -> None:
+    def __init__(self, inner: Any, ledger: Ledger, role: str | None = None) -> None:
         self._inner = inner
         self._ledger = ledger
+        self._role = role
 
     async def create(self, **request: Any) -> Any:
         request["store"] = False
         request["max_output_tokens"] = self._ledger.limits.max_output_tokens
-        self._ledger.before(estimate_tokens(request))
+        reservation = self._ledger.before(estimate_tokens(request), self._role)
         started = time.monotonic()
         try:
             response = await self._inner.responses.create(**request)
-        except Exception as error:
-            self._ledger.record_failure(error)
+        except BaseException as error:  # noqa: BLE001 - a cancelled request may still be billed
+            self._ledger.record_failure(error, reservation)
             raise
-        usage = getattr(response, "usage", None)
-        calls = sum(
-            1
-            for item in getattr(response, "output", [])
-            if getattr(item, "type", None) == "function_call"
-        )
+        # The response is whatever the provider sent: read it defensively, and settle the
+        # reservation whatever it holds. Unreadable usage is untrusted, never zero.
+        try:
+            usage = getattr(response, "usage", None)
+            reported_input = getattr(usage, "input_tokens", None)
+            reported_output = getattr(usage, "output_tokens", None)
+        except Exception:  # noqa: BLE001 - a response that cannot be read is untrusted usage
+            reported_input = reported_output = _UNREADABLE
+        try:
+            calls = sum(
+                1
+                for item in getattr(response, "output", None) or ()
+                if getattr(item, "type", None) == "function_call"
+            )
+        except Exception:  # noqa: BLE001 - a malformed output simply holds no counted call
+            calls = 0
         self._ledger.after(
-            _optional_count(getattr(usage, "input_tokens", None)),
-            _optional_count(getattr(usage, "output_tokens", None)),
+            reported_input,
+            reported_output,
             calls,
             time.monotonic() - started,
+            reservation,
         )
         return response
 
 
 class GuardedOpenAIClient:
-    """The `responses.create` surface the provider uses, with limits and accounting."""
+    """The `responses.create` surface the provider uses, with limits and accounting.
 
-    def __init__(self, inner: Any, ledger: Ledger) -> None:
-        self.responses = _GuardedResponses(inner, ledger)
+    `role` names the one role every request through this client is attributed to."""
+
+    def __init__(self, inner: Any, ledger: Ledger, role: str | None = None) -> None:
+        self.responses = _GuardedResponses(inner, ledger, role)
 
 
 class GuardedOllamaClient:
@@ -404,12 +573,12 @@ class GuardedOllamaClient:
             "num_ctx": self._context_tokens,
             "temperature": 0,
         }
-        self._ledger.before(estimate_tokens(request))
+        reservation = self._ledger.before(estimate_tokens(request))
         started = time.monotonic()
         try:
             response = await self._inner.chat(**request)
-        except Exception as error:
-            self._ledger.record_failure(error)
+        except BaseException as error:  # noqa: BLE001 - a cancelled request may still be billed
+            self._ledger.record_failure(error, reservation)
             raise
         raw = _as_mapping(response)
         message = _as_mapping(raw.get("message", {}))
@@ -422,6 +591,7 @@ class GuardedOllamaClient:
             output_tokens,
             calls,
             time.monotonic() - started,
+            reservation,
         )
         return response
 
@@ -434,26 +604,30 @@ class DiagnosticProvider:
     had been received, plus the exception class name.
     """
 
-    def __init__(self, inner: Any, ledger: Ledger) -> None:
+    def __init__(self, inner: Any, ledger: Ledger, role: str | None = None) -> None:
         self._inner = inner
         self._ledger = ledger
+        self._role = role
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
 
     async def respond(self, *args: Any, **kwargs: Any) -> Any:
+        # The counters of this role only: another role's requests, failures and responses must
+        # never decide how this role's exception is classified.
         ledger = self._ledger
-        attempts, failures, responses = ledger.requests, ledger.guard_failures, ledger.responses
+        attempts, failures, responses = ledger.counters(self._role)
         try:
             return await self._inner.respond(*args, **kwargs)
         except LimitExceeded:
             raise
         except Exception as error:
-            if ledger.guard_failures == failures:
+            now_attempts, now_failures, now_responses = ledger.counters(self._role)
+            if now_failures == failures:
                 ledger.note_exception(
                     error,
-                    attempted=ledger.requests > attempts,
-                    received=ledger.responses > responses,
+                    attempted=now_attempts > attempts,
+                    received=now_responses > responses,
                 )
             raise
 
@@ -789,17 +963,40 @@ def _account(report: Report, ledger: Ledger, config: Config) -> None:
         )
 
 
+def endpoint_is_overridden(*environments: Mapping[str, str]) -> bool:
+    """True when any environment redirects the OpenAI SDK away from the official endpoint.
+
+    The SDK reads `OPENAI_BASE_URL` when no `base_url` is given. A credential must never follow
+    it, so the validation paths pin the endpoint and refuse a different one before any request.
+    The value is never echoed: it may itself carry a secret.
+    """
+
+    return any(
+        value and value.rstrip("/") != OPENAI_BASE_URL
+        for value in (environment.get("OPENAI_BASE_URL") for environment in environments)
+    )
+
+
+def openai_client(api_key: str, *, timeout: float, environment: Mapping[str, str]) -> Any:
+    """The one real OpenAI client of the validation paths: official endpoint only, no retries."""
+
+    if endpoint_is_overridden(environment, os.environ):
+        raise HarnessError("OPENAI_BASE_URL points away from the official OpenAI endpoint")
+    from openai import AsyncOpenAI
+
+    # `base_url` is explicit, so the SDK never consults the environment for it. No hidden
+    # retries: every request is counted by the ledger.
+    return AsyncOpenAI(api_key=api_key, base_url=OPENAI_BASE_URL, timeout=timeout, max_retries=0)
+
+
 def _real_client(config: Config, environment: Mapping[str, str]) -> Any:
     if config.provider == "openai":
         if not environment.get("OPENAI_API_KEY"):
             raise HarnessError("OPENAI_API_KEY is not configured")
-        from openai import AsyncOpenAI
-
-        # No hidden retries: every request is counted by the ledger.
-        return AsyncOpenAI(
-            api_key=environment["OPENAI_API_KEY"],
+        return openai_client(
+            environment["OPENAI_API_KEY"],
             timeout=config.limits.request_timeout,
-            max_retries=0,
+            environment=environment,
         )
     try:
         from ollama import AsyncClient  # type: ignore[import-not-found]
@@ -1292,6 +1489,9 @@ TEAM_SCENARIOS = ("docker_accepted", "docker_failing_tests")
 # Model requests one team delivery is expected to need: Lead (view, propose, finish), second Lead
 # (propose, finish), Tester (call, finish), Reviewer (submit, finish). A ceiling, not a guarantee.
 TEAM_REQUESTS_PER_DELIVERY = 9
+# The most one delivery can validly need: a Lead that proposes one task per response (view, three
+# proposals, final answer = 5), the second Lead (2), the Tester (2) and the Reviewer (2).
+TEAM_MAX_REQUESTS_PER_DELIVERY = 11
 
 
 def probe_team_tools() -> list[dict[str, Any]]:
@@ -1314,21 +1514,30 @@ def probe_team_tools() -> list[dict[str, Any]]:
     return tools + [tool for tool in probe_openai_tools() if tool["name"] in used]
 
 
-def team_plan(limits: Limits, pricing: Pricing, model: str) -> dict[str, Any]:
+def team_plan(
+    limits: Limits,
+    pricing: Pricing,
+    model: str,
+    scenarios: tuple[str, ...] = TEAM_SCENARIOS,
+) -> dict[str, Any]:
     """The offline readiness assessment and authorization request for a live team run."""
 
     limits.validate()  # a non-finite or invalid limit never yields an authorization-ready plan
     pricing.validate()
     tools = probe_team_tools()
     issues = [issue for tool in tools for issue in strict_schema_issues(tool)]
-    needed = len(TEAM_SCENARIOS) * TEAM_REQUESTS_PER_DELIVERY
+    needed = len(scenarios) * TEAM_REQUESTS_PER_DELIVERY
+    maximum_valid = len(scenarios) * TEAM_MAX_REQUESTS_PER_DELIVERY
     priced = pricing.input_per_mtok > 0 and pricing.output_per_mtok > 0
     worst_case = worst_case_cost(limits, pricing) if priced else None
     blockers: list[str] = []
     if issues:
         blockers.append("a strict tool schema contains an open object")
-    if limits.max_requests < needed:
-        blockers.append(f"max_requests {limits.max_requests} is below the {needed} the plan needs")
+    if limits.max_requests < maximum_valid:
+        blockers.append(
+            f"max_requests {limits.max_requests} is below the {maximum_valid} a valid delivery "
+            "can need (a Lead that proposes one task per response)"
+        )
     if not priced:
         blockers.append("prices were not provided, so the worst-case spend is unknown")
     elif worst_case is not None and worst_case > limits.budget_usd:
@@ -1337,18 +1546,19 @@ def team_plan(limits: Limits, pricing: Pricing, model: str) -> dict[str, Any]:
         "verdict": "READY_FOR_AUTHORIZATION_REQUEST" if not blockers else "NOT_READY",
         "executed": False,
         "model": model,
-        "scenarios": list(TEAM_SCENARIOS),
+        "scenarios": list(scenarios),
         "roles": ["lead", "lead2", "tester", "reviewer"],
         "tools": {str(tool["name"]): bool(tool["strict"]) for tool in tools},
         "strict_schema_issues": issues,
         "limits": asdict(limits),
         "expected_requests": needed,
+        "maximum_valid_requests": maximum_valid,
         "worst_case_cost_usd": worst_case,
         "blockers": blockers,
         "authorization_request": {
             "provider": "openai",
             "model": model,
-            "scenarios": list(TEAM_SCENARIOS),
+            "scenarios": list(scenarios),
             "maximum_spend_usd": limits.budget_usd,
             "maximum_requests": limits.max_requests,
             "retries": "none",

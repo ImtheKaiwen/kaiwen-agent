@@ -553,6 +553,7 @@ async def run_scenario(
     docker_config: DockerSandboxConfig | None = None,
     sandbox_factory: Callable[[WorkspaceFilesystem], Any] | None = None,
     model_factory: Callable[[str, list[Any]], Any] | None = None,
+    max_steps: int = 4,
 ) -> Result:
     """Compose the team from public platform interfaces and run one delivery to its outcome.
 
@@ -566,7 +567,8 @@ async def run_scenario(
     runner (the platform still refuses a runner that does not declare isolation). `model_factory`
     receives a role name and that role's scripted steps and returns the model object for the role:
     the seam a future, separately authorized live run would use to put a real provider behind the
-    same team. Nothing else about the composition, the tools or the requirements changes.
+    same team. `max_steps` bounds the model steps of every task. Nothing else about the
+    composition, the tools or the requirements changes.
     """
 
     root = directory / "project"
@@ -665,7 +667,7 @@ async def run_scenario(
             tools=tools,
             permissions=permissions,
             tool_executor=ToolExecutor(action_intent_store=store),
-            max_steps=4,
+            max_steps=max_steps,
         )
 
     # ---- roles: Lead (delegation), Coder (host edit), Tester, Reviewer -----------------------

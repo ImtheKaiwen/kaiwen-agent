@@ -172,6 +172,105 @@ What this does and does not show:
 - The harness honors the OpenAI SDK's own environment (for example a custom base URL). Do not
   run it with an untrusted environment.
 
+## Multi-role team validation (M6.4-C)
+
+`scripts/live_team_validation.py` puts real model calls behind the Lead, the second Lead, the Tester
+and the Reviewer of `examples/coding-team-acceptance`. It composes nothing itself: the example's fenced
+SQLite stack, delegation, trusted evidence pipeline, completion gate and team acceptance decide. The
+Coder stays a host function. `testing.run` runs only in `DockerSandboxRunner` (pinned digest, no
+network); a missing engine or image fails closed before any model request, with no local fallback. A
+model names only registered tools and registered command ids from fixed, host-written briefs appended to
+the registered `coding.lead`, `coding.tester` and `coding.reviewer` prompts; what a model says is never
+evidence. Briefs direct the Reviewer's recommendation, so a PASS shows that real models can drive the
+registered tool schemas and that the host's gates hold, not that the models judge code well.
+
+```bash
+python scripts/live_team_validation.py preflight --env-file .env
+python scripts/live_team_validation.py plan --price-input-per-mtok 0.75 --price-output-per-mtok 4.5
+python scripts/live_team_validation.py run --price-input-per-mtok 0.75 --price-output-per-mtok 4.5
+```
+
+A live run (billed; only after a separate explicit authorization) adds `--live` and an authorization that
+repeats the model, the maximum spend, the scenarios and the commit:
+
+```bash
+python scripts/live_team_validation.py run --live --price-input-per-mtok 0.75 --price-output-per-mtok 4.5 \
+    --authorize-model gpt-5.4-mini --authorize-max-usd 0.15 \
+    --authorize-scenarios LIVE_ACCEPTED --authorize-head <commit>
+```
+
+- `preflight` reads the key from the process environment or the one named `.env` of this repository,
+  checks its shape, and calls `models.retrieve` (not a generation, no tokens). It reports
+  `KEY_NOT_FOUND`, `KEY_MALFORMED`, `AUTHENTICATION_FAILED`, `PERMISSION_DENIED`, `MODEL_UNAVAILABLE`,
+  `QUOTA_EXHAUSTED`, `RATE_LIMITED`, `NETWORK_FAILURE`, `PROVIDER_ERROR` or `OK`. It never prints the key.
+  The account balance is not readable with an ordinary key and is always `BALANCE_UNVERIFIED`; a
+  successful model lookup is not a tool-calling check.
+- `plan` is offline. It is not ready with an open strict schema, too few requests (nine per scenario when the Lead batches its proposals, eleven when it proposes one task per response; the plan requires eleven),
+  unknown prices, or a worst case above the budget. Prices are never assumed: pass the current official
+  ones (on 2026-11-16 the OpenAI docs list `gpt-5.4-mini` at $0.75 input and $4.50 output per million
+  tokens, standard processing).
+- `run --live` additionally requires an authorization that matches the model and the scenarios with a
+  maximum spend not below the budget, is refused for a different `--authorize-head`, never retries, stops
+  at the first failure or limit, and starts no scenario after an abort.
+
+Scenarios: `LIVE_ACCEPTED` (fixed, tested in the container, reviewed, accepted), `LIVE_FAILING_TESTS`
+(the bug stays; the container run fails; never completed) and `LIVE_INVALID_EVIDENCE` (only the unrelated
+compile check exists; never completed). The verdict of each is `PASS`, `FAIL` or `INCONCLUSIVE`, derived
+from the outcome, the durable run status, the acceptance decision and the recorded evidence artifacts, never
+from model text. A negative scenario that completes is `FAIL` (an invariant violation); a run stopped by a
+limit, or where the Tester never ran, is `INCONCLUSIVE`.
+
+Authorization of a paid run: `--authorize-head` is required for every `--live` execution and must name the full
+40-character commit. Before the key is read or any request is made the script checks that the repository it
+belongs to is at exactly that commit, that the working tree has no staged, modified or untracked-but-not-ignored
+change (ignored local files such as `.env` and `.kaiwen-live/` reports do not count), and that the
+`kaiwen_agent` package that would run lives in this checkout. Anything that cannot be established (no Git, not
+a repository root, Git environment overrides, an unreadable status) refuses; dry runs and `plan` need none of this.
+
+What a PASS requires. `LIVE_ACCEPTED`: the run completed, the durable status is `completed`, team acceptance
+accepted, the host recorded `unit.tests` evidence labelled `passed`, and every role (Lead, second Lead, Tester,
+Reviewer) has a completed task record, a model request counted by the ledger, and the host's record of its
+registered tool call (`lead.propose_task` with delegation proposals, `testing.run`, `review.submit` with a review
+assessment), never the model's words; and the per-role accounting reconciles with the run total
+(`attribution_reconciled`), otherwise the scenario is `FAIL`. `LIVE_FAILING_TESTS`: the Tester's registered call
+and the `unit.tests` evidence are on record, the evidence outcome is `failed` and the container's own output
+reported failing assertions (`FAILED (failures=N)`), and the completion gate blocked with `quality_blocked`. An
+infrastructure problem that leaves a failing exit code (a Docker error, a timeout, an import error) is
+`INCONCLUSIVE`, not a PASS. Limitation: the assertion check reads the unittest summary of the project's own
+test command; it distinguishes a failing assertion from a loading error or a container fault, but it is not a
+proof that the right test failed. `LIVE_INVALID_EVIDENCE` verifies only the completion gate: with a passing
+compile check and no test run the gate rejects the delivery for its missing required test evidence
+(`rejected_by: completion_gate`); the team-acceptance check `evidence_not_gate_verified` is exercised only by the
+offline `docker_unrelated_evidence` scenario, not by this live scenario.
+
+Programmatic entry: `run_team` itself applies the same commit check (the authorization's `head`) whenever the run would use a real provider client, whether the harness builds it or a caller injects an `openai` client, before anything is built or sent; only offline test fakes skip it. A report records the checked commit in `verified_commit` (null when nothing was verified; earlier reports have no such field). A negative scenario passes only when the outcome is `blocked` and the durable run status is `blocked`; a `failed` workflow is `INCONCLUSIVE` even with a gate reason code.
+
+Settlement: the response of a provider is not trusted. Missing or unreadable usage is charged at the request's own
+worst-case estimate; usage that is present but invalid (not an integer, negative, a boolean, not finite, above
+10^9 tokens, unpriceable) is charged the same way and stops the run; a malformed `output` or an error while
+reading the response cannot leave a reservation open; each reservation settles exactly once.
+
+Stopping rule: the run stops at the first scenario that is not `PASS` (a negative scenario that is
+correctly blocked is a `PASS` and the next scenario may start), and at any abort, failed or cancelled
+request, exhausted limit or refused authorization. Scenarios that never began are listed in
+`not_started`, and the first failure's diagnostics are kept. After a failed request or an abort the ledger
+refuses every later request.
+
+Accounting: requests may overlap, so each admitted request holds its own reservation (its worst-case
+cost) until it settles, admission counts every reservation still in flight, and a request settles exactly
+once, with its reported usage or, when the usage is unknown (failure, no usage, cancellation, timeout), at
+its worst-case estimate, never as zero. Each request is attributed when it is admitted and settled to the
+one role whose guarded client sent it, so the per-role counters of a scenario add up to the run total
+(`attribution_reconciled`). Failed tasks are explained by an allowlist: role, status, error code and a
+category from a fixed set (`max_steps_exceeded`, `invalid_tool_arguments`, `run_limit`, `unclassified`);
+the conversation shape of each role (`tool:lead.view`, `text`) is recorded, never the text.
+
+Limits apply to all roles combined through the one ledger: requests, input and output tokens, tool calls
+per scenario, model steps per task (default and maximum 6: a Lead that proposes one task per response needs five), per-request and overall timeouts and estimated spend, with
+non-finite or negative values rejected. The report is redacted JSON with per-role request and token counts,
+no prompts, paths or secrets. Tests: `tests/test_live_team_validation.py` (a deterministic fake provider
+through the real stack, a test-only stand-in runner for the wiring, and Docker-gated container tests).
+
 ## Troubleshooting
 
 - `provider unavailable`: the key or service is missing, or the model is not installed or not

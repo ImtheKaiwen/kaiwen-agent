@@ -601,16 +601,41 @@ Each defect was reproduced with a failing test before its fix.
       implementation session but it is an AI-assisted review, not a human security certification. No
       P0 to P2 finding remained. Not done by this milestone: the model-driven Tester inside the team,
       any live multi-role provider run, production readiness.
-- [~] M6.4-B model-driven Tester and Docker team integration (draft pull request, pending
-      independent audit): the same team with the Tester as an `AgentRuntimeWorker` whose scripted
-      model calls `testing.run`, executed by `DockerSandboxRunner` (`--docker` scenarios), signed
-      evidence, the completion gate and team acceptance; a missing engine or image fails closed with no
-      local fallback. The Docker tests run only on a Linux engine (Linux CI); locally they are
-      skipped, so the real-container verification rests on the exact-head CI result. Prepared for a
-      later, separately authorized live run, not executed: the offline `team-plan` command (tool
-      schema and strictness check, request ceiling, worst-case spend, authorization request) and the
-      example's `model_factory` seam. Not done: any live multi-role provider run, the live team
-      harness, resume, production readiness.
+- [x] M6.4-B model-driven Tester and Docker team integration (pull request 22, squash commit
+      `41c17e0f6e7167baabad949eeb316a21c2cbe305`; all ten checks of the post-merge `main` run
+      passed): the same team with the Tester as an `AgentRuntimeWorker` whose scripted model calls
+      `testing.run`, executed by `DockerSandboxRunner` (`--docker` scenarios), signed evidence, the
+      completion gate and team acceptance; a missing engine or image fails closed with no local
+      fallback. Two independent-audit findings (non-finite limits and prices accepted by the planning
+      and the live validation paths) were fixed red-first before the merge. The container tests ran
+      on the Linux CI engine. AI-assisted reviews, not a human security certification.
+- [~] M6.4-C live multi-role validation harness (draft pull request, pending independent review):
+      `scripts/live_team_validation.py` with `preflight` (no-cost key, authentication and model
+      check, no generation), `plan` (offline authorization request) and `run` (dry run; `--live` needs
+      an exact separate authorization of model, maximum spend and scenarios). The real Lead, second
+      Lead, Tester and Reviewer are model calls through the existing guarded OpenAI client and one
+      shared request ledger; the Coder stays a host function; `testing.run` runs only in
+      `DockerSandboxRunner`. Scenarios `LIVE_ACCEPTED`, `LIVE_FAILING_TESTS` and
+      `LIVE_INVALID_EVIDENCE`, judged from trusted host records only. Validated offline with a
+      deterministic fake OpenAI client through the real composition.
+      Live history: the first authorized live run (2026-11-17, `gpt-5.4-mini`, commit `35c3ded`, 13 requests,
+      about $0.023 by provider-reported usage) was INCONCLUSIVE overall: `LIVE_FAILING_TESTS` passed against a
+      real model and a real container, but the `LIVE_ACCEPTED` Lead task failed after four requests for a
+      cause the report could not capture (undetermined). Harness defects found by that run (it continued
+      after an INCONCLUSIVE scenario; per-role counters double counted overlapping roles; the ledger kept one
+      shared pending cost; the step limit could not hold a Lead that proposes one task per response) were
+      corrected offline. The second authorized live run (2026-11-18, commit
+      `2b4d6e228c26ff7478a56a767aec43c945c5200a`, `LIVE_ACCEPTED` only, 11 requests, about $0.0185 by
+      provider-reported usage, not a billing record) PASSED: all four roles took part, the Tester's
+      registered command ran in the pinned container, and the completion gate and team acceptance accepted.
+      It is one run, one model and one tiny project; it is not evidence of model quality, reliability or
+      production readiness, and the Reviewer's recommendation is directed by its brief.
+      R5 hardening after that run (mandatory commit and clean-tree authorization, role participation and
+      attribution reconciliation required for a PASS, exception-safe settlement of untrusted provider
+      responses, a negative scenario passing only on a container-reported assertion failure) is NOT itself
+      live-validated: it was verified offline and by CI only. Reviews so far were by AI models of the same
+      family as the author and are not author-independent. Not done: an author-independent review, resume,
+      production readiness.
 - Not done: beta integration, resolving approval-required delegation and a durable cycle
   cursor. There is no atomic reservation of delegation quotas: delegation at the cycle
   boundary is safe only because the run lease holder alone writes the run's tasks (enforced by
