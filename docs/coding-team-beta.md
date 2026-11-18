@@ -178,12 +178,12 @@ smoke on `gpt-5.4-mini` in a Docker sandbox, a passing and a deliberately broken
 signed evidence authenticated and the gate completing or blocking as expected, at about $0.002 per
 scenario. These calls are not repeated here.
 
-Unverified for a real multi-role workflow: a real model driving the Lead proposal tools, the review
+Shown live once (second run, below) for one positive scenario; still unverified beyond that run: a real model driving the Lead proposal tools, the review
 tool (`review.submit` strict schema), and the model citing real evidence references; a real model
 inside the full controller with delegation and acceptance; provider error behavior across several
 roles; token and cost totals for a multi-task run.
 
-Prepared by M6.4-C, not executed: `python scripts/live_team_validation.py` (see
+Provided by M6.4-C: `python scripts/live_team_validation.py` (see
 `docs/live-validation.md`, "Multi-role team validation"). `preflight` checks the key, authentication
 and model availability without generating anything, `plan` is offline and prints the authorization
 request (request ceiling, worst-case spend, tool-schema strictness), and `run --live` needs an exact,
@@ -200,6 +200,11 @@ from host records. Costs are provider-reported estimates, not billing records. L
 live-validated. One successful positive scenario on one model and one tiny project does not show reliability, and
 the Reviewer is a prompted model whose recommendation the brief directs. The reviews of this work were by models of
 the same family as the author and are not author-independent.
+
+Limitation of commit pinning: the authorized-commit check (exact commit, clean tree, this checkout's package)
+is guaranteed for the supported command-line path. `run_team` repeats it for the client the harness builds and
+for an injected `openai` client, but an arbitrary Python wrapper injected by a caller is an unsupported test
+seam that the harness cannot recognize as billable; no protection is claimed there.
 
 A future manual validation (a separate run that requires explicit operator authorization and a stated
 maximum cost) should specify:
@@ -228,7 +233,7 @@ maximum cost) should specify:
 | --- | --- | --- |
 | Installation and configuration | PARTIAL | `pip install -e .` runs the example; no setup guide for a real consumer beyond the examples |
 | Coding workflow composition | READY (deterministic) | the example and its tests run the full team through the real stack |
-| Provider compatibility | PARTIAL | one model, single-worker, manual smoke; multi-role not validated live; offline strict-schema check and authorization plan prepared |
+| Provider compatibility | PARTIAL | one model, single-worker, manual smoke; multi-role validated live once for the accepted path only (second live run, commit `2b4d6e2`); one model, one tiny project |
 | Tool permissions | READY | deny-by-default, per-role permissions, covered by tests |
 | Sandbox execution | PARTIAL | the multi-role team composes `DockerSandboxRunner` (M6.4-B); its container tests run only on Linux CI, so the real-container evidence is the exact-head CI result |
 | Evidence verification | READY | signed, run- and fingerprint-scoped; gate-verified citations enforced |
@@ -246,4 +251,4 @@ No claim of production readiness is made.
 
 ## Recommended next milestone
 
-After M6.4-C is independently reviewed: a separately authorized, bounded live run of the recommended scenarios (see the authorization report), then the beta closeout. The accepted path was shown once (second live run, commit `2b4d6e2`); the later R5 hardening was not live-validated.
+The beta closeout. The accepted path was shown once (second live run, commit `2b4d6e2`); the later R5 and final corrections were verified offline and by CI only, and were not live-validated. Any further live run needs its own separate authorization.
