@@ -1,7 +1,9 @@
-# First beta: release preparation
+# First beta: published release and verification
 
-Status: the release preparation of `0.8.0b1`. The GitHub Release is the record of what was published, with its
-files and hashes; this document is the plan and the limits that came with it.
+Status: **published and verified** as GitHub Pre-release
+[`v0.8.0b1`](https://github.com/ImtheKaiwen/kaiwen-agent/releases/tag/v0.8.0b1)
+(2026-11-18). This document preserves the release plan, execution record and beta limitations.
+This is not a stable or production release.
 
 ## Version and channel
 
@@ -12,7 +14,8 @@ files and hashes; this document is the plan and the limits that came with it.
   attached. Not PyPI and not npm: the `Release packages` workflow publishes to registries and is not part of
   this beta. The npm packages (`@imthekaiwen/agent-protocol`, `@imthekaiwen/agent-ui`) are not part of the
   coding-team beta and are not released with it.
-- The version bump and the `Unreleased` heading rename are step 1 of the checklist, in their own pull request.
+- The version bump, Beta classifier and changelog heading were completed in pull request #26,
+  squash-merged as `d8e10f8db90d14f5a6ca76ed5d95065e8acb8df6`.
 
 ## Supported capabilities (first beta)
 
@@ -40,7 +43,7 @@ files and hashes; this document is the plan and the limits that came with it.
 - Not verified: macOS, Podman, Windows containers, and a Linux workstation install by the quick-start commands.
 - Not production ready.
 
-## Release notes (draft for the GitHub Pre-release)
+## Release notes (text prepared for the GitHub Pre-release)
 
 > **Kaiwen Agent 0.8.0b1 (beta)**. A preview for evaluation, not for production. It adds a runnable
 > coding-team example (Lead, Coder, Tester, Reviewer) whose outcomes are decided by the host's completion gate
@@ -57,10 +60,25 @@ release path before authorization: `python scripts/check_release.py metadata` OK
 `python scripts/check_release.py dist <dir>` OK. These hashes are for the rehearsal only; the release artifacts are
 rebuilt by CI from the release commit and their hashes are the ones that count.
 
-For the currently committed version `0.7.0a1` the wheel and sdist were installed into clean virtual environments
-and the example was run (see the quick start for what was verified and what was not).
+For the then-current version `0.7.0a1`, the wheel and sdist were installed into clean virtual environments
+and the example was run before the `0.8.0b1` release (see the quick start for verification scope).
 
-## Release checklist
+## Published artifact verification (2026-11-18)
+
+- Release commit and lightweight tag `v0.8.0b1`: `d8e10f8db90d14f5a6ca76ed5d95065e8acb8df6`.
+- Post-merge `main` CI run `44362468039`: all 10 jobs passed. The wheel and sdist were taken
+  unchanged from that run's `python-dist` artifact, not rebuilt locally for the release.
+- Published `kaiwen_agent-0.8.0b1-py3-none-any.whl` SHA-256:
+  `3bd59e28a653416dc4bc55b5892cf41e56bf809bebc9112abe43b896883d063a`.
+- Published `kaiwen_agent-0.8.0b1.tar.gz` SHA-256:
+  `1d83404090f9aa5897732a145b65c3ac793a03b33423f8ce563542724d426679`.
+- Published assets include `SHA256SUMS`; downloaded assets matched it and the CI artifacts byte-for-byte.
+  The published wheel installed into a fresh Python 3.13 environment (`pip check` clean),
+  and the example from the release tag passed offline and in five Docker scenarios.
+  The published-wheel install was not repeated on Python 3.11 (pre-release wheel testing was).
+- No PyPI or npm publication occurred. These checks do not establish production readiness.
+
+## Release checklist (completed historical procedure)
 
 1. Pull request: set `version = "0.8.0b1"` and the `4 - Beta` classifier in `pyproject.toml`, rename `## Unreleased`
    in `CHANGELOG.md` to `## 0.8.0b1`, run `python scripts/check_release.py metadata`, merge once the exact head passes

@@ -224,9 +224,11 @@ small, independently reviewable changes with their own acceptance criteria.
   cp1252 stdout encoding when output is redirected (for example
   `examples/coding-simple-chat`). CI sets `PYTHONUTF8=1` for the example step; the
   examples are unchanged.
-- Observed release inconsistencies, not changed: no Git tags for 0.4.0a1 or 0.6.0a1
-  although PyPI has them; GitHub releases stop at 0.5.0a1 and mark 0.3.0a1 as
-  "Latest"; no tags for npm releases.
+- Historical release audit (2026-11-07): no Git tags for 0.4.0a1 or 0.6.0a1
+  although PyPI has them, and no tags for npm releases. At that time, GitHub Releases
+  stopped at 0.5.0a1 and marked 0.3.0a1 as "Latest". The first GitHub-only beta
+  `v0.8.0b1` was subsequently published on 2026-11-18; it is a Pre-release, not a
+  stable release. See [`beta-release.md`](beta-release.md).
 - Not verified: the publish jobs (npm tarball publishing with provenance and the
   PyPI artifact upload have not been exercised, by design), Python 3.11 and 3.13
   locally.
@@ -640,8 +642,8 @@ Each defect was reproduced with a failing test before its fix.
       family as the author and are not author-independent. Not done: an author-independent review, resume,
       production readiness. Commit pinning is guaranteed for the command-line path; an arbitrary
       injected Python wrapper is an unsupported test seam with no protection claimed.
-- Not done: beta integration, resolving approval-required delegation and a durable cycle
-  cursor. There is no atomic reservation of delegation quotas: delegation at the cycle
+- Not done beyond the published M6.4 first-beta integration: resolving
+  approval-required delegation and a durable cycle cursor. There is no atomic reservation of delegation quotas: delegation at the cycle
   boundary is safe only because the run lease holder alone writes the run's tasks (enforced by
   the fenced write transaction) and the counted quotas are run-scoped; the job path serializes within one delegator instance only.
   After a restart, earlier delegated tasks count against the per-run limit, so an identical
