@@ -4,7 +4,10 @@ Provider-neutral, reusable agent runtime and UI protocol. This repository contai
 the reusable platform only; product-specific prompts, tools, persistence models,
 routes, and visual themes belong in consuming applications.
 
-The project is an alpha. Pin exact versions in consuming applications.
+The platform is under active development. The current Python **first beta** is
+[`v0.8.0b1`](https://github.com/ImtheKaiwen/kaiwen-agent/releases/tag/v0.8.0b1), published as a
+**GitHub Pre-release**, not to PyPI. It is a limited preview, not production-ready. Pin exact
+versions in consuming applications; the npm packages are versioned and released independently.
 
 ## Packages
 
@@ -32,16 +35,23 @@ docs/archive/       Historical planning documents (not authoritative)
 
 ## Install
 
+For the **GitHub-only Python beta** (`0.8.0b1`), download the wheel and `SHA256SUMS` from
+[the tagged Pre-release](https://github.com/ImtheKaiwen/kaiwen-agent/releases/tag/v0.8.0b1),
+verify the checksum and install the wheel in a Python 3.11+ virtual environment. The exact steps,
+including the example checkout at the matching tag, are in
+[`docs/quickstart-coding-team.md`](https://github.com/ImtheKaiwen/kaiwen-agent/blob/main/docs/quickstart-coding-team.md).
+
+For the independently published **registry packages** (which may be older than the GitHub beta):
+
 ```bash
 pip install "kaiwen-agent[openai]"
 npm install @imthekaiwen/agent-protocol @imthekaiwen/agent-ui
 ```
 
 Optional Python extras: `openai-live`, `gemini`, `ollama`, `postgres-memory`,
-`redis`.
-
-To try the coding-team preview (beta, deterministic, no credentials) from a source checkout, follow
-[`docs/quickstart-coding-team.md`](https://github.com/ImtheKaiwen/kaiwen-agent/blob/main/docs/quickstart-coding-team.md).
+`redis`. The `v0.8.0b1` coding-team example is included in the tagged source checkout, not the
+installed wheel; the npm packages are not part of this beta. GitHub excludes Pre-releases from
+its stable **Latest** designation, so use the explicit beta tag link above.
 
 ## Python quickstart
 

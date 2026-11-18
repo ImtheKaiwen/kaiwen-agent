@@ -1,6 +1,8 @@
-# Coding team beta integration (M6.4-A and M6.4-B)
+# Coding team beta integration (M6.4-A, M6.4-B and M6.4-C)
 
-Status: a bounded integration baseline, not a production release. It shows that the existing
+Status: first beta **published** as GitHub Pre-release
+[`v0.8.0b1`](https://github.com/ImtheKaiwen/kaiwen-agent/releases/tag/v0.8.0b1),
+a bounded integration baseline, not a production release. It shows that the existing
 platform composes into a coding team (Lead, Coder, Tester, Reviewer) whose delivery is completed
 only by a real completion gate and a real team acceptance, without a second engine, scheduler,
 database, authority system or approval ledger. Nothing here changes an accepted ADR or trust
@@ -235,20 +237,24 @@ maximum cost) should specify:
 | Coding workflow composition | READY (deterministic) | the example and its tests run the full team through the real stack |
 | Provider compatibility | PARTIAL | one model, single-worker, manual smoke; multi-role validated live once for the accepted path only (second live run, commit `2b4d6e2`); one model, one tiny project |
 | Tool permissions | READY | deny-by-default, per-role permissions, covered by tests |
-| Sandbox execution | PARTIAL | the multi-role team composes `DockerSandboxRunner` (M6.4-B); its container tests run only on Linux CI, so the real-container evidence is the exact-head CI result |
+| Sandbox execution | PARTIAL | the multi-role team composes `DockerSandboxRunner` (M6.4-B); real-container scenarios ran in Linux CI and on Docker Desktop's Linux engine on Windows; Windows CI skips Linux-container tests |
 | Evidence verification | READY | signed, run- and fingerprint-scoped; gate-verified citations enforced |
 | Team review and acceptance | READY (author-side) | ADR 0017 accepted, fresh-context review only, no author-independent audit |
 | Durable state and recovery | PARTIAL | at-least-once replay and recovery reconcile exist; no general resume or cycle cursor |
 | Cancellation and ownership | READY | fenced writes, injected-clock ownership loss, cancellation tests |
 | Diagnostics and error reporting | PARTIAL | stable codes, no secrets; no unified operator view across roles |
 | Documentation | PARTIAL | this guide, the workflow docs and a tested team quick start; no consumer guide for a model-driven team |
-| Packaging | PARTIAL | wheel and sdist build, pass `twine check --strict` and `check_release.py dist`, and install in clean environments; the example stays in the source checkout; release prepared in `docs/beta-release.md`, not published |
+| Packaging | PARTIAL | wheel and sdist built, checked and installed in clean environments; GitHub Pre-release `v0.8.0b1` published and verified with SHA-256 checksums; the example remains in the tagged source checkout, not the wheel; see `docs/beta-release.md` |
 | Live multi-role validation | PARTIAL | first live run INCONCLUSIVE (negative scenario PASS); second live run `LIVE_ACCEPTED` PASS at `2b4d6e2` (one run, one model); R5 hardening not live-validated |
-| Out of scope | not started | distributed execution, gateway, speech, UI, production deployment, release |
+| Out of scope | not started | distributed execution, gateway, speech, UI and production deployment; registry publication is separate from the GitHub beta |
 | Not implemented | missing | approval-required delegation, a first-party approval store, general resume, model-driven edits with approvals inside a team |
 
 No claim of production readiness is made.
 
-## Recommended next milestone
+## Next steps after the first beta
 
-The beta closeout. The accepted path was shown once (second live run, commit `2b4d6e2`); the later R5 and final corrections were verified offline and by CI only, and were not live-validated. Any further live run needs its own separate authorization.
+The bounded first beta is published; a future milestone can address a real model-driven
+consumer guide, an author-independent review and broader provider validation. The accepted path
+was shown once (second live run, commit `2b4d6e2`); the later R5 and final corrections were
+verified offline and by CI only, and were not live-validated. Any further live run needs its
+own separate authorization.

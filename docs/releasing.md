@@ -17,9 +17,16 @@ relationship is that `@imthekaiwen/agent-ui` depends on the exact version of
 also requires a `CHANGELOG.md` heading for the Python version. These rules are
 checked by `python scripts/check_release.py metadata`.
 
-Python versions use PEP 440 (`0.7.0a1`); npm versions use semver (`0.2.0-alpha.1`).
-Record the matching npm versions in the release notes. Git tags use `v<python
-version>` and are created manually, after registry verification.
+Python versions use PEP 440 (for example `0.8.0b1`); npm versions use semver
+(for example `0.2.0-alpha.1`). Record the matching npm versions in the release notes.
+For registry releases, Git tags use `v<python version>` and are created manually
+after registry verification.
+
+The **first coding-team beta** (`v0.8.0b1`) was published separately as a
+[GitHub Pre-release](https://github.com/ImtheKaiwen/kaiwen-agent/releases/tag/v0.8.0b1)
+using CI-built wheel and sdist plus `SHA256SUMS`, without invoking the PyPI/npm registry
+publication workflow. See [`beta-release.md`](beta-release.md) for the completed record.
+The process below governs registry package releases, not that GitHub-only beta.
 
 ## Workflows
 
