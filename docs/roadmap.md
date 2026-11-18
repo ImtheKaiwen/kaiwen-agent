@@ -609,7 +609,10 @@ Each defect was reproduced with a failing test before its fix.
       fallback. Two independent-audit findings (non-finite limits and prices accepted by the planning
       and the live validation paths) were fixed red-first before the merge. The container tests ran
       on the Linux CI engine. AI-assisted reviews, not a human security certification.
-- [~] M6.4-C live multi-role validation harness (draft pull request, pending independent review):
+- [x] M6.4-C live multi-role validation harness (merged as pull request 23, squash commit
+      `ce5b71e6c1c6f2d632c277c89f4a682b36c2a457`; exact-head CI 10 of 10 and main CI after the merge
+      succeeded; merged without an author-independent approval on record, no branch protection
+      requires one):
       `scripts/live_team_validation.py` with `preflight` (no-cost key, authentication and model
       check, no generation), `plan` (offline authorization request) and `run` (dry run; `--live` needs
       an exact separate authorization of model, maximum spend and scenarios). The real Lead, second
@@ -635,7 +638,8 @@ Each defect was reproduced with a failing test before its fix.
       responses, a negative scenario passing only on a container-reported assertion failure) is NOT itself
       live-validated: it was verified offline and by CI only. Reviews so far were by AI models of the same
       family as the author and are not author-independent. Not done: an author-independent review, resume,
-      production readiness.
+      production readiness. Commit pinning is guaranteed for the command-line path; an arbitrary
+      injected Python wrapper is an unsupported test seam with no protection claimed.
 - Not done: beta integration, resolving approval-required delegation and a durable cycle
   cursor. There is no atomic reservation of delegation quotas: delegation at the cycle
   boundary is safe only because the run lease holder alone writes the run's tasks (enforced by
