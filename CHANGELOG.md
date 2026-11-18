@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add the first-beta distribution documents: `docs/quickstart-coding-team.md` (tested install and run commands for a
+  source checkout, Docker scenarios, common errors, verified and unverified environments) and `docs/beta-release.md`
+  (proposed version `0.8.0b1`, GitHub Pre-release channel, release notes draft, limitations, checklist). No code,
+  packaging or version change; nothing is released.
 - Add `scripts/live_team_validation.py` (M6.4-C): `preflight`, `plan` and an authorization-gated `run` for a
   controlled live validation of the multi-role coding team (real Lead, Tester and Reviewer models, the
   Tester in `DockerSandboxRunner`, one shared request ledger and budget). Validated offline with a fake

@@ -231,7 +231,7 @@ maximum cost) should specify:
 
 | Area | Status | Evidence and gap |
 | --- | --- | --- |
-| Installation and configuration | PARTIAL | `pip install -e .` runs the example; no setup guide for a real consumer beyond the examples |
+| Installation and configuration | PARTIAL | tested quick start for a source checkout (`docs/quickstart-coding-team.md`): wheel, sdist and `pip install .` verified on Windows, Python 3.13 and 3.11; macOS and a Linux workstation install not verified |
 | Coding workflow composition | READY (deterministic) | the example and its tests run the full team through the real stack |
 | Provider compatibility | PARTIAL | one model, single-worker, manual smoke; multi-role validated live once for the accepted path only (second live run, commit `2b4d6e2`); one model, one tiny project |
 | Tool permissions | READY | deny-by-default, per-role permissions, covered by tests |
@@ -241,8 +241,8 @@ maximum cost) should specify:
 | Durable state and recovery | PARTIAL | at-least-once replay and recovery reconcile exist; no general resume or cycle cursor |
 | Cancellation and ownership | READY | fenced writes, injected-clock ownership loss, cancellation tests |
 | Diagnostics and error reporting | PARTIAL | stable codes, no secrets; no unified operator view across roles |
-| Documentation | PARTIAL | this guide and the workflow docs; no consumer quick start for a team |
-| Packaging | PARTIAL | wheel and sdist build and check in CI; the example is not part of the wheel |
+| Documentation | PARTIAL | this guide, the workflow docs and a tested team quick start; no consumer guide for a model-driven team |
+| Packaging | PARTIAL | wheel and sdist build, pass `twine check --strict` and `check_release.py dist`, and install in clean environments; the example stays in the source checkout; release prepared in `docs/beta-release.md`, not published |
 | Live multi-role validation | PARTIAL | first live run INCONCLUSIVE (negative scenario PASS); second live run `LIVE_ACCEPTED` PASS at `2b4d6e2` (one run, one model); R5 hardening not live-validated |
 | Out of scope | not started | distributed execution, gateway, speech, UI, production deployment, release |
 | Not implemented | missing | approval-required delegation, a first-party approval store, general resume, model-driven edits with approvals inside a team |
