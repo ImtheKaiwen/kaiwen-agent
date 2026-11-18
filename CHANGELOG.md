@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.8.0b1
+
+First beta (GitHub Pre-release only; no PyPI or npm release). Python `0.8.0b1`; the npm packages are unchanged and not part of
+this release. Known limitations: `docs/beta-release.md`.
 
 - Add the first-beta distribution documents: `docs/quickstart-coding-team.md` (tested install and run commands for a
   source checkout, Docker scenarios, common errors, verified and unverified environments) and `docs/beta-release.md`
