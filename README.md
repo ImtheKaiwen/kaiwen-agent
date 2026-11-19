@@ -1,4 +1,16 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/ImtheKaiwen/kaiwen-agent/main/docs/assets/mascot/kaiwen-white.webp">
+    <img src="https://raw.githubusercontent.com/ImtheKaiwen/kaiwen-agent/main/docs/assets/mascot/kaiwen-dark.webp" alt="Kaiwen, the Kaiwen Agent mascot" width="200">
+  </picture>
+</p>
+
 # Kaiwen Agent Platform
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/ImtheKaiwen/kaiwen-agent/main/docs/assets/mascot/kaiwen-purple.webp" alt="Kaiwen mascot, purple" width="90">
+  <img src="https://raw.githubusercontent.com/ImtheKaiwen/kaiwen-agent/main/docs/assets/mascot/kaiwen-blue.webp" alt="Kaiwen mascot, blue" width="90">
+</p>
 
 Provider-neutral, reusable agent runtime and UI protocol. This repository contains
 the reusable platform only; product-specific prompts, tools, persistence models,
