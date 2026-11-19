@@ -44,7 +44,7 @@ python3 -m venv .venv
 .venv/bin/python -m pip install .
 ```
 
-Use `pip install -e .` instead if you intend to edit the package. A release also attaches a wheel and an
+To install the published beta instead of the checkout's version, use `python -m pip install "kaiwen-agent==0.8.0b1"` and check out the tag `v0.8.0b1` for the example. Use `pip install -e .` instead if you intend to edit the package. A release also attaches a wheel and an
 sdist; `pip install kaiwen_agent-<version>-py3-none-any.whl` installs the package the same way, and the
 example is then run from a source checkout (or its `examples/coding-team-acceptance/main.py` copied out).
 

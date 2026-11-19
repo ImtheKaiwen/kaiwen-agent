@@ -5,8 +5,8 @@ the reusable platform only; product-specific prompts, tools, persistence models,
 routes, and visual themes belong in consuming applications.
 
 The platform is under active development. The current Python **first beta** is
-[`v0.8.0b1`](https://github.com/ImtheKaiwen/kaiwen-agent/releases/tag/v0.8.0b1), published as a
-**GitHub Pre-release**, not to PyPI. It is a limited preview, not production-ready. Pin exact
+[`0.8.0b1`](https://github.com/ImtheKaiwen/kaiwen-agent/releases/tag/v0.8.0b1), a **Beta**: a GitHub
+Pre-release and the same files on [PyPI](https://pypi.org/project/kaiwen-agent/0.8.0b1/). It is a limited preview, not production-ready. Pin exact
 versions in consuming applications; the npm packages are versioned and released independently.
 
 ## Packages
@@ -35,23 +35,29 @@ docs/archive/       Historical planning documents (not authoritative)
 
 ## Install
 
-For the **GitHub-only Python beta** (`0.8.0b1`), download the wheel and `SHA256SUMS` from
-[the tagged Pre-release](https://github.com/ImtheKaiwen/kaiwen-agent/releases/tag/v0.8.0b1),
-verify the checksum and install the wheel in a Python 3.11+ virtual environment. The exact steps,
-including the example checkout at the matching tag, are in
-[`docs/quickstart-coding-team.md`](https://github.com/ImtheKaiwen/kaiwen-agent/blob/main/docs/quickstart-coding-team.md).
-
-For the independently published **registry packages** (which may be older than the GitHub beta):
+Current Python beta (`0.8.0b1`, Python 3.11 or newer), pinned exactly because it is a pre-release:
 
 ```bash
-pip install "kaiwen-agent[openai]"
+python -m pip install "kaiwen-agent==0.8.0b1"
+```
+
+The wheel and sdist on PyPI are byte-identical to the files of the
+[`v0.8.0b1` GitHub Pre-release](https://github.com/ImtheKaiwen/kaiwen-agent/releases/tag/v0.8.0b1), whose
+`SHA256SUMS` lists their checksums. The coding-team example is in the source checkout at the matching tag, not in
+the wheel; the exact steps are in
+[`docs/quickstart-coding-team.md`](https://github.com/ImtheKaiwen/kaiwen-agent/blob/main/docs/quickstart-coding-team.md).
+
+Optional extras are added the same way, for example `"kaiwen-agent[openai]==0.8.0b1"`. The npm packages are
+versioned independently and are not part of this beta:
+
+```bash
 npm install @imthekaiwen/agent-protocol @imthekaiwen/agent-ui
 ```
 
 Optional Python extras: `openai-live`, `gemini`, `ollama`, `postgres-memory`,
 `redis`. The `v0.8.0b1` coding-team example is included in the tagged source checkout, not the
-installed wheel; the npm packages are not part of this beta. GitHub excludes Pre-releases from
-its stable **Latest** designation, so use the explicit beta tag link above.
+installed wheel. GitHub excludes Pre-releases from its stable **Latest** designation, so use the explicit
+beta tag link above.
 
 ## Python quickstart
 
