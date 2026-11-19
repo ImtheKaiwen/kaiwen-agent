@@ -1,0 +1,122 @@
+name: Publish PyPI 0.8.0b1
+
+# One-purpose, manual workflow: publish exactly the already verified `kaiwen-agent` 0.8.0b1 wheel and sdist
+# from the GitHub Pre-release `v0.8.0b1` to PyPI with Trusted Publishing. It builds nothing, takes no
+# inputs, runs only from the default branch, and refuses unless the tag still points at the release commit
+# and the downloaded files match the SHA-256 values recorded below.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-pypi-0.8.0b1
+  cancel-in-progress: false
+
+env:
+  TAG: v0.8.0b1
+  RELEASE_COMMIT: d8e10f8db90d14f5a6ca76ed5d95065e8acb8df6
+  WHEEL: kaiwen_agent-0.8.0b1-py3-none-any.whl
+  WHEEL_SHA256: 3bd59e28a653416dc4bc55b5892cf41e56bf809bebc9112abe43b896883d063a
+  SDIST: kaiwen_agent-0.8.0b1.tar.gz
+  SDIST_SHA256: 1d83404090f9aa5897732a145b65c3ac793a03b33423f8ce563542724d426679
+
+jobs:
+  verify-release-files:
+    name: Verify the release files
+    runs-on: ubuntu-latest
+    # No id-token here: this job can read the release but cannot publish.
+    permissions:
+      contents: read
+    steps:
+      - name: Require the default branch
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "This workflow may only run from refs/heads/main, got $GITHUB_REF" >&2
+            exit 1
+          fi
+      - name: Require the unchanged tag and a Pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '.object.type + " " + .object.sha')
+          if [ "$ref" != "commit $RELEASE_COMMIT" ]; then
+            echo "Tag $TAG does not point at $RELEASE_COMMIT (got: $ref)" >&2
+            exit 1
+          fi
+          flags=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isPrerelease,isDraft --jq '"\(.isPrerelease) \(.isDraft)"')
+          if [ "$flags" != "true false" ]; then
+            echo "Release $TAG must be a published Pre-release (got: $flags)" >&2
+            exit 1
+          fi
+      - name: Require that this version is not on PyPI yet
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' https://pypi.org/pypi/kaiwen-agent/0.8.0b1/json)
+          if [ "$code" != "404" ]; then
+            echo "kaiwen-agent 0.8.0b1 is already on PyPI or PyPI is unreachable (HTTP $code); nothing is published" >&2
+            exit 1
+          fi
+      - name: Download the release files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir dist
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dist --pattern "$WHEEL" --pattern "$SDIST"
+          ls -l dist
+      - name: Verify hashes, archives and metadata
+        run: |
+          cd dist
+          printf '%s  %s\n%s  %s\n' "$WHEEL_SHA256" "$WHEEL" "$SDIST_SHA256" "$SDIST" | sha256sum -c -
+          test "$(ls | wc -l)" = 2
+          python3 - <<'EOF'
+          import os, tarfile, zipfile
+          wheel, sdist = os.environ["WHEEL"], os.environ["SDIST"]
+          with zipfile.ZipFile(wheel) as z:
+              assert z.testzip() is None
+              names = z.namelist()
+              assert "kaiwen_agent/py.typed" in names
+              meta = z.read("kaiwen_agent-0.8.0b1.dist-info/METADATA").decode()
+          for line in ("Name: kaiwen-agent", "Version: 0.8.0b1", "Requires-Python: >=3.11",
+                       "Classifier: Development Status :: 4 - Beta"):
+              assert line in meta.splitlines(), line
+          with tarfile.open(sdist) as t:
+              members = t.getnames()
+          assert all(m.startswith("kaiwen_agent-0.8.0b1/") for m in members)
+          print("wheel and sdist metadata verified")
+          EOF
+          python3 -m pip install --quiet "twine==6.2.0"
+          python3 -m twine check --strict "$WHEEL" "$SDIST"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verified-release-files
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish to PyPI
+    needs: verify-release-files
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/kaiwen-agent/0.8.0b1/
+    # Only this job may request an OIDC token.
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: verified-release-files
+          path: dist
+      - name: Re-check the hashes immediately before upload
+        run: |
+          cd dist
+          printf '%s  %s\n%s  %s\n' "$WHEEL_SHA256" "$WHEEL" "$SDIST_SHA256" "$SDIST" | sha256sum -c -
+          test "$(ls | wc -l)" = 2
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: dist/
