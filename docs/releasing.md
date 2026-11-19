@@ -24,9 +24,9 @@ after registry verification.
 
 The **first coding-team beta** (`v0.8.0b1`) was published separately as a
 [GitHub Pre-release](https://github.com/ImtheKaiwen/kaiwen-agent/releases/tag/v0.8.0b1)
-using CI-built wheel and sdist plus `SHA256SUMS`, without invoking the PyPI/npm registry
-publication workflow. See [`beta-release.md`](beta-release.md) for the completed record.
-The process below governs registry package releases, not that GitHub-only beta.
+using CI-built wheel and sdist plus `SHA256SUMS`, without invoking the `release.yml` registry
+publication workflow; the same two files were later published to PyPI by `publish-pypi-beta.yml` (below). See [`beta-release.md`](beta-release.md) for the completed record.
+The process below governs registry package releases in general.
 
 ## Workflows
 

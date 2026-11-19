@@ -11,8 +11,7 @@ This is not a stable or production release.
   `a`, `b` and `rc` suffixes). Git tag: `v0.8.0b1`, created manually after verification, as in
   [`releasing.md`](releasing.md).
 - Channel: a GitHub Pre-release of the repository, with the wheel, the sdist and a `SHA256SUMS` file
-  attached. Not PyPI and not npm: the `Release packages` workflow publishes to registries and is not part of
-  this beta. The npm packages (`@imthekaiwen/agent-protocol`, `@imthekaiwen/agent-ui`) are not part of the
+  attached, and afterwards the same two files on PyPI (see the PyPI section below). Not npm. The npm packages (`@imthekaiwen/agent-protocol`, `@imthekaiwen/agent-ui`) are not part of the
   coding-team beta and are not released with it.
 - The version bump, Beta classifier and changelog heading were completed in pull request #26,
   squash-merged as `d8e10f8db90d14f5a6ca76ed5d95065e8acb8df6`.
@@ -76,7 +75,19 @@ and the example was run before the `0.8.0b1` release (see the quick start for ve
   The published wheel installed into a fresh Python 3.13 environment (`pip check` clean),
   and the example from the release tag passed offline and in five Docker scenarios.
   The published-wheel install was not repeated on Python 3.11 (pre-release wheel testing was).
-- No PyPI or npm publication occurred. These checks do not establish production readiness.
+- No PyPI or npm publication occurred at the time of the GitHub release. These checks do not establish production readiness.
+
+## PyPI publication (2026-11-19)
+
+Published from the `publish-pypi-beta.yml` workflow, run 44472844371 on `main` at
+`81a93b7b3699abf6b69b9c08cffca3112603e00f`, uploading the unmodified release files after it re-verified the tag,
+the pinned hashes and the metadata. Independently verified afterwards: PyPI serves `kaiwen-agent` `0.8.0b1`
+(`Requires-Python >=3.11`, `Development Status :: 4 - Beta`) with the wheel (`3bd59e28...063a`) and the sdist
+(`1d834040...6679`) whose SHA-256 values equal the GitHub release files; the attestations name the publisher
+`ImtheKaiwen/kaiwen-agent`, workflow `publish-pypi-beta.yml`, environment `pypi`; and
+`pip install --no-cache-dir "kaiwen-agent==0.8.0b1"` into fresh Python 3.11 and 3.13 environments passed
+`pip check` and an import check, and the example from the release tag passed offline and in five Docker scenarios.
+The GitHub release stays a Pre-release. This does not establish production readiness.
 
 ## Release checklist (completed historical procedure)
 
