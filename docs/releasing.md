@@ -46,6 +46,31 @@ The process below governs registry package releases, not that GitHub-only beta.
   Only the two publish jobs hold `id-token: write`, and each uses its GitHub
   environment (`npm`, `pypi`). All third-party Actions are pinned to full commit SHAs.
 
+## PyPI publication of 0.8.0b1
+
+`.github/workflows/publish-pypi-beta.yml` publishes exactly the wheel and sdist already attached to the
+GitHub Pre-release `v0.8.0b1`; it builds nothing. It is manual (`workflow_dispatch`, no inputs) and runs only from
+`main`. Its first job needs no OIDC token: it requires the tag to still point at the release commit
+(`d8e10f8db90d14f5a6ca76ed5d95065e8acb8df6`), the release to be a published Pre-release, `0.8.0b1` to be absent
+from PyPI, the downloaded files to match the SHA-256 values written in the workflow, the archive and metadata
+checks and `twine check --strict`. Only the second job holds `id-token: write`; it runs in the `pypi`
+environment, re-checks the hashes and uploads with the pinned `pypa/gh-action-pypi-publish`. There is no
+`skip-existing`. Because `main` moves on, the standard `release.yml` is not used for this version: it would
+rebuild from the current `main`.
+
+Operator steps (PyPI account and repository settings, not done by any commit):
+
+1. On PyPI, project `kaiwen-agent`, Publishing, add a GitHub trusted publisher: owner `ImtheKaiwen`,
+   repository `kaiwen-agent`, workflow `publish-pypi-beta.yml`, environment `pypi`.
+2. The existing publisher names the former repository `kaiwen-agent-platform` (workflow `release.yml`,
+   environment `pypi`). It is not changed by this workflow. Once the new one works, consider removing it: a
+   repository later created under the former name would otherwise match it.
+3. In GitHub, give the `pypi` environment a required reviewer and a deployment branch policy limited to `main`
+   (it currently has neither), then run the workflow from `main`.
+4. Verify on PyPI, never by the workflow status alone: both files present with the recorded hashes, the Beta
+   classifier, publisher provenance naming `ImtheKaiwen/kaiwen-agent` and `publish-pypi-beta.yml`, and a clean
+   install from the public index.
+
 ## One-time registry setup
 
 1. Verify that the `imthekaiwen` npm account can publish under its own scope.
