@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/ImtheKaiwen/kaiwen-agent/main/docs/assets/mascot/kaiwen-blue.webp" alt="Kaiwen, the Kaiwen Agent mascot" width="280">
+  <img src="https://raw.githubusercontent.com/ImtheKaiwen/kaiwen-agent/main/docs/assets/mascot/kaiwen-team.webp" alt="The Kaiwen Agent mascot team" width="800">
 </p>
 
 # Kaiwen Agent Platform
